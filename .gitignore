@@ -1,0 +1,8 @@
+__pycache__/
+.model_download/
+captures/
+*.zip
+*.pyc
+*.pyo
+*.pyd
+.DS_Store
