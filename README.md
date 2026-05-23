@@ -142,12 +142,16 @@ reconstruction/depth_map.png      深度图
 reconstruction/disparity.npy       WLS 后视差矩阵，单位 px
 reconstruction/raw_disparity.npy   原始视差矩阵，单位 px
 reconstruction/confidence.npy      置信度矩阵，范围 0~1
+reconstruction/valid_disparity.npy 有效视差 mask，0/1
+reconstruction/valid_depth.npy     有效深度 mask，0/1
 reconstruction/object_mask.png     SAM3 目标分割 mask
 reconstruction/object_mask.npy     SAM3 目标分割 mask，0/1
 reconstruction/object_mask_preview.png
 reconstruction/object_mask_metadata.json
 reconstruction/depth_mm.npy       深度矩阵，单位 mm
 reconstruction/point_cloud.ply    点云文件
+reconstruction/point_cloud_world.ply 世界坐标点云（启用固定靶点世界坐标时）
+reconstruction/world_coordinate_system.json 世界坐标系与固定靶点原点信息
 reconstruction/point_cloud_preview.png
 reconstruction/reconstruction_result.png
 reconstruction/quality_metrics.json 重建质量指标
@@ -177,6 +181,12 @@ plots/calibration_board_poses.png 标定板三维位姿图
 程序启动后会自动做一次重建环境自检；标定页也可点击 `自检` 手动检查。自检项目包括 CREStereo 模型文件、`onnxruntime`、CUDA ExecutionProvider、OpenCV `ximgproc` 和 WLS 接口。标定、独立深度重建和实时深度开始前都会执行自检；如果 CREStereo 不可用但允许 SGBM fallback，会给出警告并继续，否则会阻止任务开始。
 
 可启用 SAM3 单视角目标分割来清理点云。默认 SAM3 路径为 `D:\SAM3`，程序会调用 `D:\SAM3\.venv\Scripts\python.exe` 运行 `sam3_mask_inference.py`，基于左校正图生成 `object_mask`，再用 `object_mask & valid_depth` 过滤深度点，输出更干净的单视角目标点云。标定页可调整 SAM3 开关、prompt 和阈值；更多参数在 `config.json` 中设置，包括 `sam3_checkpoint`、`sam3_top_k`、`sam3_resolution`、`sam3_mask_selection`、`sam3_dilate_pixels` 和 `sam3_erode_pixels`。
+
+SAM3 失败时不再静默退化为全图 mask。若 `sam3_required=false`，程序会继续输出普通深度和相机坐标点云，但 `object_mask.status` 会标记为 failed/skipped，且不会把失败 mask 当作有效语义过滤；若 `sam3_required=true`，重建会直接中止。
+
+P0/P1 工程检查增加了三类输出：`valid_depth.npy` 用于区分真实有效深度与全图深度数组；`depth_scale_validation` 可输入标定板或已知平面的实际距离，若重建图像来自 `accepted_pairs` 会优先使用校正后标定板角点凸包区域，否则使用 SAM3 object mask 或有效深度区域比较深度中位数与参考距离；`world_coordinate_system.json` 可在启用世界坐标时记录由 SAM3 固定靶点识别得到的参考原点，并输出 `point_cloud_world.ply/pcd`。
+
+采集配置默认关闭自动曝光和自动增益。`timestamp_reject_enabled=true` 时可通过 `max_camera_timestamp_delta` 或 `max_host_timestamp_delta` 拒绝不同步帧；`require_hardware_trigger=true` 时会禁止 Software trigger 采集。
 
 当 `reconstruction_method` 为 `crestereo` 时，程序优先使用 CREStereo ONNX 输出视差，并继续执行 WLS 和置信度过滤；如果模型或 `onnxruntime` 不可用且 `allow_sgbm_fallback=true`，会回退到 SGBM + WLS。CREStereo 路径会额外执行左右互换推理生成 right disparity，置信度会融合光度一致性、left-right consistency 和 WLS 相关一致性；如果 left-right consistency 分量整体过低，程序会自动忽略该分量并在结果中写入提示，避免把整张深度图过滤成黑图。重建结果会在 `calibration_result.json` 的 `artifacts.reconstruction` 中记录实际使用的 `method_used`、`wls_filter` 和 `confidence_filter` 状态。
 

@@ -539,6 +539,10 @@ class StereoCaptureApp:
         self.sam3_enabled_var = BooleanVar(value=config_bool(self.config, "sam3_segmentation", True))
         self.sam3_prompt_var = StringVar(value=optional_config_text(self.config, "sam3_prompt", "object"))
         self.sam3_threshold_var = StringVar(value=optional_config_text(self.config, "sam3_confidence_threshold", "0.25"))
+        self.depth_scale_enabled_var = BooleanVar(value=config_bool(self.config, "depth_scale_validation_enabled", False))
+        self.depth_scale_reference_var = StringVar(value=optional_config_text(self.config, "depth_scale_reference_distance_mm", "0.0"))
+        self.world_enabled_var = BooleanVar(value=config_bool(self.config, "world_coordinate_enabled", False))
+        self.world_reference_prompt_var = StringVar(value=optional_config_text(self.config, "world_reference_prompt", "fixed target"))
 
         toolbar = ttk.Frame(root, padding=(10, 8))
         toolbar.pack(side=TOP, fill=X)
@@ -816,6 +820,10 @@ class StereoCaptureApp:
         self._grid_entry(recon_panel, "Prompt", self.sam3_prompt_var, 18, 3, 1)
         self._grid_entry(recon_panel, "SAM3阈值", self.sam3_threshold_var, 7, 3, 4)
         ttk.Label(recon_panel, text="object_mask 会过滤 valid_depth 并输出更干净的单视角目标点云", style="Muted.TLabel").grid(row=3, column=6, columnspan=5, padx=(8, 4), pady=3, sticky="w")
+        ttk.Checkbutton(recon_panel, text="尺度验证", variable=self.depth_scale_enabled_var).grid(row=4, column=0, padx=(0, 4), pady=4, sticky="w")
+        self._grid_entry(recon_panel, "距离mm", self.depth_scale_reference_var, 9, 4, 1)
+        ttk.Checkbutton(recon_panel, text="世界坐标", variable=self.world_enabled_var).grid(row=4, column=3, padx=(8, 4), pady=4, sticky="w")
+        self._grid_entry(recon_panel, "固定靶点", self.world_reference_prompt_var, 16, 4, 4)
 
         left_col = ttk.Frame(container)
         left_col.grid(row=1, column=0, sticky="nsew", padx=(0, 5))
@@ -998,6 +1006,8 @@ class StereoCaptureApp:
             "left_right_consistency_px": float(self.recon_lr_threshold_var.get()),
             "left_right_consistency_min_mean": float(self.config.get("left_right_consistency_min_mean", 0.05)),
             "left_right_consistency_min_pass_ratio": float(self.config.get("left_right_consistency_min_pass_ratio", 0.01)),
+            "crestereo_validate_right_disparity": config_bool(self.config, "crestereo_validate_right_disparity", True),
+            "crestereo_lr_fail_fallback": config_bool(self.config, "crestereo_lr_fail_fallback", True),
             "wls_consistency_px": float(self.config.get("wls_consistency_px", 2.0)),
             "reconstruction_max_width": int(reconstruction_max_width),
             "sam3_segmentation": bool(self.sam3_enabled_var.get()),
@@ -1010,10 +1020,19 @@ class StereoCaptureApp:
             "sam3_resolution": int(self.config.get("sam3_resolution", 1008)),
             "sam3_mask_selection": str(self.config.get("sam3_mask_selection", "union")),
             "sam3_timeout_seconds": int(self.config.get("sam3_timeout_seconds", 600)),
+            "sam3_device": str(self.config.get("sam3_device", "auto")),
             "sam3_dilate_pixels": int(self.config.get("sam3_dilate_pixels", 0)),
             "sam3_erode_pixels": int(self.config.get("sam3_erode_pixels", 0)),
             "sam3_filter_valid_depth": config_bool(self.config, "sam3_filter_valid_depth", True),
             "sam3_required": config_bool(self.config, "sam3_required", False),
+            "depth_scale_validation_enabled": bool(self.depth_scale_enabled_var.get()),
+            "depth_scale_reference_distance_mm": float(self.depth_scale_reference_var.get() or 0),
+            "depth_scale_validation_tolerance_mm": float(self.config.get("depth_scale_validation_tolerance_mm", 5.0)),
+            "depth_scale_validation_tolerance_percent": float(self.config.get("depth_scale_validation_tolerance_percent", 0.5)),
+            "world_coordinate_enabled": bool(self.world_enabled_var.get()),
+            "world_reference_prompt": self.world_reference_prompt_var.get().strip() or "fixed target",
+            "world_reference_required": config_bool(self.config, "world_reference_required", False),
+            "world_reference_min_points": int(self.config.get("world_reference_min_points", 200)),
         }
 
     def apply_reconstruction_settings(self) -> bool:
@@ -1390,6 +1409,8 @@ class StereoCaptureApp:
         confidence_quality = quality.get("confidence", {}).get("valid_depth", {})
         point_quality = quality.get("point_cloud", {})
         object_mask = reconstruction.get("object_mask", {})
+        scale_validation = reconstruction.get("depth_scale_validation", {})
+        world_status = reconstruction.get("world_coordinate_system", {})
         confidence_warnings = confidence_filter.get("warnings") or []
         warning_text = "；".join(map(str, confidence_warnings)) if confidence_warnings else "无"
         return (
@@ -1419,12 +1440,17 @@ class StereoCaptureApp:
             f"Confidence Warnings: {warning_text}\n"
             f"SAM3 object_mask: status={object_mask.get('status', '--')} prompt={object_mask.get('prompt', '--')} "
             f"mask_ratio={object_mask.get('mask_ratio', '--')} kept_depth={object_mask.get('valid_depth_kept_ratio', '--')}\n"
+            f"Depth Scale Validation: status={scale_validation.get('status', '--')} ref={scale_validation.get('reference_distance_mm', '--')}mm "
+            f"median={scale_validation.get('median_depth_mm', '--')}mm error={scale_validation.get('error_mm', '--')}mm\n"
+            f"World Coordinate: status={world_status.get('status', '--')} origin={world_status.get('origin_camera_mm', '--')}\n"
             f"质量指标: 有效深度 {quality.get('valid_depth_ratio', '--')}；有效视差 {quality.get('valid_disparity_ratio', '--')}；"
             f"置信度均值 {confidence_quality.get('mean', '--')}；深度范围 {depth_quality.get('p01', '--')}~{depth_quality.get('p99', '--')} mm；"
             f"点云离群比例 {point_quality.get('outlier_ratio', '--')}\n"
             f"Confidence Map: {reconstruction.get('confidence_map', '--')}\n"
+            f"Valid Depth Mask: {reconstruction.get('valid_depth_npy', '--')}\n"
             f"Object Mask: {reconstruction.get('object_mask_png', '--')}\n"
             f"Semantic Labels: {reconstruction.get('semantic_labels_json', '--')}\n"
+            f"World Cloud: {reconstruction.get('point_cloud_world_ply', '--')}\n"
             f"Semantic Point Cloud PCD: {reconstruction.get('point_cloud_pcd', '--')}\n"
             f"Quality Metrics: {reconstruction.get('quality_metrics_json', '--')}\n"
             f"重建输出: {reconstruction.get('reconstruction_result', '--')}\n"
@@ -2641,6 +2667,10 @@ class StereoCaptureApp:
         self.sam3_enabled_var.set(config_bool(self.config, "sam3_segmentation", True))
         self.sam3_prompt_var.set(optional_config_text(self.config, "sam3_prompt", "object"))
         self.sam3_threshold_var.set(str(self.config.get("sam3_confidence_threshold", 0.25)))
+        self.depth_scale_enabled_var.set(config_bool(self.config, "depth_scale_validation_enabled", False))
+        self.depth_scale_reference_var.set(str(self.config.get("depth_scale_reference_distance_mm", 0.0)))
+        self.world_enabled_var.set(config_bool(self.config, "world_coordinate_enabled", False))
+        self.world_reference_prompt_var.set(optional_config_text(self.config, "world_reference_prompt", "fixed target"))
 
     def _format_apply_result(self, prefix: str, warnings: list[str]) -> str:
         if warnings:

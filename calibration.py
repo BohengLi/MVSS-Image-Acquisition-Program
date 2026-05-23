@@ -804,6 +804,34 @@ def _rectified_point_disparities(cv2, result: dict[str, Any], pair: dict[str, An
     return (left_rect.reshape(-1, 2)[:, 0] - right_rect.reshape(-1, 2)[:, 0]).astype(np.float32)
 
 
+def _rectified_board_mask(
+    cv2,
+    result: dict[str, Any],
+    pair: dict[str, Any],
+    shape: tuple[int, int],
+    scale: float,
+) -> np.ndarray | None:
+    mats = _rectification_matrices(result)
+    if mats is None:
+        return None
+    left_points = np.asarray(pair.get("left_points", []), dtype=np.float32).reshape(-1, 1, 2)
+    if len(left_points) < 3:
+        return None
+    left_rect = cv2.undistortPoints(left_points, mats["K1"], mats["D1"], R=mats["R1"], P=mats["P1"]).reshape(-1, 2)
+    left_rect *= float(scale)
+    finite = np.isfinite(left_rect).all(axis=1)
+    pts = left_rect[finite]
+    if len(pts) < 3:
+        return None
+    mask = np.zeros(shape, dtype=np.uint8)
+    hull = cv2.convexHull(np.round(pts).astype(np.int32).reshape(-1, 1, 2))
+    cv2.fillConvexPoly(mask, hull, 1)
+    pad = max(3, int(round(min(shape) * 0.003)))
+    kernel = np.ones((pad * 2 + 1, pad * 2 + 1), dtype=np.uint8)
+    mask = cv2.dilate(mask, kernel, iterations=1)
+    return mask > 0
+
+
 def _choose_disparity_range(disparities: np.ndarray, scale: float, width: int) -> tuple[int, int]:
     finite = disparities[np.isfinite(disparities)]
     finite = finite[finite > 0]
@@ -1132,6 +1160,8 @@ def _normalize_reconstruction_config(config: dict[str, Any] | None) -> dict[str,
         "left_right_consistency_px": 2.0,
         "left_right_consistency_min_mean": 0.05,
         "left_right_consistency_min_pass_ratio": 0.01,
+        "crestereo_validate_right_disparity": True,
+        "crestereo_lr_fail_fallback": True,
         "wls_consistency_px": 2.0,
         "wls_lambda": 8000.0,
         "wls_sigma_color": 1.5,
@@ -1150,6 +1180,15 @@ def _normalize_reconstruction_config(config: dict[str, Any] | None) -> dict[str,
         "sam3_erode_pixels": 0,
         "sam3_filter_valid_depth": True,
         "sam3_required": False,
+        "sam3_device": "auto",
+        "depth_scale_validation_enabled": False,
+        "depth_scale_reference_distance_mm": 0.0,
+        "depth_scale_validation_tolerance_mm": 5.0,
+        "depth_scale_validation_tolerance_percent": 0.5,
+        "world_coordinate_enabled": False,
+        "world_reference_prompt": "fixed target",
+        "world_reference_required": False,
+        "world_reference_min_points": 200,
     }
     if config:
         normalized.update(config)
@@ -1162,12 +1201,17 @@ def _normalize_reconstruction_config(config: dict[str, Any] | None) -> dict[str,
     normalized["left_right_consistency_px"] = _config_float(normalized, "left_right_consistency_px", 2.0, 1e-6)
     normalized["left_right_consistency_min_mean"] = _config_float(normalized, "left_right_consistency_min_mean", 0.05, 0.0)
     normalized["left_right_consistency_min_pass_ratio"] = _config_float(normalized, "left_right_consistency_min_pass_ratio", 0.01, 0.0)
+    normalized["crestereo_validate_right_disparity"] = _config_bool(normalized, "crestereo_validate_right_disparity", True)
+    normalized["crestereo_lr_fail_fallback"] = _config_bool(normalized, "crestereo_lr_fail_fallback", True)
     normalized["wls_consistency_px"] = _config_float(normalized, "wls_consistency_px", 2.0, 1e-6)
     normalized["wls_lambda"] = _config_float(normalized, "wls_lambda", 8000.0, 0.0)
     normalized["wls_sigma_color"] = _config_float(normalized, "wls_sigma_color", 1.5, 0.0)
     normalized["sam3_segmentation"] = _config_bool(normalized, "sam3_segmentation", True)
     normalized["sam3_filter_valid_depth"] = _config_bool(normalized, "sam3_filter_valid_depth", True)
     normalized["sam3_required"] = _config_bool(normalized, "sam3_required", False)
+    normalized["sam3_device"] = str(normalized.get("sam3_device", "auto") or "auto").strip().lower()
+    if normalized["sam3_device"] not in {"auto", "cuda", "cpu"}:
+        normalized["sam3_device"] = "auto"
     normalized["sam3_root"] = str(normalized.get("sam3_root", r"D:\SAM3") or "").strip()
     normalized["sam3_python"] = str(normalized.get("sam3_python", r"D:\SAM3\.venv\Scripts\python.exe") or "").strip()
     normalized["sam3_checkpoint"] = str(normalized.get("sam3_checkpoint", "") or "").strip()
@@ -1182,6 +1226,19 @@ def _normalize_reconstruction_config(config: dict[str, Any] | None) -> dict[str,
     if mask_selection not in {"union", "best", "largest"}:
         mask_selection = "union"
     normalized["sam3_mask_selection"] = mask_selection
+    normalized["depth_scale_validation_enabled"] = _config_bool(normalized, "depth_scale_validation_enabled", False)
+    normalized["depth_scale_reference_distance_mm"] = _config_float(normalized, "depth_scale_reference_distance_mm", 0.0, 0.0)
+    normalized["depth_scale_validation_tolerance_mm"] = _config_float(normalized, "depth_scale_validation_tolerance_mm", 5.0, 0.0)
+    normalized["depth_scale_validation_tolerance_percent"] = _config_float(
+        normalized,
+        "depth_scale_validation_tolerance_percent",
+        0.5,
+        0.0,
+    )
+    normalized["world_coordinate_enabled"] = _config_bool(normalized, "world_coordinate_enabled", False)
+    normalized["world_reference_prompt"] = str(normalized.get("world_reference_prompt", "fixed target") or "fixed target").strip() or "fixed target"
+    normalized["world_reference_required"] = _config_bool(normalized, "world_reference_required", False)
+    normalized["world_reference_min_points"] = _config_int(normalized, "world_reference_min_points", 200, 3)
     max_width = _config_int(normalized, "reconstruction_max_width", 2400)
     if max_width <= 0:
         normalized["reconstruction_max_width"] = 0
@@ -1450,6 +1507,120 @@ def _compute_sgbm_disparity(
     }
 
 
+def _left_right_error_metrics_for_candidate(
+    cv2,
+    left_disparity: np.ndarray,
+    right_disparity: np.ndarray,
+    threshold_px: float,
+) -> dict[str, Any]:
+    left = np.asarray(left_disparity, dtype=np.float32)
+    right = np.asarray(right_disparity, dtype=np.float32)
+    if left.shape != right.shape:
+        return {
+            "valid": False,
+            "count": 0,
+            "mean_abs_error_px": None,
+            "median_abs_error_px": None,
+            "p95_abs_error_px": None,
+            "pass_ratio": 0.0,
+        }
+
+    height, width = left.shape[:2]
+    xs, ys = np.meshgrid(np.arange(width, dtype=np.float32), np.arange(height, dtype=np.float32))
+    valid = np.isfinite(left) & np.isfinite(right) & (left > 0.5)
+    map_x = xs - left
+    map_y = ys
+    in_bounds = valid & np.isfinite(map_x) & (map_x >= 0.0) & (map_x <= float(width - 1))
+    if not np.any(in_bounds):
+        return {
+            "valid": False,
+            "count": 0,
+            "mean_abs_error_px": None,
+            "median_abs_error_px": None,
+            "p95_abs_error_px": None,
+            "pass_ratio": 0.0,
+        }
+
+    sampled = cv2.remap(
+        right,
+        map_x.astype(np.float32),
+        map_y.astype(np.float32),
+        cv2.INTER_LINEAR,
+        borderMode=cv2.BORDER_CONSTANT,
+        borderValue=np.nan,
+    )
+    error = np.abs(left + sampled)
+    mask = in_bounds & np.isfinite(error)
+    if not np.any(mask):
+        return {
+            "valid": False,
+            "count": 0,
+            "mean_abs_error_px": None,
+            "median_abs_error_px": None,
+            "p95_abs_error_px": None,
+            "pass_ratio": 0.0,
+        }
+
+    values = error[mask].astype(np.float32, copy=False)
+    return {
+        "valid": True,
+        "count": int(values.size),
+        "mean_abs_error_px": float(np.mean(values)),
+        "median_abs_error_px": float(np.percentile(values, 50)),
+        "p95_abs_error_px": float(np.percentile(values, 95)),
+        "pass_ratio": float(np.count_nonzero(values <= float(threshold_px)) / max(int(values.size), 1)),
+    }
+
+
+def _right_disparity_candidate_score(metrics: dict[str, Any]) -> tuple[float, float, float]:
+    if not metrics.get("valid"):
+        return (float("inf"), float("inf"), 1.0)
+    return (
+        float(metrics.get("median_abs_error_px") if metrics.get("median_abs_error_px") is not None else float("inf")),
+        float(metrics.get("p95_abs_error_px") if metrics.get("p95_abs_error_px") is not None else float("inf")),
+        -float(metrics.get("pass_ratio") or 0.0),
+    )
+
+
+def _select_right_disparity_convention(
+    cv2,
+    left_disparity: np.ndarray,
+    right_raw_disparity: np.ndarray,
+    config: dict[str, Any],
+) -> tuple[np.ndarray, dict[str, Any]]:
+    right_raw = np.asarray(right_raw_disparity, dtype=np.float32)
+    if not _config_bool(config, "crestereo_validate_right_disparity", True):
+        return -np.abs(right_raw), {
+            "status": "legacy_negative_abs",
+            "selected": "negative_abs",
+            "validated": False,
+        }
+
+    candidates: dict[str, np.ndarray] = {
+        "raw": right_raw,
+        "negative_raw": -right_raw,
+        "negative_abs": -np.abs(right_raw),
+        "positive_abs": np.abs(right_raw),
+    }
+    threshold_px = _config_float(config, "left_right_consistency_px", 2.0, 1e-6)
+    metrics = {
+        name: _left_right_error_metrics_for_candidate(cv2, left_disparity, candidate, threshold_px)
+        for name, candidate in candidates.items()
+    }
+    selected = min(metrics, key=lambda name: _right_disparity_candidate_score(metrics[name]))
+    selected_metrics = metrics[selected]
+    min_pass_ratio = _config_float(config, "left_right_consistency_min_pass_ratio", 0.01, 0.0)
+    status = "ok" if selected_metrics.get("valid") and float(selected_metrics.get("pass_ratio") or 0.0) >= min_pass_ratio else "invalid"
+    return candidates[selected], {
+        "status": status,
+        "selected": selected,
+        "validated": True,
+        "threshold_px": float(threshold_px),
+        "min_pass_ratio": float(min_pass_ratio),
+        "candidate_metrics": metrics,
+    }
+
+
 def _compute_crestereo_disparity(cv2, left_image, right_image, config: dict[str, Any]) -> dict[str, Any]:
     model_path = str(config.get("crestereo_model_path", "") or "").strip()
     if not model_path:
@@ -1469,13 +1640,20 @@ def _compute_crestereo_disparity(cv2, left_image, right_image, config: dict[str,
 
     result = model.predict(cv2, left_image, right_image)
     right_result = model.predict(cv2, right_image, left_image)
-    right_disparity = -np.abs(np.asarray(right_result.disparity, dtype=np.float32))
+    right_raw = np.asarray(right_result.disparity, dtype=np.float32)
+    right_disparity, right_policy = _select_right_disparity_convention(
+        cv2,
+        np.asarray(result.disparity, dtype=np.float32),
+        right_raw,
+        config,
+    )
     filtered, wls_info = _apply_generic_wls_filter(cv2, result.disparity, left_image, config)
     return {
         "method": "crestereo",
         "raw_disparity": result.disparity.astype(np.float32),
         "disparity": filtered.astype(np.float32),
         "right_disparity": right_disparity.astype(np.float32),
+        "raw_right_disparity": right_raw.astype(np.float32),
         "wls_confidence": None,
         "wls_filter": wls_info,
         "metadata": {
@@ -1486,6 +1664,7 @@ def _compute_crestereo_disparity(cv2, left_image, right_image, config: dict[str,
             "input_names": result.input_names,
             "output_names": result.output_names,
             "right_inference": True,
+            "right_disparity_policy": right_policy,
         },
     }
 
@@ -1929,45 +2108,212 @@ def _semantic_payload_from_mask(
     return semantics, label_payload, path_payload
 
 
-def _run_sam3_object_mask(cv2, image, output_dir: Path, config: dict[str, Any]) -> dict[str, Any]:
+def _validate_depth_scale_from_reference(
+    depth_mm: np.ndarray,
+    valid_depth: np.ndarray,
+    reference_mask: np.ndarray | None,
+    config: dict[str, Any],
+    *,
+    mask_source: str = "valid_depth",
+) -> dict[str, Any]:
+    enabled = _config_bool(config, "depth_scale_validation_enabled", False)
+    reference = _config_float(config, "depth_scale_reference_distance_mm", 0.0, 0.0)
+    tolerance_mm = _config_float(config, "depth_scale_validation_tolerance_mm", 5.0, 0.0)
+    tolerance_percent = _config_float(config, "depth_scale_validation_tolerance_percent", 0.5, 0.0)
+    payload: dict[str, Any] = {
+        "enabled": bool(enabled),
+        "reference_distance_mm": float(reference),
+        "tolerance_mm": float(tolerance_mm),
+        "tolerance_percent": float(tolerance_percent),
+        "status": "disabled",
+    }
+    if not enabled:
+        return payload
+    if reference <= 0:
+        payload.update({"status": "invalid_config", "error": "depth_scale_reference_distance_mm must be positive."})
+        return payload
+
+    mask = np.asarray(valid_depth, dtype=bool) & np.isfinite(depth_mm) & (np.asarray(depth_mm) > 0)
+    if reference_mask is not None:
+        ref = np.asarray(reference_mask, dtype=bool)
+        if ref.shape == mask.shape:
+            mask &= ref
+            payload["mask_source"] = mask_source
+        else:
+            payload["mask_source"] = "valid_depth_shape_mismatch"
+    else:
+        payload["mask_source"] = "valid_depth"
+
+    values = np.asarray(depth_mm, dtype=np.float32)[mask]
+    if values.size == 0:
+        payload.update({"status": "no_valid_samples", "sample_count": 0})
+        return payload
+
+    median_depth = float(np.percentile(values, 50))
+    mean_depth = float(np.mean(values))
+    error_mm = median_depth - float(reference)
+    error_percent = 100.0 * error_mm / max(float(reference), 1e-6)
+    abs_error = abs(error_mm)
+    pass_mm = abs_error <= tolerance_mm
+    pass_percent = abs(error_percent) <= tolerance_percent
+    payload.update(
+        {
+            "status": "pass" if pass_mm and pass_percent else "fail",
+            "sample_count": int(values.size),
+            "mean_depth_mm": mean_depth,
+            "median_depth_mm": median_depth,
+            "p05_depth_mm": float(np.percentile(values, 5)),
+            "p95_depth_mm": float(np.percentile(values, 95)),
+            "error_mm": float(error_mm),
+            "abs_error_mm": float(abs_error),
+            "error_percent": float(error_percent),
+            "pass_tolerance_mm": bool(pass_mm),
+            "pass_tolerance_percent": bool(pass_percent),
+        }
+    )
+    return payload
+
+
+def _build_world_coordinate_payload(
+    cv2,
+    image,
+    points: np.ndarray,
+    depth_mm: np.ndarray,
+    valid_depth: np.ndarray,
+    p1: np.ndarray,
+    focal: float,
+    scale: float,
+    config: dict[str, Any],
+    output_dir: Path,
+) -> dict[str, Any]:
+    enabled = _config_bool(config, "world_coordinate_enabled", False)
+    metadata: dict[str, Any] = {
+        "enabled": bool(enabled),
+        "status": "disabled",
+        "coordinate_definition": {
+            "source": "camera",
+            "world_axes": "identity unless a fixed target is detected; units are millimeters",
+        },
+    }
+    if not enabled:
+        return {"points_world": None, "metadata": metadata, "metadata_path": ""}
+
+    reference_result = _run_sam3_object_mask(
+        cv2,
+        image,
+        output_dir,
+        config,
+        role="world_reference",
+        prompt=str(config.get("world_reference_prompt", "fixed target")),
+        required=_config_bool(config, "world_reference_required", False),
+    )
+    ref_mask = np.asarray(reference_result.get("mask", np.zeros(image.shape[:2], dtype=bool)), dtype=bool)
+    ref_metadata = dict(reference_result.get("metadata", {}))
+    min_points = _config_int(config, "world_reference_min_points", 200, 3)
+    metadata["reference_target"] = ref_metadata
+    if not bool(ref_metadata.get("enabled", False)):
+        metadata.update({"status": "sam3_disabled", "reference_point_count": 0})
+        return {"points_world": None, "metadata": metadata, "metadata_path": str(output_dir / "world_coordinate_system.json")}
+
+    final_points = np.asarray(points, dtype=np.float32).reshape(-1, 3)
+    if final_points.size == 0:
+        metadata.update({"status": "no_output_points", "reference_point_count": 0})
+        return {"points_world": None, "metadata": metadata, "metadata_path": str(output_dir / "world_coordinate_system.json")}
+
+    if bool(reference_result.get("usable", False)) and ref_mask.shape == image.shape[:2]:
+        reference_valid = np.asarray(valid_depth, dtype=bool) & ref_mask & np.isfinite(depth_mm) & (np.asarray(depth_mm) > 0)
+        ref_ys, ref_xs = np.nonzero(reference_valid)
+    else:
+        ref_ys = np.empty((0,), dtype=np.int64)
+        ref_xs = np.empty((0,), dtype=np.int64)
+
+    if len(ref_xs) < min_points:
+        metadata.update(
+            {
+                "status": "reference_insufficient",
+                "reference_point_count": int(len(ref_xs)),
+                "min_points": int(min_points),
+                "note": "SAM3 fixed-target detection did not overlap enough valid pre-object-mask depth pixels.",
+            }
+        )
+        return {"points_world": None, "metadata": metadata, "metadata_path": str(output_dir / "world_coordinate_system.json")}
+
+    z = np.asarray(depth_mm, dtype=np.float32)[ref_ys, ref_xs]
+    cx = float(p1[0, 2]) * float(scale)
+    cy = float(p1[1, 2]) * float(scale)
+    ref_x = (ref_xs.astype(np.float32) - cx) * z / max(float(focal), 1e-6)
+    ref_y = (ref_ys.astype(np.float32) - cy) * z / max(float(focal), 1e-6)
+    ref_points = np.column_stack([ref_x, ref_y, z]).astype(np.float32)
+    origin = np.median(ref_points, axis=0).astype(np.float32)
+    points_world = (final_points - origin.reshape(1, 3)).astype(np.float32)
+    metadata.update(
+        {
+            "status": "origin_from_sam3_fixed_target",
+            "origin_camera_mm": [float(v) for v in origin.tolist()],
+            "reference_point_count": int(len(ref_xs)),
+            "transform_camera_to_world": {
+                "R": [[1.0, 0.0, 0.0], [0.0, 1.0, 0.0], [0.0, 0.0, 1.0]],
+                "t_mm": [float(-origin[0]), float(-origin[1]), float(-origin[2])],
+            },
+        }
+    )
+    return {"points_world": points_world, "metadata": metadata, "metadata_path": str(output_dir / "world_coordinate_system.json")}
+
+
+def _run_sam3_object_mask(
+    cv2,
+    image,
+    output_dir: Path,
+    config: dict[str, Any],
+    *,
+    role: str = "object",
+    prompt: str | None = None,
+    required: bool | None = None,
+) -> dict[str, Any]:
+    role_name = re.sub(r"[^A-Za-z0-9_]+", "_", str(role or "object")).strip("_") or "object"
+    prompt_text = str(prompt if prompt is not None else config.get("sam3_prompt", "object")).strip() or "object"
+    is_required = bool(config.get("sam3_required", False) if required is None else required)
     metadata: dict[str, Any] = {
         "enabled": bool(config.get("sam3_segmentation", True)),
         "filter_valid_depth": bool(config.get("sam3_filter_valid_depth", True)),
         "status": "disabled",
-        "prompt": str(config.get("sam3_prompt", "object")),
+        "role": role_name,
+        "prompt": prompt_text,
         "mask_pixels": 0,
         "mask_ratio": 0.0,
     }
     if not bool(config.get("sam3_segmentation", True)):
         return {
-            "mask": np.ones(image.shape[:2], dtype=bool),
+            "mask": np.zeros(image.shape[:2], dtype=bool),
             "metadata": metadata,
             "paths": {},
+            "usable": False,
         }
 
+    failed_mask = np.zeros(image.shape[:2], dtype=bool)
     sam3_root = Path(str(config.get("sam3_root", r"D:\SAM3") or r"D:\SAM3"))
     if not sam3_root.is_dir():
         metadata.update({"status": "skipped", "error": f"SAM3 root not found: {sam3_root}"})
-        if bool(config.get("sam3_required", False)):
+        if is_required:
             raise CalibrationError(metadata["error"])
-        return {"mask": np.ones(image.shape[:2], dtype=bool), "metadata": metadata, "paths": {}}
+        return {"mask": failed_mask, "metadata": metadata, "paths": {}, "usable": False}
 
     if not SAM3_MASK_SCRIPT.is_file():
         metadata.update({"status": "skipped", "error": f"SAM3 adapter script not found: {SAM3_MASK_SCRIPT}"})
-        if bool(config.get("sam3_required", False)):
+        if is_required:
             raise CalibrationError(metadata["error"])
-        return {"mask": np.ones(image.shape[:2], dtype=bool), "metadata": metadata, "paths": {}}
+        return {"mask": failed_mask, "metadata": metadata, "paths": {}, "usable": False}
 
     python_exe = _resolve_sam3_python(config)
-    input_path = output_dir / "sam3_input_left_rectified.png"
-    mask_path = output_dir / "object_mask.png"
-    mask_npy_path = output_dir / "object_mask.npy"
-    instance_map_path = output_dir / "object_instance_map.npy"
-    semantic_map_path = output_dir / "object_semantic_map.npy"
-    confidence_map_path = output_dir / "object_semantic_confidence.npy"
-    label_map_path = output_dir / "semantic_labels.json"
-    preview_path = output_dir / "object_mask_preview.png"
-    metadata_path = output_dir / "object_mask_metadata.json"
+    input_path = output_dir / f"sam3_input_{role_name}_left_rectified.png"
+    mask_path = output_dir / f"{role_name}_mask.png"
+    mask_npy_path = output_dir / f"{role_name}_mask.npy"
+    instance_map_path = output_dir / f"{role_name}_instance_map.npy"
+    semantic_map_path = output_dir / f"{role_name}_semantic_map.npy"
+    confidence_map_path = output_dir / f"{role_name}_semantic_confidence.npy"
+    label_map_path = output_dir / f"{role_name}_semantic_labels.json"
+    preview_path = output_dir / f"{role_name}_mask_preview.png"
+    metadata_path = output_dir / f"{role_name}_mask_metadata.json"
     _write_image(cv2, input_path, image)
 
     command = [
@@ -1990,7 +2336,7 @@ def _run_sam3_object_mask(cv2, image, output_dir: Path, config: dict[str, Any]) 
         "--sam3-root",
         str(sam3_root),
         "--prompt",
-        str(config.get("sam3_prompt", "object")),
+        prompt_text,
         "--threshold",
         str(float(config.get("sam3_confidence_threshold", 0.25))),
         "--top-k",
@@ -1999,6 +2345,8 @@ def _run_sam3_object_mask(cv2, image, output_dir: Path, config: dict[str, Any]) 
         str(int(config.get("sam3_resolution", 1008))),
         "--selection",
         str(config.get("sam3_mask_selection", "union")),
+        "--device",
+        str(config.get("sam3_device", "auto")),
     ]
     checkpoint = str(config.get("sam3_checkpoint", "") or "").strip()
     if checkpoint:
@@ -2018,9 +2366,9 @@ def _run_sam3_object_mask(cv2, image, output_dir: Path, config: dict[str, Any]) 
     except Exception as exc:
         metadata.update({"status": "failed", "error": str(exc), "python": python_exe})
         _write_json(metadata_path, metadata)
-        if bool(config.get("sam3_required", False)):
+        if is_required:
             raise CalibrationError(f"SAM3 object mask failed: {exc}") from exc
-        return {"mask": np.ones(image.shape[:2], dtype=bool), "metadata": metadata, "paths": {"metadata": str(metadata_path)}}
+        return {"mask": failed_mask, "metadata": metadata, "paths": {"metadata": str(metadata_path)}, "usable": False}
 
     metadata.update(
         {
@@ -2035,9 +2383,9 @@ def _run_sam3_object_mask(cv2, image, output_dir: Path, config: dict[str, Any]) 
     if completed.returncode != 0:
         metadata["error"] = completed.stderr.strip() or completed.stdout.strip() or "SAM3 subprocess failed."
         _write_json(metadata_path, metadata)
-        if bool(config.get("sam3_required", False)):
+        if is_required:
             raise CalibrationError(f"SAM3 object mask failed: {metadata['error']}")
-        return {"mask": np.ones(image.shape[:2], dtype=bool), "metadata": metadata, "paths": {"metadata": str(metadata_path)}}
+        return {"mask": failed_mask, "metadata": metadata, "paths": {"metadata": str(metadata_path)}, "usable": False}
 
     if metadata_path.exists():
         try:
@@ -2049,9 +2397,9 @@ def _run_sam3_object_mask(cv2, image, output_dir: Path, config: dict[str, Any]) 
     if not mask_path.exists():
         metadata.update({"status": "failed", "error": f"SAM3 did not write mask: {mask_path}"})
         _write_json(metadata_path, metadata)
-        if bool(config.get("sam3_required", False)):
+        if is_required:
             raise CalibrationError(metadata["error"])
-        return {"mask": np.ones(image.shape[:2], dtype=bool), "metadata": metadata, "paths": {"metadata": str(metadata_path)}}
+        return {"mask": failed_mask, "metadata": metadata, "paths": {"metadata": str(metadata_path)}, "usable": False}
 
     mask_image = _read_gray(cv2, mask_path)
     if mask_image.shape[:2] != image.shape[:2]:
@@ -2086,6 +2434,7 @@ def _run_sam3_object_mask(cv2, image, output_dir: Path, config: dict[str, Any]) 
     return {
         "mask": object_mask,
         "metadata": metadata,
+        "usable": bool(mask_pixels > 0),
         "paths": {
             "input": str(input_path),
             "mask": str(mask_path),
@@ -2743,6 +3092,34 @@ def _compute_reconstruction_arrays(
         right_disparity=disparity_result.get("right_disparity"),
         wls_confidence=disparity_result.get("wls_confidence"),
     )
+    right_policy = disparity_result.get("metadata", {}).get("right_disparity_policy", {})
+    lr_invalid = (
+        disparity_result.get("method") == "crestereo"
+        and isinstance(right_policy, dict)
+        and right_policy.get("validated")
+        and right_policy.get("status") != "ok"
+    )
+    if lr_invalid and _config_bool(config, "crestereo_lr_fail_fallback", True):
+        disparity_result = _compute_sgbm_disparity(cv2, gray_left, gray_right, left_small, min_disp, num_disp, config)
+        disparity_result["metadata"]["fallback_from"] = "crestereo"
+        disparity_result["metadata"]["fallback_reason"] = "CREStereo right disparity failed left-right validation."
+        disparity_result["metadata"]["crestereo_right_disparity_policy"] = right_policy
+        raw_disparity = np.asarray(disparity_result["raw_disparity"], dtype=np.float32)
+        disparity = np.asarray(disparity_result["disparity"], dtype=np.float32)
+        valid = np.isfinite(disparity) & (disparity > max(0.5, float(min_disp) + 0.25))
+        confidence, confidence_info = _compute_confidence_map(
+            cv2,
+            gray_left_raw,
+            gray_right_raw,
+            disparity,
+            valid,
+            config,
+            raw_disparity=raw_disparity,
+            right_disparity=disparity_result.get("right_disparity"),
+            wls_confidence=disparity_result.get("wls_confidence"),
+        )
+    elif lr_invalid and not _config_bool(config, "crestereo_lr_fail_fallback", True):
+        raise CalibrationError("CREStereo right disparity failed left-right validation; enable crestereo_lr_fail_fallback or fix the model convention.")
     confidence_threshold = float(config["confidence_threshold"])
     confidence_enabled = bool(config["confidence_filter"])
     if confidence_enabled:
@@ -2820,6 +3197,24 @@ def rectify_stereo_image_arrays(
     return StereoRectifier(calibration_result).rectify(left_image, right_image)
 
 
+def _same_file_path(left: str | Path, right: str | Path) -> bool:
+    try:
+        return Path(left).resolve().samefile(Path(right).resolve())
+    except Exception:
+        return str(Path(left)).replace("\\", "/").casefold() == str(Path(right)).replace("\\", "/").casefold()
+
+
+def _find_calibration_pair_for_sources(
+    calibration_result: dict[str, Any],
+    left_image_path: str | Path,
+    right_image_path: str | Path,
+) -> dict[str, Any] | None:
+    for pair in calibration_result.get("accepted_pairs", []):
+        if _same_file_path(pair.get("left", ""), left_image_path) and _same_file_path(pair.get("right", ""), right_image_path):
+            return pair
+    return None
+
+
 def reconstruct_stereo_images(
     left_image_path: str | Path,
     right_image_path: str | Path,
@@ -2852,10 +3247,11 @@ def reconstruct_stereo_images(
     rectified_pair_path = rectified_dir / "rectified_pair.png"
     _write_image(cv2, rectified_pair_path, rectified_pair_image)
 
+    matched_pair = _find_calibration_pair_for_sources(calibration_result, left_image_path, right_image_path)
     reconstruction = _generate_reconstruction_artifacts(
         cv2,
         calibration_result,
-        {},
+        matched_pair or {},
         left_rectified,
         right_rectified,
         rectified_pair_image,
@@ -2914,7 +3310,8 @@ def _generate_reconstruction_artifacts(
     object_mask_metadata = dict(object_mask_result.get("metadata", {}))
     object_mask_paths = dict(object_mask_result.get("paths", {}))
     valid_depth_before_object_mask = valid_depth.copy()
-    if bool(config.get("sam3_segmentation", True)) and bool(config.get("sam3_filter_valid_depth", True)):
+    object_mask_usable = bool(object_mask_result.get("usable", False))
+    if bool(config.get("sam3_segmentation", True)) and bool(config.get("sam3_filter_valid_depth", True)) and object_mask_usable:
         if object_mask.shape[:2] != valid_depth.shape[:2]:
             object_mask = cv2.resize(object_mask.astype(np.uint8), (valid_depth.shape[1], valid_depth.shape[0]), interpolation=cv2.INTER_NEAREST) > 0
         valid_depth = valid_depth & object_mask
@@ -2926,6 +3323,8 @@ def _generate_reconstruction_artifacts(
             "valid_depth_kept_ratio": float(
                 np.count_nonzero(valid_depth) / max(int(np.count_nonzero(valid_depth_before_object_mask)), 1)
             ),
+            "usable_for_filtering": bool(object_mask_usable),
+            "semantic_point_cloud": bool(object_mask_usable),
         }
     )
     arrays["object_mask"] = object_mask
@@ -2940,11 +3339,15 @@ def _generate_reconstruction_artifacts(
     filtered_disparity_path = reconstruction_dir / "disparity.npy"
     confidence_path = reconstruction_dir / "confidence_map.png"
     confidence_npy_path = reconstruction_dir / "confidence.npy"
+    valid_disparity_npy_path = reconstruction_dir / "valid_disparity.npy"
+    valid_depth_npy_path = reconstruction_dir / "valid_depth.npy"
     _write_image(cv2, disparity_path, disparity_image)
     _write_image(cv2, confidence_path, _confidence_image(cv2, confidence, np.isfinite(disparity)))
     np.save(raw_disparity_path, raw_disparity.astype(np.float32))
     np.save(filtered_disparity_path, disparity.astype(np.float32))
     np.save(confidence_npy_path, confidence.astype(np.float32))
+    np.save(valid_disparity_npy_path, valid.astype(np.uint8))
+    np.save(valid_depth_npy_path, valid_depth.astype(np.uint8))
 
     rectification = result["stereo"]["rectification"]
     p1 = np.asarray(rectification["P1"], dtype=np.float64)
@@ -2975,7 +3378,38 @@ def _generate_reconstruction_artifacts(
         ys,
         xs,
     )
+    world_payload = _build_world_coordinate_payload(
+        cv2,
+        left_small,
+        points,
+        depth_mm,
+        valid_depth_before_object_mask,
+        p1,
+        focal,
+        scale,
+        config,
+        reconstruction_dir,
+    )
+    board_mask = _rectified_board_mask(cv2, result, pair, valid_depth.shape, scale)
+    if board_mask is not None:
+        scale_mask = board_mask
+        scale_mask_source = "rectified_calibration_board"
+    elif object_mask_usable:
+        scale_mask = object_mask
+        scale_mask_source = "sam3_object_mask"
+    else:
+        scale_mask = None
+        scale_mask_source = "valid_depth"
+    scale_validation = _validate_depth_scale_from_reference(
+        depth_mm,
+        valid_depth,
+        scale_mask,
+        config,
+        mask_source=scale_mask_source,
+    )
     quality_metrics = _evaluate_reconstruction_quality(result, arrays, points)
+    quality_metrics["depth_scale_validation"] = scale_validation
+    quality_metrics["world_coordinate_system"] = world_payload["metadata"]
 
     point_cloud_path = reconstruction_dir / "point_cloud.ply"
     point_cloud_pcd_path = reconstruction_dir / "point_cloud.pcd"
@@ -2985,7 +3419,12 @@ def _generate_reconstruction_artifacts(
     quality_metrics_path = reconstruction_dir / "quality_metrics.json"
     _save_ply(point_cloud_path, points, colors, semantic_payload)
     _save_pcd_ascii(point_cloud_pcd_path, points, colors, semantic_payload)
+    if world_payload["points_world"] is not None:
+        _save_ply(reconstruction_dir / "point_cloud_world.ply", world_payload["points_world"], colors, semantic_payload)
+        _save_pcd_ascii(reconstruction_dir / "point_cloud_world.pcd", world_payload["points_world"], colors, semantic_payload)
     _write_json(semantic_labels_path, semantic_labels)
+    if world_payload["metadata_path"]:
+        _write_json(Path(world_payload["metadata_path"]), world_payload["metadata"])
     _write_json(quality_metrics_path, quality_metrics)
     _save_point_cloud_plot(point_cloud_preview_path, points, colors, "Point cloud")
     _make_reconstruction_montage(
@@ -3021,6 +3460,8 @@ def _generate_reconstruction_artifacts(
         "disparity_npy": str(filtered_disparity_path),
         "confidence_map": str(confidence_path),
         "confidence_npy": str(confidence_npy_path),
+        "valid_disparity_npy": str(valid_disparity_npy_path),
+        "valid_depth_npy": str(valid_depth_npy_path),
         "object_mask_png": object_mask_paths.get("mask", ""),
         "object_mask_npy": object_mask_paths.get("mask_npy", ""),
         "object_instance_map_npy": object_mask_paths.get("instance_map", ""),
@@ -3029,6 +3470,11 @@ def _generate_reconstruction_artifacts(
         "object_mask_preview": object_mask_paths.get("preview", ""),
         "object_mask_metadata_json": object_mask_paths.get("metadata", ""),
         "semantic_labels_json": str(semantic_labels_path),
+        "depth_scale_validation": scale_validation,
+        "world_coordinate_system": world_payload["metadata"],
+        "world_coordinate_json": world_payload["metadata_path"],
+        "point_cloud_world_ply": str(reconstruction_dir / "point_cloud_world.ply") if world_payload["points_world"] is not None else "",
+        "point_cloud_world_pcd": str(reconstruction_dir / "point_cloud_world.pcd") if world_payload["points_world"] is not None else "",
         "depth_map": str(depth_path),
         "depth_mm_npy": str(depth_npy_path),
         "point_cloud_ply": str(point_cloud_path),

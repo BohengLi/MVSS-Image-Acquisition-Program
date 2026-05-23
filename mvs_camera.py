@@ -20,6 +20,17 @@ class MvsError(RuntimeError):
     pass
 
 
+def _config_bool(config: dict[str, Any], key: str, default: bool) -> bool:
+    value = config.get(key, default)
+    if isinstance(value, bool):
+        return value
+    if value is None:
+        return default
+    if isinstance(value, (int, float)):
+        return bool(value)
+    return str(value).strip().lower() in {"1", "true", "yes", "y", "on", "enabled"}
+
+
 def _add_mvs_runtime_path() -> None:
     candidates: list[Path] = []
     if sys.maxsize > 2**32:
@@ -610,6 +621,10 @@ class StereoCameraSystem:
         self.right_info: CameraInfo | None = None
         self.trigger_source = str(config.get("trigger_source", "Software"))
         self.timeout_ms = int(config.get("frame_timeout_ms", 3000))
+        self.timestamp_reject_enabled = _config_bool(config, "timestamp_reject_enabled", True)
+        self.max_camera_timestamp_delta = int(config.get("max_camera_timestamp_delta", 0) or 0)
+        self.max_host_timestamp_delta = int(config.get("max_host_timestamp_delta", 0) or 0)
+        self.require_hardware_trigger = _config_bool(config, "require_hardware_trigger", False)
         self._capture_lock = threading.Lock()
 
     def connect(self) -> tuple[CameraInfo, CameraInfo]:
@@ -777,6 +792,9 @@ class StereoCameraSystem:
         if self.left is None or self.right is None:
             raise MvsError("相机尚未连接。")
 
+        if self.require_hardware_trigger and self.trigger_source.lower() == "software":
+            raise MvsError("Hardware trigger is required, but trigger_source is Software.")
+
         if self.trigger_source.lower() == "software":
             barrier = threading.Barrier(3)
             errors: list[BaseException] = []
@@ -819,4 +837,20 @@ class StereoCameraSystem:
 
         if errors:
             raise MvsError("; ".join(str(exc) for exc in errors))
+        self._validate_frame_sync(frames["left"], frames["right"])
         return frames["left"], frames["right"], trigger_time
+
+    def _validate_frame_sync(self, left: Frame, right: Frame) -> None:
+        if not self.timestamp_reject_enabled:
+            return
+        issues: list[str] = []
+        if self.max_camera_timestamp_delta > 0:
+            camera_delta = abs(int(left.camera_timestamp) - int(right.camera_timestamp))
+            if camera_delta > self.max_camera_timestamp_delta:
+                issues.append(f"camera timestamp delta {camera_delta} exceeds {self.max_camera_timestamp_delta}")
+        if self.max_host_timestamp_delta > 0:
+            host_delta = abs(int(left.host_timestamp) - int(right.host_timestamp))
+            if host_delta > self.max_host_timestamp_delta:
+                issues.append(f"host timestamp delta {host_delta} exceeds {self.max_host_timestamp_delta}")
+        if issues:
+            raise MvsError("Stereo frame rejected: " + "; ".join(issues))
