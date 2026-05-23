@@ -44,6 +44,20 @@ class CalibrationError(RuntimeError):
     pass
 
 
+class CREStereoFallbackRequired(CalibrationError):
+    def __init__(
+        self,
+        reason: str,
+        *,
+        stage: str = "inference",
+        right_disparity_policy: dict[str, Any] | None = None,
+    ) -> None:
+        super().__init__(reason)
+        self.reason = reason
+        self.stage = stage
+        self.right_disparity_policy = right_disparity_policy or {}
+
+
 BASE_DIR = Path(__file__).resolve().parent
 SAM3_MASK_SCRIPT = BASE_DIR / "sam3_mask_inference.py"
 _CRESTEREO_MODEL_CACHE: dict[tuple[str, tuple[str, ...] | None], Any] = {}
@@ -1151,6 +1165,9 @@ def _normalize_reconstruction_config(config: dict[str, Any] | None) -> dict[str,
     normalized = {
         "reconstruction_method": "sgbm",
         "allow_sgbm_fallback": True,
+        "prompt_before_sgbm_fallback": True,
+        "force_sgbm_fallback": False,
+        "sgbm_fallback_reason": "",
         "crestereo_model_path": "",
         "crestereo_providers": ["CUDAExecutionProvider", "CPUExecutionProvider"],
         "use_wls_filter": True,
@@ -1194,6 +1211,9 @@ def _normalize_reconstruction_config(config: dict[str, Any] | None) -> dict[str,
         normalized.update(config)
     normalized["reconstruction_method"] = str(normalized.get("reconstruction_method", "sgbm")).strip().lower() or "sgbm"
     normalized["allow_sgbm_fallback"] = _config_bool(normalized, "allow_sgbm_fallback", True)
+    normalized["prompt_before_sgbm_fallback"] = _config_bool(normalized, "prompt_before_sgbm_fallback", True)
+    normalized["force_sgbm_fallback"] = _config_bool(normalized, "force_sgbm_fallback", False)
+    normalized["sgbm_fallback_reason"] = str(normalized.get("sgbm_fallback_reason", "") or "").strip()
     normalized["use_wls_filter"] = _config_bool(normalized, "use_wls_filter", True)
     normalized["confidence_filter"] = _config_bool(normalized, "confidence_filter", True)
     normalized["confidence_threshold"] = _config_float(normalized, "confidence_threshold", 0.35, 0.0)
@@ -1404,6 +1424,7 @@ def check_reconstruction_environment(config: dict[str, Any] | None = None) -> di
         "ok": bool(ok),
         "method": method,
         "allow_sgbm_fallback": bool(normalized.get("allow_sgbm_fallback", True)),
+        "prompt_before_sgbm_fallback": bool(normalized.get("prompt_before_sgbm_fallback", True)),
         "checks": checks,
         "warnings": warnings,
         "errors": errors,
@@ -1580,6 +1601,29 @@ def _right_disparity_candidate_score(metrics: dict[str, Any]) -> tuple[float, fl
         float(metrics.get("p95_abs_error_px") if metrics.get("p95_abs_error_px") is not None else float("inf")),
         -float(metrics.get("pass_ratio") or 0.0),
     )
+
+
+def _format_right_disparity_policy(policy: dict[str, Any]) -> str:
+    if not isinstance(policy, dict) or not policy:
+        return ""
+    selected = policy.get("selected", "")
+    metrics = policy.get("candidate_metrics", {})
+    selected_metrics = metrics.get(selected, {}) if isinstance(metrics, dict) else {}
+    parts = [
+        f"selected={selected or '--'}",
+        f"status={policy.get('status', '--')}",
+        f"threshold_px={policy.get('threshold_px', '--')}",
+        f"min_pass_ratio={policy.get('min_pass_ratio', '--')}",
+    ]
+    if selected_metrics:
+        parts.extend(
+            [
+                f"pass_ratio={selected_metrics.get('pass_ratio', '--')}",
+                f"median_abs_error_px={selected_metrics.get('median_abs_error_px', '--')}",
+                f"p95_abs_error_px={selected_metrics.get('p95_abs_error_px', '--')}",
+            ]
+        )
+    return ", ".join(parts)
 
 
 def _select_right_disparity_convention(
@@ -2282,29 +2326,6 @@ def _run_sam3_object_mask(
         "mask_pixels": 0,
         "mask_ratio": 0.0,
     }
-    if not bool(config.get("sam3_segmentation", True)):
-        return {
-            "mask": np.zeros(image.shape[:2], dtype=bool),
-            "metadata": metadata,
-            "paths": {},
-            "usable": False,
-        }
-
-    failed_mask = np.zeros(image.shape[:2], dtype=bool)
-    sam3_root = Path(str(config.get("sam3_root", r"D:\SAM3") or r"D:\SAM3"))
-    if not sam3_root.is_dir():
-        metadata.update({"status": "skipped", "error": f"SAM3 root not found: {sam3_root}"})
-        if is_required:
-            raise CalibrationError(metadata["error"])
-        return {"mask": failed_mask, "metadata": metadata, "paths": {}, "usable": False}
-
-    if not SAM3_MASK_SCRIPT.is_file():
-        metadata.update({"status": "skipped", "error": f"SAM3 adapter script not found: {SAM3_MASK_SCRIPT}"})
-        if is_required:
-            raise CalibrationError(metadata["error"])
-        return {"mask": failed_mask, "metadata": metadata, "paths": {}, "usable": False}
-
-    python_exe = _resolve_sam3_python(config)
     input_path = output_dir / f"sam3_input_{role_name}_left_rectified.png"
     mask_path = output_dir / f"{role_name}_mask.png"
     mask_npy_path = output_dir / f"{role_name}_mask.npy"
@@ -2314,9 +2335,69 @@ def _run_sam3_object_mask(
     label_map_path = output_dir / f"{role_name}_semantic_labels.json"
     preview_path = output_dir / f"{role_name}_mask_preview.png"
     metadata_path = output_dir / f"{role_name}_mask_metadata.json"
+
+    def write_failed_outputs(status: str, error: str = "") -> dict[str, Any]:
+        metadata.update({"status": status})
+        if error:
+            metadata["error"] = error
+        output_dir.mkdir(parents=True, exist_ok=True)
+        empty_mask = np.zeros(image.shape[:2], dtype=bool)
+        try:
+            if not input_path.exists():
+                _write_image(cv2, input_path, image)
+        except Exception:
+            pass
+        np.save(mask_npy_path, empty_mask.astype(np.uint8))
+        np.save(instance_map_path, np.zeros(image.shape[:2], dtype=np.int32))
+        np.save(semantic_map_path, np.zeros(image.shape[:2], dtype=np.int32))
+        np.save(confidence_map_path, np.zeros(image.shape[:2], dtype=np.float32))
+        _write_image(cv2, mask_path, empty_mask.astype(np.uint8) * 255)
+        _write_image(cv2, preview_path, _mask_preview_image(cv2, image, empty_mask))
+        _write_json(
+            label_map_path,
+            {
+                "labels": [{"semantic_id": 0, "label": "background"}],
+                "instances": [],
+            },
+        )
+        _write_json(metadata_path, metadata)
+        return {
+            "mask": empty_mask,
+            "metadata": metadata,
+            "paths": {
+                "input": str(input_path),
+                "mask": str(mask_path),
+                "mask_npy": str(mask_npy_path),
+                "instance_map": str(instance_map_path),
+                "semantic_map": str(semantic_map_path),
+                "confidence_map": str(confidence_map_path),
+                "label_map": str(label_map_path),
+                "preview": str(preview_path),
+                "metadata": str(metadata_path),
+            },
+            "usable": False,
+        }
+
+    if not bool(config.get("sam3_segmentation", True)):
+        return write_failed_outputs("disabled")
+
+    sam3_root = Path(str(config.get("sam3_root", r"D:\SAM3") or r"D:\SAM3"))
+    if not sam3_root.is_dir():
+        metadata.update({"status": "skipped", "error": f"SAM3 root not found: {sam3_root}"})
+        if is_required:
+            raise CalibrationError(metadata["error"])
+        return write_failed_outputs("skipped", metadata["error"])
+
+    if not SAM3_MASK_SCRIPT.is_file():
+        metadata.update({"status": "skipped", "error": f"SAM3 adapter script not found: {SAM3_MASK_SCRIPT}"})
+        if is_required:
+            raise CalibrationError(metadata["error"])
+        return write_failed_outputs("skipped", metadata["error"])
+
+    python_exe = _resolve_sam3_python(config)
     _write_image(cv2, input_path, image)
 
-    command = [
+    base_command = [
         python_exe,
         str(SAM3_MASK_SCRIPT),
         "--image",
@@ -2350,12 +2431,12 @@ def _run_sam3_object_mask(
     ]
     checkpoint = str(config.get("sam3_checkpoint", "") or "").strip()
     if checkpoint:
-        command.extend(["--checkpoint", checkpoint])
+        base_command.extend(["--checkpoint", checkpoint])
 
-    try:
+    def run_command(command: list[str]):
         import subprocess
 
-        completed = subprocess.run(
+        return subprocess.run(
             command,
             cwd=str(sam3_root),
             capture_output=True,
@@ -2363,12 +2444,35 @@ def _run_sam3_object_mask(
             timeout=int(config.get("sam3_timeout_seconds", 600)),
             check=False,
         )
+
+    try:
+        completed = run_command(base_command)
+        stderr_text = completed.stderr or ""
+        stdout_text = completed.stdout or ""
+        cuda_oom = (
+            completed.returncode != 0
+            and str(config.get("sam3_device", "auto")).lower() == "auto"
+            and ("outofmemoryerror" in stderr_text.lower() or "cuda out of memory" in stderr_text.lower())
+        )
+        if cuda_oom:
+            cpu_command = list(base_command)
+            device_index = cpu_command.index("--device") + 1
+            cpu_command[device_index] = "cpu"
+            completed_cpu = run_command(cpu_command)
+            metadata["cuda_retry"] = {
+                "triggered": True,
+                "first_returncode": int(completed.returncode),
+                "first_stdout": stdout_text[-4000:],
+                "first_stderr": stderr_text[-4000:],
+                "retry_device": "cpu",
+                "retry_returncode": int(completed_cpu.returncode),
+            }
+            completed = completed_cpu
     except Exception as exc:
         metadata.update({"status": "failed", "error": str(exc), "python": python_exe})
-        _write_json(metadata_path, metadata)
         if is_required:
             raise CalibrationError(f"SAM3 object mask failed: {exc}") from exc
-        return {"mask": failed_mask, "metadata": metadata, "paths": {"metadata": str(metadata_path)}, "usable": False}
+        return write_failed_outputs("failed", str(exc))
 
     metadata.update(
         {
@@ -2382,10 +2486,9 @@ def _run_sam3_object_mask(
     )
     if completed.returncode != 0:
         metadata["error"] = completed.stderr.strip() or completed.stdout.strip() or "SAM3 subprocess failed."
-        _write_json(metadata_path, metadata)
         if is_required:
             raise CalibrationError(f"SAM3 object mask failed: {metadata['error']}")
-        return {"mask": failed_mask, "metadata": metadata, "paths": {"metadata": str(metadata_path)}, "usable": False}
+        return write_failed_outputs("failed", metadata["error"])
 
     if metadata_path.exists():
         try:
@@ -2396,10 +2499,9 @@ def _run_sam3_object_mask(
 
     if not mask_path.exists():
         metadata.update({"status": "failed", "error": f"SAM3 did not write mask: {mask_path}"})
-        _write_json(metadata_path, metadata)
         if is_required:
             raise CalibrationError(metadata["error"])
-        return {"mask": failed_mask, "metadata": metadata, "paths": {"metadata": str(metadata_path)}, "usable": False}
+        return write_failed_outputs("failed", metadata["error"])
 
     mask_image = _read_gray(cv2, mask_path)
     if mask_image.shape[:2] != image.shape[:2]:
@@ -3041,6 +3143,7 @@ def _compute_reconstruction_arrays(
     point_disparities: np.ndarray | None = None,
 ) -> dict[str, Any]:
     config = _normalize_reconstruction_config(reconstruction_config)
+    prompt_before_fallback = bool(config.get("prompt_before_sgbm_fallback", True))
     height, width = left_rectified.shape[:2]
     method_requested = str(config["reconstruction_method"]).lower()
     scale, resource_policy = _resolve_reconstruction_scale(config, width, height, method_requested)
@@ -3057,12 +3160,23 @@ def _compute_reconstruction_arrays(
     min_disp, num_disp = _choose_disparity_range(point_disparities, scale, small_size[0])
 
     fallback_error = ""
-    if method_requested in {"cres", "crestereo", "crestereo_onnx"}:
+    if bool(config.get("force_sgbm_fallback", False)):
+        fallback_error = str(config.get("sgbm_fallback_reason", "") or "User approved SGBM fallback.")
+        disparity_result = _compute_sgbm_disparity(cv2, gray_left, gray_right, left_small, min_disp, num_disp, config)
+        disparity_result["metadata"]["fallback_from"] = "crestereo"
+        disparity_result["metadata"]["fallback_reason"] = fallback_error
+        disparity_result["metadata"]["fallback_user_approved"] = True
+    elif method_requested in {"cres", "crestereo", "crestereo_onnx"}:
         try:
             disparity_result = _compute_crestereo_disparity(cv2, left_small, right_small, config)
         except Exception as exc:
             if not bool(config["allow_sgbm_fallback"]):
                 raise
+            if prompt_before_fallback:
+                raise CREStereoFallbackRequired(
+                    f"CREStereo failed before producing a usable disparity: {exc}",
+                    stage="inference",
+                ) from exc
             fallback_error = str(exc)
             disparity_result = _compute_sgbm_disparity(cv2, gray_left, gray_right, left_small, min_disp, num_disp, config)
             disparity_result["metadata"]["fallback_from"] = "crestereo"
@@ -3071,6 +3185,13 @@ def _compute_reconstruction_arrays(
         try:
             disparity_result = _compute_crestereo_disparity(cv2, left_small, right_small, config)
         except Exception as exc:
+            if not bool(config["allow_sgbm_fallback"]):
+                raise
+            if prompt_before_fallback:
+                raise CREStereoFallbackRequired(
+                    f"CREStereo failed before producing a usable disparity: {exc}",
+                    stage="inference",
+                ) from exc
             fallback_error = str(exc)
             disparity_result = _compute_sgbm_disparity(cv2, gray_left, gray_right, left_small, min_disp, num_disp, config)
             disparity_result["metadata"]["fallback_from"] = "crestereo"
@@ -3100,9 +3221,19 @@ def _compute_reconstruction_arrays(
         and right_policy.get("status") != "ok"
     )
     if lr_invalid and _config_bool(config, "crestereo_lr_fail_fallback", True):
+        fallback_error = (
+            "CREStereo right disparity failed left-right validation. "
+            + _format_right_disparity_policy(right_policy)
+        ).strip()
+        if bool(config.get("allow_sgbm_fallback", True)) and prompt_before_fallback:
+            raise CREStereoFallbackRequired(
+                fallback_error,
+                stage="left_right_validation",
+                right_disparity_policy=right_policy,
+            )
         disparity_result = _compute_sgbm_disparity(cv2, gray_left, gray_right, left_small, min_disp, num_disp, config)
         disparity_result["metadata"]["fallback_from"] = "crestereo"
-        disparity_result["metadata"]["fallback_reason"] = "CREStereo right disparity failed left-right validation."
+        disparity_result["metadata"]["fallback_reason"] = fallback_error
         disparity_result["metadata"]["crestereo_right_disparity_policy"] = right_policy
         raw_disparity = np.asarray(disparity_result["raw_disparity"], dtype=np.float32)
         disparity = np.asarray(disparity_result["disparity"], dtype=np.float32)

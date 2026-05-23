@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import math
+import queue
 import shutil
 import subprocess
 import threading
@@ -995,6 +996,7 @@ class StereoCaptureApp:
         return {
             "reconstruction_method": method,
             "allow_sgbm_fallback": bool(self.recon_allow_fallback_var.get()),
+            "prompt_before_sgbm_fallback": True,
             "crestereo_model_path": self.recon_model_path_var.get().strip(),
             "crestereo_providers": self.config.get("crestereo_providers", ["CUDAExecutionProvider", "CPUExecutionProvider"]),
             "use_wls_filter": bool(self.recon_wls_var.get()),
@@ -1205,6 +1207,75 @@ class StereoCaptureApp:
             if hasattr(self, "calibration_result_text") and self.last_calibration_result is None:
                 self._set_calibration_result_text(self._format_reconstruction_preflight_detail(report))
         return True
+
+    def _ask_crestereo_fallback(self, exc: Exception) -> bool:
+        reason = getattr(exc, "reason", str(exc))
+        return messagebox.askyesno(
+            "CREStereo 验证未通过",
+            "CREStereo 未能通过当前重建验证。\n\n"
+            f"原因：{reason}\n\n"
+            "是否改用 SGBM fallback 继续本次重建？",
+        )
+
+    def _confirm_crestereo_fallback(self, exc: Exception) -> bool:
+        if threading.current_thread() is threading.main_thread():
+            return self._ask_crestereo_fallback(exc)
+        response_queue: queue.Queue[bool] = queue.Queue(maxsize=1)
+        self.ui_queue.put(("crestereo_fallback_prompt", (exc, response_queue)))
+        try:
+            return bool(response_queue.get())
+        except Exception:
+            return False
+
+    def _run_with_optional_sgbm_fallback(self, operation: Callable[[dict], Any], reconstruction_config: dict) -> Any:
+        try:
+            from calibration import CREStereoFallbackRequired
+        except Exception:
+            CREStereoFallbackRequired = None
+
+        try:
+            return operation(dict(reconstruction_config))
+        except Exception as exc:
+            if CREStereoFallbackRequired is None or not isinstance(exc, CREStereoFallbackRequired):
+                raise
+            if not self._confirm_crestereo_fallback(exc):
+                raise
+            reconstruction_config["force_sgbm_fallback"] = True
+            reconstruction_config["prompt_before_sgbm_fallback"] = False
+            reconstruction_config["sgbm_fallback_reason"] = getattr(exc, "reason", str(exc))
+            return operation(dict(reconstruction_config))
+
+    def _run_worker_with_fallback_prompt(
+        self,
+        operation: Callable[[dict], Any],
+        reconstruction_config: dict,
+        *,
+        on_success: Callable[[Any], None],
+        on_error: Callable[[Exception], None],
+    ) -> None:
+        def ask_user(exc: Exception) -> bool:
+            return self._confirm_crestereo_fallback(exc)
+
+        try:
+            from calibration import CREStereoFallbackRequired
+        except Exception:
+            CREStereoFallbackRequired = None
+
+        try:
+            try:
+                result = operation(dict(reconstruction_config))
+            except Exception as exc:
+                if CREStereoFallbackRequired is None or not isinstance(exc, CREStereoFallbackRequired):
+                    raise
+                if not ask_user(exc):
+                    raise
+                reconstruction_config["force_sgbm_fallback"] = True
+                reconstruction_config["prompt_before_sgbm_fallback"] = False
+                reconstruction_config["sgbm_fallback_reason"] = getattr(exc, "reason", str(exc))
+                result = operation(dict(reconstruction_config))
+            on_success(result)
+        except Exception as exc:
+            on_error(exc)
 
     def refresh_calibration_summary(self) -> None:
         if not hasattr(self, "calibration_summary_vars") or not self.calibration_summary_vars:
@@ -1740,7 +1811,10 @@ class StereoCaptureApp:
                 left_bgr = self._pil_to_bgr(left.image)
                 right_bgr = self._pil_to_bgr(right.image)
                 left_rectified, right_rectified = rectifier.rectify(left_bgr, right_bgr)
-                preview = reconstruct_rectified_pair_preview(left_rectified, right_rectified, calibration_result, reconstruction_config)
+                preview = self._run_with_optional_sgbm_fallback(
+                    lambda config: reconstruct_rectified_pair_preview(left_rectified, right_rectified, calibration_result, config),
+                    reconstruction_config,
+                )
                 info = self._status_with_stats(
                     f"实时深度：{preview['method_requested']} -> {preview['disparity_result']['method']}；目标 {target_fps:g} fps"
                 )
@@ -2104,6 +2178,12 @@ class StereoCaptureApp:
                     self.status_var.set(self._format_preflight_summary(payload))
                     if hasattr(self, "calibration_result_text") and self.last_calibration_result is None:
                         self._set_calibration_result_text(self._format_reconstruction_preflight_detail(payload))
+                elif kind == "crestereo_fallback_prompt":
+                    exc, response_queue = payload
+                    try:
+                        response_queue.put(self._ask_crestereo_fallback(exc))
+                    except Exception:
+                        response_queue.put(False)
                 elif kind == "viewer_error":
                     self.status_var.set(str(payload).splitlines()[0] if str(payload).strip() else "Open3D 点云查看器打开失败。")
                     messagebox.showerror("点云查看器打开失败", str(payload))
@@ -2502,19 +2582,29 @@ class StereoCaptureApp:
         open_cloud_button.pack(side=RIGHT, padx=(0, 8))
 
         def worker() -> None:
-            try:
-                from calibration import reconstruct_stereo_images
+            from calibration import reconstruct_stereo_images
 
-                result = reconstruct_stereo_images(
+            def operation(config: dict) -> dict:
+                return reconstruct_stereo_images(
                     left_var.get(),
                     right_var.get(),
                     calib_var.get(),
                     output_var.get(),
-                    self._current_reconstruction_config(),
+                    config,
                 )
-                self.ui_queue.put(("reconstruction_done", (result, status_var, left_preview, right_preview, open_cloud_button, cloud_path_var)))
-            except Exception as exc:
+
+            def on_error(exc: Exception) -> None:
                 self.ui_queue.put(("error", exc))
+
+            try:
+                self._run_worker_with_fallback_prompt(
+                    operation,
+                    self._current_reconstruction_config(),
+                    on_success=lambda result: self.ui_queue.put(
+                        ("reconstruction_done", (result, status_var, left_preview, right_preview, open_cloud_button, cloud_path_var))
+                    ),
+                    on_error=on_error,
+                )
             finally:
                 self.ui_queue.put(("reconstruction_idle", start_button))
 
@@ -2525,6 +2615,8 @@ class StereoCaptureApp:
                 status_var.set("请先选择左图、右图和标定结果。")
                 return
             if not self.apply_reconstruction_settings():
+                return
+            if not self.ensure_reconstruction_preflight():
                 return
             self.reconstructing = True
             start_button.configure(state=DISABLED)
@@ -2589,10 +2681,10 @@ class StereoCaptureApp:
         reconstruction_config = self._current_reconstruction_config()
 
         def worker() -> None:
-            try:
-                from calibration import calibrate_stereo_from_folders, summarize_result
+            from calibration import calibrate_stereo_from_folders, summarize_result
 
-                result = calibrate_stereo_from_folders(
+            def operation(config: dict) -> dict:
+                return calibrate_stereo_from_folders(
                     resolve_app_path(self.calib_left_dir_var.get()),
                     resolve_app_path(self.calib_right_dir_var.get()),
                     resolve_app_path(self.calib_output_dir_var.get()),
@@ -2603,14 +2695,24 @@ class StereoCaptureApp:
                     marker_size_mm=marker_size,
                     aruco_dictionary=aruco_dictionary,
                     legacy_charuco=pattern == "charuco_legacy",
-                    reconstruction_config=reconstruction_config,
+                    reconstruction_config=config,
                     progress_callback=lambda value, text: self.ui_queue.put(("calibration_progress", (value, text))),
                 )
+
+            def on_success(result: dict) -> None:
                 result["summary_text"] = summarize_result(result)
                 self.ui_queue.put(("calibration_done", result))
-            except Exception as exc:
+
+            def on_error(exc: Exception) -> None:
                 self.ui_queue.put(("error", exc))
                 self.ui_queue.put(("calibration_idle", None))
+
+            self._run_worker_with_fallback_prompt(
+                operation,
+                reconstruction_config,
+                on_success=on_success,
+                on_error=on_error,
+            )
 
         threading.Thread(target=worker, daemon=True).start()
 
