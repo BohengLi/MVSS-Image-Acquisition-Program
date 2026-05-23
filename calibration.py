@@ -6,6 +6,7 @@ import math
 import os
 import re
 import shutil
+import sys
 from datetime import datetime
 from pathlib import Path
 from typing import Any, Callable
@@ -43,6 +44,8 @@ class CalibrationError(RuntimeError):
     pass
 
 
+BASE_DIR = Path(__file__).resolve().parent
+SAM3_MASK_SCRIPT = BASE_DIR / "sam3_mask_inference.py"
 _CRESTEREO_MODEL_CACHE: dict[tuple[str, tuple[str, ...] | None], Any] = {}
 
 
@@ -927,6 +930,95 @@ def _available_cuda_memory_bytes() -> int | None:
     return max(values) if values else None
 
 
+def _resolve_sam3_python(config: dict[str, Any]) -> str:
+    configured = str(config.get("sam3_python", "") or "").strip()
+    if configured:
+        return configured
+    sam3_root = Path(str(config.get("sam3_root", r"D:\SAM3") or r"D:\SAM3"))
+    bundled = sam3_root / ".venv" / "Scripts" / "python.exe"
+    if bundled.exists():
+        return str(bundled)
+    return sys.executable
+
+
+def _find_sam3_cached_checkpoint(sam3_root: Path, filename: str = "sam3.pt") -> Path | None:
+    cache_roots = [
+        sam3_root / "hf_cache" / "hub",
+        Path.home() / ".cache" / "huggingface" / "hub",
+    ]
+    for env_name in ("HUGGINGFACE_HUB_CACHE", "HF_HUB_CACHE"):
+        value = os.environ.get(env_name)
+        if value:
+            cache_roots.insert(0, Path(value))
+    hf_home = os.environ.get("HF_HOME")
+    if hf_home:
+        cache_roots.insert(0, Path(hf_home) / "hub")
+
+    seen: set[str] = set()
+    for cache_root in cache_roots:
+        key = str(cache_root).casefold()
+        if key in seen:
+            continue
+        seen.add(key)
+        snapshots = cache_root / "models--facebook--sam3" / "snapshots"
+        if not snapshots.is_dir():
+            continue
+        for snapshot in sorted(snapshots.iterdir(), key=lambda item: item.name):
+            checkpoint = snapshot / filename
+            if checkpoint.is_file() and checkpoint.stat().st_size > 0:
+                return checkpoint
+    return None
+
+
+def _check_sam3_python(python_exe: str, sam3_root: Path) -> dict[str, Any]:
+    if not python_exe:
+        return {"ok": False, "error": "SAM3 Python executable is not configured."}
+    path = Path(python_exe)
+    if not path.exists():
+        return {"ok": False, "path": python_exe, "error": "SAM3 Python executable does not exist."}
+
+    try:
+        import subprocess
+
+        completed = subprocess.run(
+            [
+                python_exe,
+                "-c",
+                (
+                    "import json, sys; "
+                    f"sys.path.insert(0, {str(sam3_root)!r}); "
+                    "import torch; import sam3; "
+                    "print(json.dumps({"
+                    "'executable': sys.executable, "
+                    "'torch': getattr(torch, '__version__', ''), "
+                    "'cuda': bool(torch.cuda.is_available()), "
+                    "'sam3': getattr(sam3, '__version__', '')"
+                    "}))"
+                ),
+            ],
+            capture_output=True,
+            text=True,
+            timeout=15,
+            check=False,
+        )
+    except Exception as exc:
+        return {"ok": False, "path": python_exe, "error": str(exc)}
+
+    detail: dict[str, Any] = {
+        "path": python_exe,
+        "returncode": int(completed.returncode),
+        "stderr": completed.stderr.strip(),
+    }
+    try:
+        detail.update(json.loads(completed.stdout.strip().splitlines()[-1]))
+    except Exception:
+        detail["stdout"] = completed.stdout.strip()
+    detail["ok"] = completed.returncode == 0
+    if completed.returncode != 0 and not detail.get("error"):
+        detail["error"] = completed.stderr.strip() or completed.stdout.strip()
+    return detail
+
+
 def _estimate_reconstruction_memory_bytes(width: int, height: int, config: dict[str, Any], method_requested: str) -> int:
     pixels = max(int(width) * int(height), 1)
     method = str(method_requested).lower()
@@ -1044,6 +1136,20 @@ def _normalize_reconstruction_config(config: dict[str, Any] | None) -> dict[str,
         "wls_lambda": 8000.0,
         "wls_sigma_color": 1.5,
         "reconstruction_max_width": 2400,
+        "sam3_segmentation": True,
+        "sam3_root": r"D:\SAM3",
+        "sam3_python": r"D:\SAM3\.venv\Scripts\python.exe",
+        "sam3_checkpoint": "",
+        "sam3_prompt": "object",
+        "sam3_confidence_threshold": 0.25,
+        "sam3_top_k": 50,
+        "sam3_resolution": 1008,
+        "sam3_mask_selection": "union",
+        "sam3_timeout_seconds": 600,
+        "sam3_dilate_pixels": 0,
+        "sam3_erode_pixels": 0,
+        "sam3_filter_valid_depth": True,
+        "sam3_required": False,
     }
     if config:
         normalized.update(config)
@@ -1059,6 +1165,23 @@ def _normalize_reconstruction_config(config: dict[str, Any] | None) -> dict[str,
     normalized["wls_consistency_px"] = _config_float(normalized, "wls_consistency_px", 2.0, 1e-6)
     normalized["wls_lambda"] = _config_float(normalized, "wls_lambda", 8000.0, 0.0)
     normalized["wls_sigma_color"] = _config_float(normalized, "wls_sigma_color", 1.5, 0.0)
+    normalized["sam3_segmentation"] = _config_bool(normalized, "sam3_segmentation", True)
+    normalized["sam3_filter_valid_depth"] = _config_bool(normalized, "sam3_filter_valid_depth", True)
+    normalized["sam3_required"] = _config_bool(normalized, "sam3_required", False)
+    normalized["sam3_root"] = str(normalized.get("sam3_root", r"D:\SAM3") or "").strip()
+    normalized["sam3_python"] = str(normalized.get("sam3_python", r"D:\SAM3\.venv\Scripts\python.exe") or "").strip()
+    normalized["sam3_checkpoint"] = str(normalized.get("sam3_checkpoint", "") or "").strip()
+    normalized["sam3_prompt"] = str(normalized.get("sam3_prompt", "object") or "object").strip() or "object"
+    normalized["sam3_confidence_threshold"] = _config_float(normalized, "sam3_confidence_threshold", 0.25, 0.0)
+    normalized["sam3_top_k"] = _config_int(normalized, "sam3_top_k", 50, 0)
+    normalized["sam3_resolution"] = _config_int(normalized, "sam3_resolution", 1008, 224)
+    normalized["sam3_timeout_seconds"] = _config_int(normalized, "sam3_timeout_seconds", 600, 30)
+    normalized["sam3_dilate_pixels"] = _config_int(normalized, "sam3_dilate_pixels", 0, 0)
+    normalized["sam3_erode_pixels"] = _config_int(normalized, "sam3_erode_pixels", 0, 0)
+    mask_selection = str(normalized.get("sam3_mask_selection", "union") or "union").strip().lower()
+    if mask_selection not in {"union", "best", "largest"}:
+        mask_selection = "union"
+    normalized["sam3_mask_selection"] = mask_selection
     max_width = _config_int(normalized, "reconstruction_max_width", 2400)
     if max_width <= 0:
         normalized["reconstruction_max_width"] = 0
@@ -1158,6 +1281,66 @@ def check_reconstruction_environment(config: dict[str, Any] | None = None) -> di
     }
     if bool(normalized.get("use_wls_filter", True)) and not (wls_generic_available or wls_sgbm_available):
         warnings.append("OpenCV ximgproc/WLS 接口不可用；重建会跳过 WLS 滤波。")
+
+    wants_sam3 = bool(normalized.get("sam3_segmentation", True))
+    sam3_root_text = str(normalized.get("sam3_root", "") or "").strip()
+    sam3_root = Path(sam3_root_text) if sam3_root_text else Path()
+    sam3_root_ok = bool(sam3_root_text and sam3_root.exists() and sam3_root.is_dir())
+    checks["sam3_root"] = {
+        "required": wants_sam3,
+        "ok": sam3_root_ok if wants_sam3 else (not sam3_root_text or sam3_root_ok),
+        "path": sam3_root_text,
+    }
+    if wants_sam3 and not sam3_root_ok:
+        message = f"SAM3 path does not exist: {sam3_root_text or '(empty)'}"
+        if bool(normalized.get("sam3_required", False)):
+            errors.append(message)
+        else:
+            warnings.append(message + "; object_mask filtering will be skipped.")
+
+    sam3_script_ok = bool(SAM3_MASK_SCRIPT.exists() and SAM3_MASK_SCRIPT.is_file())
+    checks["sam3_adapter_script"] = {
+        "required": wants_sam3,
+        "ok": sam3_script_ok,
+        "path": str(SAM3_MASK_SCRIPT),
+    }
+    if wants_sam3 and not sam3_script_ok:
+        message = f"SAM3 adapter script is missing: {SAM3_MASK_SCRIPT}"
+        if bool(normalized.get("sam3_required", False)):
+            errors.append(message)
+        else:
+            warnings.append(message + "; object_mask filtering will be skipped.")
+
+    checkpoint_text = str(normalized.get("sam3_checkpoint", "") or "").strip()
+    checkpoint_path = Path(checkpoint_text) if checkpoint_text else (_find_sam3_cached_checkpoint(sam3_root) if sam3_root_ok else None)
+    checkpoint_ok = bool(checkpoint_path and checkpoint_path.is_file() and checkpoint_path.stat().st_size > 0)
+    checks["sam3_checkpoint"] = {
+        "required": wants_sam3,
+        "ok": checkpoint_ok if wants_sam3 else (not checkpoint_text or checkpoint_ok),
+        "path": "" if checkpoint_path is None else str(checkpoint_path),
+        "configured_path": checkpoint_text,
+    }
+    if wants_sam3 and not checkpoint_ok:
+        message = "SAM3 checkpoint was not found; set sam3_checkpoint or keep sam3.pt in D:\\SAM3\\hf_cache."
+        if bool(normalized.get("sam3_required", False)):
+            errors.append(message)
+        else:
+            warnings.append(message + " SAM3 may auto-download it, or object_mask filtering may be skipped.")
+
+    sam3_python = _resolve_sam3_python(normalized)
+    sam3_python_check = _check_sam3_python(sam3_python, sam3_root) if wants_sam3 and sam3_root_ok else {
+        "ok": False,
+        "path": sam3_python,
+        "error": "not checked",
+    }
+    sam3_python_check["required"] = wants_sam3
+    checks["sam3_python"] = sam3_python_check
+    if wants_sam3 and not sam3_python_check.get("ok"):
+        message = f"SAM3 Python environment is not available: {sam3_python_check.get('error', sam3_python)}"
+        if bool(normalized.get("sam3_required", False)):
+            errors.append(message)
+        else:
+            warnings.append(message + "; object_mask filtering will be skipped.")
 
     ok = not errors
     return {
@@ -1522,6 +1705,18 @@ def _confidence_image(cv2, confidence: np.ndarray, valid: np.ndarray):
     return output
 
 
+def _mask_preview_image(cv2, image, mask: np.ndarray):
+    valid_mask = np.asarray(mask, dtype=bool)
+    overlay = image.copy()
+    color = np.zeros_like(overlay)
+    color[:, :] = (0, 190, 255)
+    overlay[valid_mask] = cv2.addWeighted(image[valid_mask], 0.45, color[valid_mask], 0.55, 0)
+    if np.any(valid_mask):
+        contours, _hierarchy = cv2.findContours(valid_mask.astype(np.uint8) * 255, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+        cv2.drawContours(overlay, contours, -1, (0, 255, 255), max(1, int(round(min(image.shape[:2]) / 600))))
+    return overlay
+
+
 def _colored_range_image(cv2, values: np.ndarray, valid: np.ndarray, colormap: int | None = None, invert: bool = False):
     color_map = colormap if colormap is not None else getattr(cv2, "COLORMAP_TURBO", cv2.COLORMAP_JET)
     output = np.zeros((*values.shape, 3), dtype=np.uint8)
@@ -1541,7 +1736,27 @@ def _colored_range_image(cv2, values: np.ndarray, valid: np.ndarray, colormap: i
     return output, (float(lo), float(hi))
 
 
-def _save_ply(path: Path, points: np.ndarray, colors: np.ndarray) -> None:
+def _save_ply(
+    path: Path,
+    points: np.ndarray,
+    colors: np.ndarray,
+    semantics: dict[str, np.ndarray] | None = None,
+) -> None:
+    semantic_label = None if semantics is None else np.asarray(semantics.get("semantic_label", []), dtype=np.int32)
+    semantic_id = None if semantics is None else np.asarray(semantics.get("semantic_id", []), dtype=np.int32)
+    instance_id = None if semantics is None else np.asarray(semantics.get("instance_id", []), dtype=np.int32)
+    confidence = None if semantics is None else np.asarray(semantics.get("confidence", []), dtype=np.float32)
+    has_semantics = (
+        semantic_label is not None
+        and semantic_id is not None
+        and instance_id is not None
+        and confidence is not None
+        and len(semantic_label) == len(points)
+        and len(semantic_id) == len(points)
+        and len(instance_id) == len(points)
+        and len(confidence) == len(points)
+    )
+
     path.parent.mkdir(parents=True, exist_ok=True)
     with path.open("w", encoding="ascii", newline="\n") as fh:
         fh.write("ply\n")
@@ -1553,12 +1768,336 @@ def _save_ply(path: Path, points: np.ndarray, colors: np.ndarray) -> None:
         fh.write("property uchar red\n")
         fh.write("property uchar green\n")
         fh.write("property uchar blue\n")
+        if has_semantics:
+            fh.write("property int semantic_label\n")
+            fh.write("property int semantic_id\n")
+            fh.write("property int instance_id\n")
+            fh.write("property float confidence\n")
         fh.write("end_header\n")
-        for point, color in zip(points, colors):
-            fh.write(
+        for index, (point, color) in enumerate(zip(points, colors)):
+            line = (
                 f"{point[0]:.4f} {point[1]:.4f} {point[2]:.4f} "
-                f"{int(color[0])} {int(color[1])} {int(color[2])}\n"
+                f"{int(color[0])} {int(color[1])} {int(color[2])}"
             )
+            if has_semantics:
+                line += (
+                    f" {int(semantic_label[index])}"
+                    f" {int(semantic_id[index])}"
+                    f" {int(instance_id[index])}"
+                    f" {float(confidence[index]):.6f}"
+                )
+            fh.write(line + "\n")
+
+
+def _save_pcd_ascii(
+    path: Path,
+    points: np.ndarray,
+    colors: np.ndarray,
+    semantics: dict[str, np.ndarray] | None = None,
+) -> None:
+    semantic_label = None if semantics is None else np.asarray(semantics.get("semantic_label", []), dtype=np.int32)
+    semantic_id = None if semantics is None else np.asarray(semantics.get("semantic_id", []), dtype=np.int32)
+    instance_id = None if semantics is None else np.asarray(semantics.get("instance_id", []), dtype=np.int32)
+    confidence = None if semantics is None else np.asarray(semantics.get("confidence", []), dtype=np.float32)
+    has_semantics = (
+        semantic_label is not None
+        and semantic_id is not None
+        and instance_id is not None
+        and confidence is not None
+        and len(semantic_label) == len(points)
+        and len(semantic_id) == len(points)
+        and len(instance_id) == len(points)
+        and len(confidence) == len(points)
+    )
+    fields = ["x", "y", "z", "rgb"]
+    sizes = ["4", "4", "4", "4"]
+    types = ["F", "F", "F", "U"]
+    counts = ["1", "1", "1", "1"]
+    if has_semantics:
+        fields.extend(["semantic_label", "semantic_id", "instance_id", "confidence"])
+        sizes.extend(["4", "4", "4", "4"])
+        types.extend(["I", "I", "I", "F"])
+        counts.extend(["1", "1", "1", "1"])
+
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with path.open("w", encoding="ascii", newline="\n") as fh:
+        fh.write("# .PCD v0.7 - Point Cloud Data file format\n")
+        fh.write("VERSION 0.7\n")
+        fh.write(f"FIELDS {' '.join(fields)}\n")
+        fh.write(f"SIZE {' '.join(sizes)}\n")
+        fh.write(f"TYPE {' '.join(types)}\n")
+        fh.write(f"COUNT {' '.join(counts)}\n")
+        fh.write(f"WIDTH {len(points)}\n")
+        fh.write("HEIGHT 1\n")
+        fh.write("VIEWPOINT 0 0 0 1 0 0 0\n")
+        fh.write(f"POINTS {len(points)}\n")
+        fh.write("DATA ascii\n")
+        for index, (point, color) in enumerate(zip(points, colors)):
+            rgb = (int(color[0]) << 16) | (int(color[1]) << 8) | int(color[2])
+            line = f"{point[0]:.4f} {point[1]:.4f} {point[2]:.4f} {rgb}"
+            if has_semantics:
+                line += (
+                    f" {int(semantic_label[index])}"
+                    f" {int(semantic_id[index])}"
+                    f" {int(instance_id[index])}"
+                    f" {float(confidence[index]):.6f}"
+                )
+            fh.write(line + "\n")
+
+
+def _resize_label_map(cv2, values: np.ndarray, shape: tuple[int, int], dtype) -> np.ndarray:
+    if values.shape[:2] == shape:
+        return values.astype(dtype, copy=False)
+    resized = cv2.resize(values.astype(dtype, copy=False), (shape[1], shape[0]), interpolation=cv2.INTER_NEAREST)
+    return resized.astype(dtype, copy=False)
+
+
+def _semantic_payload_from_mask(
+    cv2,
+    object_mask_result: dict[str, Any],
+    shape: tuple[int, int],
+    ys: np.ndarray,
+    xs: np.ndarray,
+) -> tuple[dict[str, np.ndarray], dict[str, Any], dict[str, str]]:
+    metadata = dict(object_mask_result.get("metadata", {}))
+    paths = dict(object_mask_result.get("paths", {}))
+    semantic_map = np.zeros(shape, dtype=np.int32)
+    instance_map = np.zeros(shape, dtype=np.int32)
+    confidence_map = np.zeros(shape, dtype=np.float32)
+
+    try:
+        if paths.get("semantic_map"):
+            semantic_map = _resize_label_map(cv2, np.load(paths["semantic_map"]), shape, np.int32)
+        elif (
+            metadata.get("status") in {"ok", "empty"}
+            and bool(metadata.get("enabled", False))
+            and np.asarray(object_mask_result.get("mask", np.zeros(shape, dtype=bool)), dtype=bool).shape == shape
+        ):
+            semantic_map = np.asarray(object_mask_result["mask"], dtype=np.int32)
+        if paths.get("instance_map"):
+            instance_map = _resize_label_map(cv2, np.load(paths["instance_map"]), shape, np.int32)
+        elif np.any(semantic_map):
+            instance_map = semantic_map.astype(np.int32)
+        if paths.get("confidence_map"):
+            confidence_map = _resize_label_map(cv2, np.load(paths["confidence_map"]), shape, np.float32)
+        elif np.any(semantic_map):
+            confidence_map = np.where(semantic_map > 0, 1.0, 0.0).astype(np.float32)
+    except Exception as exc:
+        metadata["semantic_projection_warning"] = str(exc)
+        semantic_map = np.zeros(shape, dtype=np.int32)
+        instance_map = np.zeros(shape, dtype=np.int32)
+        confidence_map = np.zeros(shape, dtype=np.float32)
+
+    labels = metadata.get("semantic_labels")
+    if not isinstance(labels, list):
+        labels = [{"semantic_id": 0, "label": "background"}]
+        prompt = str(metadata.get("prompt", "") or "").strip()
+        if prompt and np.any(semantic_map > 0):
+            labels.append({"semantic_id": 1, "label": prompt})
+    labels_by_id: dict[int, str] = {}
+    for item in labels:
+        try:
+            labels_by_id[int(item.get("semantic_id", 0))] = str(item.get("label", ""))
+        except Exception:
+            continue
+
+    sampled_semantic_id = semantic_map[ys, xs].astype(np.int32, copy=False) if len(xs) else np.empty((0,), dtype=np.int32)
+    sampled_instance_id = instance_map[ys, xs].astype(np.int32, copy=False) if len(xs) else np.empty((0,), dtype=np.int32)
+    sampled_confidence = confidence_map[ys, xs].astype(np.float32, copy=False) if len(xs) else np.empty((0,), dtype=np.float32)
+    # PLY/PCD fields are numeric. semantic_label is a numeric alias of semantic_id;
+    # the text label mapping is written to semantic_labels.json.
+    semantics = {
+        "semantic_label": sampled_semantic_id,
+        "semantic_id": sampled_semantic_id,
+        "instance_id": sampled_instance_id,
+        "confidence": sampled_confidence,
+    }
+    label_payload = {
+        "labels": [
+            {"semantic_id": int(key), "label": labels_by_id.get(key, "")}
+            for key in sorted(labels_by_id)
+        ],
+        "instances": metadata.get("objects", []),
+        "fields": {
+            "semantic_label": "numeric semantic class id; see labels for text names",
+            "semantic_id": "numeric semantic class id",
+            "instance_id": "SAM3 instance index assigned per pixel after overlap resolution",
+            "confidence": "SAM3 detection confidence sampled at the source pixel",
+        },
+    }
+    path_payload: dict[str, str] = {}
+    return semantics, label_payload, path_payload
+
+
+def _run_sam3_object_mask(cv2, image, output_dir: Path, config: dict[str, Any]) -> dict[str, Any]:
+    metadata: dict[str, Any] = {
+        "enabled": bool(config.get("sam3_segmentation", True)),
+        "filter_valid_depth": bool(config.get("sam3_filter_valid_depth", True)),
+        "status": "disabled",
+        "prompt": str(config.get("sam3_prompt", "object")),
+        "mask_pixels": 0,
+        "mask_ratio": 0.0,
+    }
+    if not bool(config.get("sam3_segmentation", True)):
+        return {
+            "mask": np.ones(image.shape[:2], dtype=bool),
+            "metadata": metadata,
+            "paths": {},
+        }
+
+    sam3_root = Path(str(config.get("sam3_root", r"D:\SAM3") or r"D:\SAM3"))
+    if not sam3_root.is_dir():
+        metadata.update({"status": "skipped", "error": f"SAM3 root not found: {sam3_root}"})
+        if bool(config.get("sam3_required", False)):
+            raise CalibrationError(metadata["error"])
+        return {"mask": np.ones(image.shape[:2], dtype=bool), "metadata": metadata, "paths": {}}
+
+    if not SAM3_MASK_SCRIPT.is_file():
+        metadata.update({"status": "skipped", "error": f"SAM3 adapter script not found: {SAM3_MASK_SCRIPT}"})
+        if bool(config.get("sam3_required", False)):
+            raise CalibrationError(metadata["error"])
+        return {"mask": np.ones(image.shape[:2], dtype=bool), "metadata": metadata, "paths": {}}
+
+    python_exe = _resolve_sam3_python(config)
+    input_path = output_dir / "sam3_input_left_rectified.png"
+    mask_path = output_dir / "object_mask.png"
+    mask_npy_path = output_dir / "object_mask.npy"
+    instance_map_path = output_dir / "object_instance_map.npy"
+    semantic_map_path = output_dir / "object_semantic_map.npy"
+    confidence_map_path = output_dir / "object_semantic_confidence.npy"
+    label_map_path = output_dir / "semantic_labels.json"
+    preview_path = output_dir / "object_mask_preview.png"
+    metadata_path = output_dir / "object_mask_metadata.json"
+    _write_image(cv2, input_path, image)
+
+    command = [
+        python_exe,
+        str(SAM3_MASK_SCRIPT),
+        "--image",
+        str(input_path),
+        "--output-mask",
+        str(mask_path),
+        "--output-json",
+        str(metadata_path),
+        "--output-instance-map",
+        str(instance_map_path),
+        "--output-semantic-map",
+        str(semantic_map_path),
+        "--output-confidence-map",
+        str(confidence_map_path),
+        "--output-label-map",
+        str(label_map_path),
+        "--sam3-root",
+        str(sam3_root),
+        "--prompt",
+        str(config.get("sam3_prompt", "object")),
+        "--threshold",
+        str(float(config.get("sam3_confidence_threshold", 0.25))),
+        "--top-k",
+        str(int(config.get("sam3_top_k", 50))),
+        "--resolution",
+        str(int(config.get("sam3_resolution", 1008))),
+        "--selection",
+        str(config.get("sam3_mask_selection", "union")),
+    ]
+    checkpoint = str(config.get("sam3_checkpoint", "") or "").strip()
+    if checkpoint:
+        command.extend(["--checkpoint", checkpoint])
+
+    try:
+        import subprocess
+
+        completed = subprocess.run(
+            command,
+            cwd=str(sam3_root),
+            capture_output=True,
+            text=True,
+            timeout=int(config.get("sam3_timeout_seconds", 600)),
+            check=False,
+        )
+    except Exception as exc:
+        metadata.update({"status": "failed", "error": str(exc), "python": python_exe})
+        _write_json(metadata_path, metadata)
+        if bool(config.get("sam3_required", False)):
+            raise CalibrationError(f"SAM3 object mask failed: {exc}") from exc
+        return {"mask": np.ones(image.shape[:2], dtype=bool), "metadata": metadata, "paths": {"metadata": str(metadata_path)}}
+
+    metadata.update(
+        {
+            "status": "ok" if completed.returncode == 0 else "failed",
+            "returncode": int(completed.returncode),
+            "python": python_exe,
+            "sam3_root": str(sam3_root),
+            "stdout": completed.stdout[-4000:],
+            "stderr": completed.stderr[-4000:],
+        }
+    )
+    if completed.returncode != 0:
+        metadata["error"] = completed.stderr.strip() or completed.stdout.strip() or "SAM3 subprocess failed."
+        _write_json(metadata_path, metadata)
+        if bool(config.get("sam3_required", False)):
+            raise CalibrationError(f"SAM3 object mask failed: {metadata['error']}")
+        return {"mask": np.ones(image.shape[:2], dtype=bool), "metadata": metadata, "paths": {"metadata": str(metadata_path)}}
+
+    if metadata_path.exists():
+        try:
+            with metadata_path.open("r", encoding="utf-8") as fh:
+                metadata.update(json.load(fh))
+        except Exception as exc:
+            metadata["metadata_read_error"] = str(exc)
+
+    if not mask_path.exists():
+        metadata.update({"status": "failed", "error": f"SAM3 did not write mask: {mask_path}"})
+        _write_json(metadata_path, metadata)
+        if bool(config.get("sam3_required", False)):
+            raise CalibrationError(metadata["error"])
+        return {"mask": np.ones(image.shape[:2], dtype=bool), "metadata": metadata, "paths": {"metadata": str(metadata_path)}}
+
+    mask_image = _read_gray(cv2, mask_path)
+    if mask_image.shape[:2] != image.shape[:2]:
+        mask_image = cv2.resize(mask_image, (image.shape[1], image.shape[0]), interpolation=cv2.INTER_NEAREST)
+    object_mask = mask_image > 0
+
+    erode_pixels = int(config.get("sam3_erode_pixels", 0))
+    dilate_pixels = int(config.get("sam3_dilate_pixels", 0))
+    if erode_pixels > 0 and np.any(object_mask):
+        kernel = np.ones((erode_pixels * 2 + 1, erode_pixels * 2 + 1), dtype=np.uint8)
+        object_mask = cv2.erode(object_mask.astype(np.uint8), kernel, iterations=1) > 0
+    if dilate_pixels > 0 and np.any(object_mask):
+        kernel = np.ones((dilate_pixels * 2 + 1, dilate_pixels * 2 + 1), dtype=np.uint8)
+        object_mask = cv2.dilate(object_mask.astype(np.uint8), kernel, iterations=1) > 0
+
+    mask_pixels = int(np.count_nonzero(object_mask))
+    metadata.update(
+        {
+            "enabled": True,
+            "filter_valid_depth": bool(config.get("sam3_filter_valid_depth", True)),
+            "status": "ok" if mask_pixels > 0 else "empty",
+            "mask_pixels": mask_pixels,
+            "mask_ratio": float(mask_pixels / max(object_mask.size, 1)),
+            "erode_pixels": erode_pixels,
+            "dilate_pixels": dilate_pixels,
+        }
+    )
+    np.save(mask_npy_path, object_mask.astype(np.uint8))
+    _write_image(cv2, mask_path, (object_mask.astype(np.uint8) * 255))
+    _write_image(cv2, preview_path, _mask_preview_image(cv2, image, object_mask))
+    _write_json(metadata_path, metadata)
+    return {
+        "mask": object_mask,
+        "metadata": metadata,
+        "paths": {
+            "input": str(input_path),
+            "mask": str(mask_path),
+            "mask_npy": str(mask_npy_path),
+            "instance_map": str(instance_map_path),
+            "semantic_map": str(semantic_map_path),
+            "confidence_map": str(confidence_map_path),
+            "label_map": str(label_map_path),
+            "preview": str(preview_path),
+            "metadata": str(metadata_path),
+        },
+    }
 
 
 def _basic_stats(values: np.ndarray) -> dict[str, Any]:
@@ -1678,6 +2217,12 @@ def _evaluate_reconstruction_quality(
     depth_mm = np.asarray(arrays["depth_mm"], dtype=np.float32)
     valid_disparity = np.asarray(arrays["valid_disparity"], dtype=bool)
     valid_depth = np.asarray(arrays["valid_depth"], dtype=bool)
+    object_mask = np.asarray(arrays.get("object_mask", np.ones_like(valid_depth)), dtype=bool)
+    if object_mask.shape != valid_depth.shape:
+        object_mask = np.ones_like(valid_depth, dtype=bool)
+    valid_depth_before_object_mask = np.asarray(arrays.get("valid_depth_before_object_mask", valid_depth), dtype=bool)
+    if valid_depth_before_object_mask.shape != valid_depth.shape:
+        valid_depth_before_object_mask = valid_depth
     total_pixels = int(disparity.size)
     finite_disparity = np.isfinite(disparity)
     finite_depth = np.isfinite(depth_mm) & (depth_mm > 0)
@@ -1689,6 +2234,13 @@ def _evaluate_reconstruction_quality(
         "valid_disparity_ratio": float(np.count_nonzero(valid_disparity) / max(total_pixels, 1)),
         "valid_depth_pixels": int(np.count_nonzero(valid_depth)),
         "valid_depth_ratio": float(np.count_nonzero(valid_depth) / max(total_pixels, 1)),
+        "valid_depth_pixels_before_object_mask": int(np.count_nonzero(valid_depth_before_object_mask)),
+        "valid_depth_ratio_before_object_mask": float(np.count_nonzero(valid_depth_before_object_mask) / max(total_pixels, 1)),
+        "object_mask_pixels": int(np.count_nonzero(object_mask)),
+        "object_mask_ratio": float(np.count_nonzero(object_mask) / max(total_pixels, 1)),
+        "object_mask_valid_depth_kept_ratio": float(
+            np.count_nonzero(valid_depth) / max(int(np.count_nonzero(valid_depth_before_object_mask)), 1)
+        ),
         "finite_disparity_ratio_before_filter": float(np.count_nonzero(finite_disparity) / max(total_pixels, 1)),
         "finite_depth_ratio_before_filter": float(np.count_nonzero(finite_depth) / max(total_pixels, 1)),
         "confidence": {
@@ -2357,6 +2909,30 @@ def _generate_reconstruction_artifacts(
     confidence_info = arrays["confidence_info"]
     confidence_threshold = float(arrays["confidence_threshold"])
     confidence_enabled = bool(arrays["confidence_enabled"])
+    object_mask_result = _run_sam3_object_mask(cv2, left_small, reconstruction_dir, config)
+    object_mask = np.asarray(object_mask_result["mask"], dtype=bool)
+    object_mask_metadata = dict(object_mask_result.get("metadata", {}))
+    object_mask_paths = dict(object_mask_result.get("paths", {}))
+    valid_depth_before_object_mask = valid_depth.copy()
+    if bool(config.get("sam3_segmentation", True)) and bool(config.get("sam3_filter_valid_depth", True)):
+        if object_mask.shape[:2] != valid_depth.shape[:2]:
+            object_mask = cv2.resize(object_mask.astype(np.uint8), (valid_depth.shape[1], valid_depth.shape[0]), interpolation=cv2.INTER_NEAREST) > 0
+        valid_depth = valid_depth & object_mask
+        arrays["valid_depth"] = valid_depth
+    object_mask_metadata.update(
+        {
+            "valid_depth_pixels_before_object_mask": int(np.count_nonzero(valid_depth_before_object_mask)),
+            "valid_depth_pixels_after_object_mask": int(np.count_nonzero(valid_depth)),
+            "valid_depth_kept_ratio": float(
+                np.count_nonzero(valid_depth) / max(int(np.count_nonzero(valid_depth_before_object_mask)), 1)
+            ),
+        }
+    )
+    arrays["object_mask"] = object_mask
+    arrays["object_mask_metadata"] = object_mask_metadata
+    arrays["valid_depth_before_object_mask"] = valid_depth_before_object_mask
+    if object_mask_paths.get("metadata"):
+        _write_json(Path(object_mask_paths["metadata"]), object_mask_metadata)
 
     disparity_image, disparity_range = _colored_range_image(cv2, disparity, valid)
     disparity_path = reconstruction_dir / "disparity_map.png"
@@ -2392,13 +2968,24 @@ def _generate_reconstruction_artifacts(
         points = np.empty((0, 3), dtype=np.float32)
         colors = np.empty((0, 3), dtype=np.uint8)
 
+    semantic_payload, semantic_labels, _semantic_paths = _semantic_payload_from_mask(
+        cv2,
+        object_mask_result,
+        valid_depth.shape,
+        ys,
+        xs,
+    )
     quality_metrics = _evaluate_reconstruction_quality(result, arrays, points)
 
     point_cloud_path = reconstruction_dir / "point_cloud.ply"
+    point_cloud_pcd_path = reconstruction_dir / "point_cloud.pcd"
+    semantic_labels_path = reconstruction_dir / "semantic_labels.json"
     point_cloud_preview_path = reconstruction_dir / "point_cloud_preview.png"
     reconstruction_path = reconstruction_dir / "reconstruction_result.png"
     quality_metrics_path = reconstruction_dir / "quality_metrics.json"
-    _save_ply(point_cloud_path, points, colors)
+    _save_ply(point_cloud_path, points, colors, semantic_payload)
+    _save_pcd_ascii(point_cloud_pcd_path, points, colors, semantic_payload)
+    _write_json(semantic_labels_path, semantic_labels)
     _write_json(quality_metrics_path, quality_metrics)
     _save_point_cloud_plot(point_cloud_preview_path, points, colors, "Point cloud")
     _make_reconstruction_montage(
@@ -2423,6 +3010,7 @@ def _generate_reconstruction_artifacts(
             "threshold": float(confidence_threshold),
             **confidence_info,
         },
+        "object_mask": object_mask_metadata,
         "disparity_range_px": list(disparity_range) if disparity_range else None,
         "depth_range_mm": list(depth_range) if depth_range else None,
         "valid_point_count": int(len(points)),
@@ -2433,9 +3021,18 @@ def _generate_reconstruction_artifacts(
         "disparity_npy": str(filtered_disparity_path),
         "confidence_map": str(confidence_path),
         "confidence_npy": str(confidence_npy_path),
+        "object_mask_png": object_mask_paths.get("mask", ""),
+        "object_mask_npy": object_mask_paths.get("mask_npy", ""),
+        "object_instance_map_npy": object_mask_paths.get("instance_map", ""),
+        "object_semantic_map_npy": object_mask_paths.get("semantic_map", ""),
+        "object_semantic_confidence_npy": object_mask_paths.get("confidence_map", ""),
+        "object_mask_preview": object_mask_paths.get("preview", ""),
+        "object_mask_metadata_json": object_mask_paths.get("metadata", ""),
+        "semantic_labels_json": str(semantic_labels_path),
         "depth_map": str(depth_path),
         "depth_mm_npy": str(depth_npy_path),
         "point_cloud_ply": str(point_cloud_path),
+        "point_cloud_pcd": str(point_cloud_pcd_path),
         "point_cloud_preview": str(point_cloud_preview_path),
         "reconstruction_result": str(reconstruction_path),
         "method_metadata": disparity_result.get("metadata", {}),
@@ -2671,7 +3268,17 @@ def _write_parameter_exports(output_path: Path, result: dict[str, Any]) -> dict[
             "value": artifacts.get("reconstruction", {}),
             "files": "; ".join(
                 str(artifacts.get("reconstruction", {}).get(key, ""))
-                for key in ("disparity_map", "depth_map", "point_cloud_ply", "point_cloud_preview", "reconstruction_result")
+                for key in (
+                    "disparity_map",
+                    "depth_map",
+                    "object_mask_png",
+                    "object_mask_preview",
+                    "point_cloud_ply",
+                    "point_cloud_pcd",
+                    "semantic_labels_json",
+                    "point_cloud_preview",
+                    "reconstruction_result",
+                )
                 if artifacts.get("reconstruction", {}).get(key)
             ),
         },

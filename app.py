@@ -536,6 +536,9 @@ class StereoCaptureApp:
         recon_max_width = self.config.get("reconstruction_max_width", 2400)
         self.recon_max_width_var = StringVar(value="" if recon_max_width in (None, "") else str(recon_max_width))
         self.recon_allow_fallback_var = BooleanVar(value=config_bool(self.config, "allow_sgbm_fallback", True))
+        self.sam3_enabled_var = BooleanVar(value=config_bool(self.config, "sam3_segmentation", True))
+        self.sam3_prompt_var = StringVar(value=optional_config_text(self.config, "sam3_prompt", "object"))
+        self.sam3_threshold_var = StringVar(value=optional_config_text(self.config, "sam3_confidence_threshold", "0.25"))
 
         toolbar = ttk.Frame(root, padding=(10, 8))
         toolbar.pack(side=TOP, fill=X)
@@ -809,6 +812,10 @@ class StereoCaptureApp:
         ttk.Button(recon_panel, text="独立深度重建", command=self.open_reconstruction_dialog, style="Accent.TButton").grid(row=1, column=10, padx=(8, 0), pady=4, sticky="e")
         self._grid_entry(recon_panel, "最大宽度", self.recon_max_width_var, 8, 2, 0)
         ttk.Label(recon_panel, text="0 或留空 = 内存/显存足够时使用原图宽度，否则自动回退", style="Muted.TLabel").grid(row=2, column=2, columnspan=6, padx=(8, 4), pady=3, sticky="w")
+        ttk.Checkbutton(recon_panel, text="SAM3 object_mask", variable=self.sam3_enabled_var).grid(row=3, column=0, padx=(0, 4), pady=4, sticky="w")
+        self._grid_entry(recon_panel, "Prompt", self.sam3_prompt_var, 18, 3, 1)
+        self._grid_entry(recon_panel, "SAM3阈值", self.sam3_threshold_var, 7, 3, 4)
+        ttk.Label(recon_panel, text="object_mask 会过滤 valid_depth 并输出更干净的单视角目标点云", style="Muted.TLabel").grid(row=3, column=6, columnspan=5, padx=(8, 4), pady=3, sticky="w")
 
         left_col = ttk.Frame(container)
         left_col.grid(row=1, column=0, sticky="nsew", padx=(0, 5))
@@ -993,6 +1000,20 @@ class StereoCaptureApp:
             "left_right_consistency_min_pass_ratio": float(self.config.get("left_right_consistency_min_pass_ratio", 0.01)),
             "wls_consistency_px": float(self.config.get("wls_consistency_px", 2.0)),
             "reconstruction_max_width": int(reconstruction_max_width),
+            "sam3_segmentation": bool(self.sam3_enabled_var.get()),
+            "sam3_root": str(self.config.get("sam3_root", r"D:\SAM3")),
+            "sam3_python": str(self.config.get("sam3_python", r"D:\SAM3\.venv\Scripts\python.exe")),
+            "sam3_checkpoint": str(self.config.get("sam3_checkpoint", "")),
+            "sam3_prompt": self.sam3_prompt_var.get().strip() or "object",
+            "sam3_confidence_threshold": float(self.sam3_threshold_var.get()),
+            "sam3_top_k": int(self.config.get("sam3_top_k", 50)),
+            "sam3_resolution": int(self.config.get("sam3_resolution", 1008)),
+            "sam3_mask_selection": str(self.config.get("sam3_mask_selection", "union")),
+            "sam3_timeout_seconds": int(self.config.get("sam3_timeout_seconds", 600)),
+            "sam3_dilate_pixels": int(self.config.get("sam3_dilate_pixels", 0)),
+            "sam3_erode_pixels": int(self.config.get("sam3_erode_pixels", 0)),
+            "sam3_filter_valid_depth": config_bool(self.config, "sam3_filter_valid_depth", True),
+            "sam3_required": config_bool(self.config, "sam3_required", False),
         }
 
     def apply_reconstruction_settings(self) -> bool:
@@ -1103,6 +1124,21 @@ class StereoCaptureApp:
             ]
         )
 
+        sam3_root = checks.get("sam3_root", {})
+        sam3_python = checks.get("sam3_python", {})
+        sam3_checkpoint = checks.get("sam3_checkpoint", {})
+        lines.extend(
+            [
+                f"6. SAM3 object_mask：{self._format_bool_status(bool(sam3_python.get('ok') and sam3_root.get('ok')), bool(sam3_root.get('required')))}",
+                f"   SAM3 路径：{sam3_root.get('path') or '未填写'}",
+                f"   Python：{sam3_python.get('executable') or sam3_python.get('path') or '未填写'}",
+                f"   CUDA：{'可用' if sam3_python.get('cuda') else '不可用'}",
+                f"   权重：{sam3_checkpoint.get('path') or '未找到'}",
+            ]
+        )
+        if sam3_python.get("error"):
+            lines.append(f"   错误信息：{sam3_python.get('error')}")
+
         warnings = report.get("warnings", [])
         errors = report.get("errors", [])
         if warnings:
@@ -1112,7 +1148,7 @@ class StereoCaptureApp:
             lines.extend(["", "错误："])
             lines.extend(f"- {item}" for item in errors)
         if not warnings and not errors:
-            lines.extend(["", "结论：当前环境完整，CREStereo、CUDA、OpenCV ximgproc 和 WLS 均可用。"])
+            lines.extend(["", "结论：当前环境完整，CREStereo、CUDA、OpenCV ximgproc、WLS 和 SAM3 object_mask 均可用。"])
         return "\n".join(lines)
 
     def run_reconstruction_preflight(self) -> None:
@@ -1353,6 +1389,7 @@ class StereoCaptureApp:
         depth_quality = quality.get("depth_mm", {}).get("valid", {})
         confidence_quality = quality.get("confidence", {}).get("valid_depth", {})
         point_quality = quality.get("point_cloud", {})
+        object_mask = reconstruction.get("object_mask", {})
         confidence_warnings = confidence_filter.get("warnings") or []
         warning_text = "；".join(map(str, confidence_warnings)) if confidence_warnings else "无"
         return (
@@ -1380,10 +1417,15 @@ class StereoCaptureApp:
             f"WLS: {wls_filter.get('status', '--')} enabled={wls_filter.get('enabled', '--')}\n"
             f"Confidence Filtering: enabled={confidence_filter.get('enabled', '--')} threshold={confidence_filter.get('threshold', '--')} sources={confidence_filter.get('sources', '--')}\n"
             f"Confidence Warnings: {warning_text}\n"
+            f"SAM3 object_mask: status={object_mask.get('status', '--')} prompt={object_mask.get('prompt', '--')} "
+            f"mask_ratio={object_mask.get('mask_ratio', '--')} kept_depth={object_mask.get('valid_depth_kept_ratio', '--')}\n"
             f"质量指标: 有效深度 {quality.get('valid_depth_ratio', '--')}；有效视差 {quality.get('valid_disparity_ratio', '--')}；"
             f"置信度均值 {confidence_quality.get('mean', '--')}；深度范围 {depth_quality.get('p01', '--')}~{depth_quality.get('p99', '--')} mm；"
             f"点云离群比例 {point_quality.get('outlier_ratio', '--')}\n"
             f"Confidence Map: {reconstruction.get('confidence_map', '--')}\n"
+            f"Object Mask: {reconstruction.get('object_mask_png', '--')}\n"
+            f"Semantic Labels: {reconstruction.get('semantic_labels_json', '--')}\n"
+            f"Semantic Point Cloud PCD: {reconstruction.get('point_cloud_pcd', '--')}\n"
             f"Quality Metrics: {reconstruction.get('quality_metrics_json', '--')}\n"
             f"重建输出: {reconstruction.get('reconstruction_result', '--')}\n"
         )
@@ -2596,6 +2638,9 @@ class StereoCaptureApp:
         recon_max_width = self.config.get("reconstruction_max_width", 2400)
         self.recon_max_width_var.set("" if recon_max_width in (None, "") else str(recon_max_width))
         self.recon_allow_fallback_var.set(config_bool(self.config, "allow_sgbm_fallback", True))
+        self.sam3_enabled_var.set(config_bool(self.config, "sam3_segmentation", True))
+        self.sam3_prompt_var.set(optional_config_text(self.config, "sam3_prompt", "object"))
+        self.sam3_threshold_var.set(str(self.config.get("sam3_confidence_threshold", 0.25)))
 
     def _format_apply_result(self, prefix: str, warnings: list[str]) -> str:
         if warnings:

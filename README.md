@@ -142,6 +142,10 @@ reconstruction/depth_map.png      深度图
 reconstruction/disparity.npy       WLS 后视差矩阵，单位 px
 reconstruction/raw_disparity.npy   原始视差矩阵，单位 px
 reconstruction/confidence.npy      置信度矩阵，范围 0~1
+reconstruction/object_mask.png     SAM3 目标分割 mask
+reconstruction/object_mask.npy     SAM3 目标分割 mask，0/1
+reconstruction/object_mask_preview.png
+reconstruction/object_mask_metadata.json
 reconstruction/depth_mm.npy       深度矩阵，单位 mm
 reconstruction/point_cloud.ply    点云文件
 reconstruction/point_cloud_preview.png
@@ -171,6 +175,8 @@ plots/calibration_board_poses.png 标定板三维位姿图
 标定页现在提供 `重建参数` 面板，可直接切换 `auto` / `crestereo` / `sgbm`，选择 ONNX 模型，设置 WLS 开关、`lambda`、`sigma_color`、置信度过滤阈值、左右一致性阈值和 SGBM fallback。点击 `保存参数` 会写回 `config.json`，点击 `开始标定` 也会使用当前面板参数生成诊断重建。
 
 程序启动后会自动做一次重建环境自检；标定页也可点击 `自检` 手动检查。自检项目包括 CREStereo 模型文件、`onnxruntime`、CUDA ExecutionProvider、OpenCV `ximgproc` 和 WLS 接口。标定、独立深度重建和实时深度开始前都会执行自检；如果 CREStereo 不可用但允许 SGBM fallback，会给出警告并继续，否则会阻止任务开始。
+
+可启用 SAM3 单视角目标分割来清理点云。默认 SAM3 路径为 `D:\SAM3`，程序会调用 `D:\SAM3\.venv\Scripts\python.exe` 运行 `sam3_mask_inference.py`，基于左校正图生成 `object_mask`，再用 `object_mask & valid_depth` 过滤深度点，输出更干净的单视角目标点云。标定页可调整 SAM3 开关、prompt 和阈值；更多参数在 `config.json` 中设置，包括 `sam3_checkpoint`、`sam3_top_k`、`sam3_resolution`、`sam3_mask_selection`、`sam3_dilate_pixels` 和 `sam3_erode_pixels`。
 
 当 `reconstruction_method` 为 `crestereo` 时，程序优先使用 CREStereo ONNX 输出视差，并继续执行 WLS 和置信度过滤；如果模型或 `onnxruntime` 不可用且 `allow_sgbm_fallback=true`，会回退到 SGBM + WLS。CREStereo 路径会额外执行左右互换推理生成 right disparity，置信度会融合光度一致性、left-right consistency 和 WLS 相关一致性；如果 left-right consistency 分量整体过低，程序会自动忽略该分量并在结果中写入提示，避免把整张深度图过滤成黑图。重建结果会在 `calibration_result.json` 的 `artifacts.reconstruction` 中记录实际使用的 `method_used`、`wls_filter` 和 `confidence_filter` 状态。
 
