@@ -78,6 +78,22 @@
     }
   },
   "reconstruction_method": "crestereo",
-  "allow_sgbm_fallback": "True",
-  "crestereo_model_path": "D:\\CREStereo\\models\\crestereo_combined_iter10_720x1280.onnx"
+  "allow_sgbm_fallback": true,
+  "crestereo_model_path": "D:\\CREStereo\\models\\crestereo_combined_iter10_720x1280.onnx",
+  "crestereo_providers": [
+    "CUDAExecutionProvider",
+    "CPUExecutionProvider"
+  ],
+  "use_wls_filter": true,
+  "wls_lambda": 6000.0,
+  "wls_sigma_color": 1.2,
+  "confidence_filter": true,
+  "confidence_threshold": 0.3,
+  "confidence_photometric_sigma": 0.15,
+  "left_right_consistency_px": 2.0,
+  "left_right_consistency_min_mean": 0.05,
+  "left_right_consistency_min_pass_ratio": 0.01,
+  "wls_consistency_px": 2.0,
+  "reconstruction_max_width": 5472,
+  "point_cloud_viewer_python": "C:\\Users\\93658\\AppData\\Local\\Programs\\Python\\Python312\\python.exe"
 }

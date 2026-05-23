@@ -11,7 +11,7 @@ import webbrowser
 from dataclasses import asdict
 from pathlib import Path
 from queue import Empty, Queue
-from tkinter import BOTH, BOTTOM, DISABLED, LEFT, NORMAL, RIGHT, TOP, X, Canvas, DoubleVar, Frame, Scrollbar, StringVar, Text, Tk, Toplevel, filedialog, messagebox
+from tkinter import BOTH, BOTTOM, DISABLED, LEFT, NORMAL, RIGHT, TOP, X, BooleanVar, Canvas, DoubleVar, Frame, Scrollbar, StringVar, Text, Tk, Toplevel, filedialog, messagebox
 from tkinter import ttk
 
 import numpy as np
@@ -24,6 +24,7 @@ from mvs_camera import MvsError, StereoCameraSystem, enumerate_cameras
 BASE_DIR = Path(__file__).resolve().parent
 CONFIG_PATH = BASE_DIR / "config.json"
 PATTERN_GENERATOR_DIR = Path(r"E:\Desktop\SAM3\calibration-pattern-generator")
+POINT_CLOUD_VIEWER_SCRIPT = BASE_DIR / "point_cloud_viewer.py"
 BG_COLOR = "#2d2d2d"
 PANEL_COLOR = "#404040"
 CANVAS_COLOR = "#111111"
@@ -70,6 +71,24 @@ def optional_int_text(text: str) -> int | None:
     if not value:
         return None
     return int(value)
+
+
+def config_bool(config: dict, key: str, default: bool) -> bool:
+    value = config.get(key, default)
+    if isinstance(value, bool):
+        return value
+    if value is None:
+        return default
+    if isinstance(value, (int, float)):
+        return bool(value)
+    return str(value).strip().lower() in {"1", "true", "yes", "y", "on", "enabled"}
+
+
+def python_launcher_command(version: str = "3.12") -> list[str]:
+    configured = str(load_config().get("point_cloud_viewer_python", "")).strip() if CONFIG_PATH.exists() else ""
+    if configured:
+        return [configured]
+    return ["py", f"-{version}"]
 
 
 def estimate_frame_bytes(config: dict, width: int = 5472, height: int = 3648) -> int:
@@ -178,6 +197,80 @@ class ImagePane(Frame):
         else:
             self.set_zoom(self.zoom / 1.1)
 
+
+class CalibrationResultTab(Frame):
+    def __init__(self, master: Tk | Toplevel | Frame):
+        super().__init__(master, bg=BG_COLOR)
+        self.grid_rowconfigure(0, weight=1)
+        self.grid_columnconfigure(0, weight=1)
+
+        notebook = ttk.Notebook(self)
+        notebook.grid(row=0, column=0, sticky="nsew")
+
+        self.result_tab = ttk.Frame(notebook, padding=(10, 10))
+        self.artifact_tab = ttk.Frame(notebook, padding=(10, 10))
+        notebook.add(self.result_tab, text="2 识别与结果")
+        notebook.add(self.artifact_tab, text="3 结果图像")
+
+        self.result_tab.grid_rowconfigure(1, weight=1)
+        self.result_tab.grid_columnconfigure(0, weight=1)
+        self.artifact_tab.grid_rowconfigure(0, weight=1)
+        self.artifact_tab.grid_columnconfigure(0, weight=1)
+        self.artifact_tab.grid_columnconfigure(1, weight=1)
+        self.artifact_tab.grid_columnconfigure(2, weight=1)
+
+        self.status_var = StringVar(value="")
+        ttk.Label(self.result_tab, textvariable=self.status_var, style="Status.TLabel", anchor="w", padding=(0, 4)).grid(row=0, column=0, sticky="ew")
+
+        self.left_image_pane = CalibrationImagePane(self.result_tab, "左相机识别")
+        self.right_image_pane = CalibrationImagePane(self.result_tab, "右相机识别")
+        self.left_image_pane.grid(row=1, column=0, sticky="nsew", pady=(4, 0))
+        self.right_image_pane.grid(row=2, column=0, sticky="nsew", pady=(8, 0))
+
+        right_result = ttk.Frame(self.result_tab)
+        right_result.grid(row=1, column=1, rowspan=2, sticky="nsew", padx=(8, 0), pady=(4, 0))
+        right_result.grid_rowconfigure(1, weight=1)
+        right_result.grid_rowconfigure(3, weight=1)
+        right_result.grid_columnconfigure(0, weight=1)
+        nav = ttk.Frame(right_result)
+        nav.grid(row=0, column=0, sticky="ew", pady=(0, 6))
+        self.pair_index_label = ttk.Label(nav, text="--")
+        self.pair_index_label.pack(side=LEFT, padx=(0, 6))
+        self.prev_button = ttk.Button(nav, text="上一张")
+        self.next_button = ttk.Button(nav, text="下一张")
+        self.redraw_button = ttk.Button(nav, text="重绘三维图")
+        self.prev_button.pack(side=LEFT, padx=(0, 6))
+        self.next_button.pack(side=LEFT, padx=(0, 12))
+        self.redraw_button.pack(side=LEFT)
+
+        self.plot_canvas = Canvas(right_result, bg="white", highlightthickness=0, height=260)
+        self.plot_canvas.grid(row=1, column=0, sticky="nsew")
+        detail_frame = ttk.Frame(right_result)
+        detail_frame.grid(row=3, column=0, sticky="nsew", pady=(8, 0))
+        detail_frame.grid_rowconfigure(0, weight=1)
+        detail_frame.grid_columnconfigure(0, weight=1)
+        self.detail_text = Text(detail_frame, bg=CANVAS_COLOR, fg=TEXT_COLOR, insertbackground=TEXT_COLOR, relief="flat", wrap="word", font=("Consolas", 10), height=10)
+        self.detail_text.grid(row=0, column=0, sticky="nsew")
+        detail_scroll = Scrollbar(detail_frame, command=self.detail_text.yview)
+        detail_scroll.grid(row=0, column=1, sticky="ns")
+        self.detail_text.configure(yscrollcommand=detail_scroll.set, state="disabled")
+
+        self.result_text = Text(self.result_tab, bg=CANVAS_COLOR, fg=TEXT_COLOR, insertbackground=TEXT_COLOR, relief="flat", wrap="word", font=("Consolas", 10), height=8)
+        self.result_text.grid(row=3, column=0, sticky="nsew", pady=(8, 0))
+
+        self.left_artifact_pane = CalibrationImagePane(self.artifact_tab, "左图角点")
+        self.middle_artifact_pane = CalibrationImagePane(self.artifact_tab, "右图角点")
+        self.right_artifact_pane = CalibrationImagePane(self.artifact_tab, "识别结果图")
+        self.left_artifact_pane.grid(row=0, column=0, sticky="nsew", padx=(0, 6))
+        self.middle_artifact_pane.grid(row=0, column=1, sticky="nsew", padx=6)
+        self.right_artifact_pane.grid(row=0, column=2, sticky="nsew", padx=(6, 0))
+
+    def _on_mouse_wheel(self, event) -> None:
+        if event.delta > 0:
+            self.set_zoom(self.zoom * 1.1)
+        else:
+            self.set_zoom(self.zoom / 1.1)
+
     def set_zoom(self, value: float) -> None:
         self.zoom = min(8.0, max(0.1, value))
         self._render()
@@ -251,6 +344,13 @@ class CalibrationImagePane(Frame):
     def reset_zoom(self) -> None:
         self.set_zoom(1.0)
 
+    def clear_image(self) -> None:
+        self._last_image = None
+        self._detected_points = []
+        self._reprojected_points = []
+        self.info_var.set("未加载")
+        self._render()
+
     def _render(self) -> None:
         width = max(self.canvas.winfo_width(), 100)
         height = max(self.canvas.winfo_height(), 100)
@@ -286,6 +386,59 @@ class CalibrationImagePane(Frame):
             self.canvas.create_line(cx, cy - radius, cx, cy + radius, fill="#ff3030", width=2, tags="render")
 
 
+class ArrayImagePane(Frame):
+    def __init__(self, master: Tk | Toplevel | Frame, title: str):
+        super().__init__(master, bg=BORDER_COLOR)
+        self.title_var = StringVar(value=title)
+        self.info_var = StringVar(value="未加载")
+        self._image_ref: ImageTk.PhotoImage | None = None
+        self._last_image: Image.Image | None = None
+
+        container = Frame(self, bg=CANVAS_COLOR, bd=0)
+        container.pack(fill=BOTH, expand=True, padx=2, pady=2)
+        ttk.Label(container, textvariable=self.title_var, style="PaneTitle.TLabel", padding=(10, 5), anchor="w").pack(side=TOP, fill=X)
+        self.canvas = Canvas(container, bg=CANVAS_COLOR, highlightthickness=0, bd=0)
+        self.canvas.pack(side=TOP, fill=BOTH, expand=True)
+        self._canvas_text_id = self.canvas.create_text(0, 0, text="无图像", fill="#777777", font=(FONT_FAMILY, 14), anchor="center")
+        ttk.Label(container, textvariable=self.info_var, style="PaneInfo.TLabel", padding=(8, 3), anchor="w").pack(side=BOTTOM, fill=X)
+        self.canvas.bind("<Configure>", lambda _event: self._render())
+
+    def set_array(self, image_array: np.ndarray, info: str = "") -> None:
+        array = np.asarray(image_array)
+        if array.ndim == 2:
+            image = Image.fromarray(array.astype(np.uint8), mode="L").convert("RGB")
+        else:
+            image = Image.fromarray(array[..., ::-1].astype(np.uint8)).convert("RGB")
+        self._last_image = image
+        self.info_var.set(info or f"{image.width}x{image.height}")
+        self._render()
+
+    def set_image_file(self, path: str | Path) -> None:
+        image = Image.open(path).convert("RGB")
+        self._last_image = image
+        self.info_var.set(f"{Path(path).name}  {image.width}x{image.height}")
+        self._render()
+
+    def clear_image(self) -> None:
+        self._last_image = None
+        self.info_var.set("未加载")
+        self._render()
+
+    def _render(self) -> None:
+        width = max(self.canvas.winfo_width(), 100)
+        height = max(self.canvas.winfo_height(), 100)
+        self.canvas.delete("render")
+        if self._last_image is None:
+            self.canvas.coords(self._canvas_text_id, width // 2, height // 2)
+            self.canvas.itemconfigure(self._canvas_text_id, state="normal")
+            return
+        image = self._last_image.copy()
+        image.thumbnail((width, height), Image.Resampling.BILINEAR)
+        self._image_ref = ImageTk.PhotoImage(image)
+        self.canvas.create_image(width // 2, height // 2, image=self._image_ref, anchor="center", tags="render")
+        self.canvas.itemconfigure(self._canvas_text_id, state="hidden")
+
+
 class StereoCaptureApp:
     def __init__(self, root: Tk):
         self.root = root
@@ -310,7 +463,19 @@ class StereoCaptureApp:
         self.interval_stop_event = threading.Event()
         self.interval_count = 0
         self.calibrating = False
+        self.reconstructing = False
+        self.reconstruction_preflight: dict | None = None
+        self.depth_previewing = False
+        self.depth_preview_stop_event = threading.Event()
+        self.depth_preview_thread: threading.Thread | None = None
+        self.depth_preview_window: Toplevel | None = None
+        self.depth_preview_left_pane: ArrayImagePane | None = None
+        self.depth_preview_depth_pane: ArrayImagePane | None = None
+        self.depth_preview_disparity_pane: ArrayImagePane | None = None
+        self.depth_preview_confidence_pane: ArrayImagePane | None = None
+        self.depth_preview_status_var = StringVar(value="未启动")
         self.calibration_window: Toplevel | None = None
+        self.progress_window: Toplevel | None = None
         self.calibration_summary_vars: dict[str, StringVar] = {}
         self.last_calibration_result: dict | None = None
         self.calibration_view_pairs: list[dict] = []
@@ -360,6 +525,17 @@ class StereoCaptureApp:
         self.calib_square_size_var = StringVar(value=optional_config_text(self.config, "calibration_square_size_mm", "20.0"))
         self.calib_marker_size_var = StringVar(value=optional_config_text(self.config, "calibration_marker_size_mm", "15.0"))
         self.calib_dictionary_var = StringVar(value=optional_config_text(self.config, "calibration_aruco_dictionary", "DICT_4X4_50"))
+        self.recon_method_var = StringVar(value=optional_config_text(self.config, "reconstruction_method", "auto"))
+        self.recon_model_path_var = StringVar(value=optional_config_text(self.config, "crestereo_model_path", ""))
+        self.recon_wls_var = BooleanVar(value=config_bool(self.config, "use_wls_filter", True))
+        self.recon_wls_lambda_var = StringVar(value=optional_config_text(self.config, "wls_lambda", "8000.0"))
+        self.recon_wls_sigma_var = StringVar(value=optional_config_text(self.config, "wls_sigma_color", "1.5"))
+        self.recon_confidence_var = BooleanVar(value=config_bool(self.config, "confidence_filter", True))
+        self.recon_confidence_threshold_var = StringVar(value=optional_config_text(self.config, "confidence_threshold", "0.35"))
+        self.recon_lr_threshold_var = StringVar(value=optional_config_text(self.config, "left_right_consistency_px", "2.0"))
+        recon_max_width = self.config.get("reconstruction_max_width", 2400)
+        self.recon_max_width_var = StringVar(value="" if recon_max_width in (None, "") else str(recon_max_width))
+        self.recon_allow_fallback_var = BooleanVar(value=config_bool(self.config, "allow_sgbm_fallback", True))
 
         toolbar = ttk.Frame(root, padding=(10, 8))
         toolbar.pack(side=TOP, fill=X)
@@ -378,6 +554,8 @@ class StereoCaptureApp:
         self.record_button = ttk.Button(actions_panel, text="开始录像", command=self.toggle_recording, state=DISABLED)
         self.reset_view_button = ttk.Button(actions_panel, text="还原画面", command=self.reset_view)
         self.open_calibration_button = ttk.Button(actions_panel, text="相机标定", command=self.open_calibration_page)
+        self.depth_preview_button = ttk.Button(actions_panel, text="实时深度", command=self.toggle_depth_preview, state=DISABLED)
+        self.open_point_cloud_file_button = ttk.Button(actions_panel, text="打开点云文件", command=self.open_point_cloud_file_viewer)
         self.refresh_button = ttk.Button(actions_panel, text="刷新设备", command=self.refresh_devices)
         self.choose_save_dir_button = ttk.Button(actions_panel, text="保存路径", command=self.choose_save_dir)
         self.exit_button = ttk.Button(actions_panel, text="退出", command=self.close)
@@ -389,6 +567,8 @@ class StereoCaptureApp:
             self.record_button,
             self.reset_view_button,
             self.open_calibration_button,
+            self.depth_preview_button,
+            self.open_point_cloud_file_button,
             self.refresh_button,
             self.choose_save_dir_button,
         ):
@@ -477,6 +657,7 @@ class StereoCaptureApp:
         self.status_bar.pack(side=BOTTOM, fill=X)
 
         self.root.after(100, self.process_ui_queue)
+        self.root.after(400, self.run_reconstruction_preflight)
 
     def _configure_style(self) -> None:
         self.style = ttk.Style()
@@ -514,6 +695,12 @@ class StereoCaptureApp:
         entry.grid(row=row, column=column + 1, padx=(0, 4), pady=3)
         return entry
 
+    def _grid_entry(self, parent, label: str, variable: StringVar, width: int, row: int, column: int, style: str | None = None) -> ttk.Entry:
+        ttk.Label(parent, text=label, style=style).grid(row=row, column=column, padx=(8, 3), pady=3, sticky="w")
+        entry = ttk.Entry(parent, textvariable=variable, width=width)
+        entry.grid(row=row, column=column + 1, padx=(0, 4), pady=3, sticky="ew")
+        return entry
+
     def reset_view(self) -> None:
         self.left_pane.reset_zoom()
         self.right_pane.reset_zoom()
@@ -529,16 +716,21 @@ class StereoCaptureApp:
         self.calibration_window = window
         window.title("相机标定")
         window.configure(bg=BG_COLOR)
-        window.geometry("1500x900")
-        window.minsize(1180, 720)
+        window.geometry("1600x950")
+        window.minsize(1280, 720)
         window.protocol("WM_DELETE_WINDOW", self.close_calibration_page)
 
         container = ttk.Frame(window, padding=(14, 12))
         container.pack(side=TOP, fill=BOTH, expand=True)
-        container.grid_columnconfigure(0, weight=1)
+        container.grid_columnconfigure(0, weight=2)
+        container.grid_columnconfigure(1, weight=1)
+        container.grid_rowconfigure(1, weight=1)
 
-        source_panel = ttk.LabelFrame(container, text="标定图像", padding=(10, 8))
-        source_panel.grid(row=0, column=0, sticky="ew", pady=(0, 10))
+        top_frame = ttk.Frame(container)
+        top_frame.grid(row=0, column=0, columnspan=2, sticky="ew")
+
+        source_panel = ttk.LabelFrame(top_frame, text="标定图像", padding=(10, 8))
+        source_panel.pack(side=TOP, fill=X, pady=(0, 10))
         source_panel.grid_columnconfigure(1, weight=1)
         source_panel.grid_columnconfigure(4, weight=1)
         source_panel.grid_columnconfigure(7, weight=1)
@@ -552,8 +744,8 @@ class StereoCaptureApp:
         ttk.Entry(source_panel, textvariable=self.calib_output_dir_var, width=34).grid(row=0, column=7, padx=(0, 4), pady=4, sticky="ew")
         ttk.Button(source_panel, text="选择", command=lambda: self.choose_calibration_dir(self.calib_output_dir_var)).grid(row=0, column=8, padx=(0, 0), pady=4)
 
-        board_panel = ttk.LabelFrame(container, text="标定板", padding=(10, 8))
-        board_panel.grid(row=1, column=0, sticky="ew", pady=(0, 10))
+        board_panel = ttk.LabelFrame(top_frame, text="标定板", padding=(10, 8))
+        board_panel.pack(side=TOP, fill=X, pady=(0, 10))
         for column in (1, 3, 5, 7, 9):
             board_panel.grid_columnconfigure(column, weight=1)
         ttk.Label(board_panel, text="类型").grid(row=0, column=0, padx=(0, 4), pady=4, sticky="w")
@@ -589,8 +781,40 @@ class StereoCaptureApp:
         self.calibrate_button = ttk.Button(board_panel, text="开始标定", command=self.start_calibration, style="Accent.TButton")
         self.calibrate_button.grid(row=1, column=5, padx=(0, 8), pady=4, sticky="w")
 
-        summary_panel = ttk.LabelFrame(container, text="标定结果摘要", padding=(10, 8))
-        summary_panel.grid(row=2, column=0, sticky="ew", pady=(0, 10))
+        recon_panel = ttk.LabelFrame(top_frame, text="重建参数", padding=(10, 8))
+        recon_panel.pack(side=TOP, fill=X, pady=(0, 10))
+        for column in (1, 3, 5, 7, 9):
+            recon_panel.grid_columnconfigure(column, weight=1)
+        ttk.Label(recon_panel, text="算法").grid(row=0, column=0, padx=(0, 4), pady=4, sticky="w")
+        ttk.OptionMenu(
+            recon_panel,
+            self.recon_method_var,
+            self.recon_method_var.get(),
+            "auto",
+            "crestereo",
+            "sgbm",
+        ).grid(row=0, column=1, padx=(0, 8), pady=4, sticky="w")
+        ttk.Label(recon_panel, text="ONNX").grid(row=0, column=2, padx=(0, 4), pady=4, sticky="w")
+        ttk.Entry(recon_panel, textvariable=self.recon_model_path_var, width=34).grid(row=0, column=3, columnspan=4, padx=(0, 4), pady=4, sticky="ew")
+        ttk.Button(recon_panel, text="选择", command=self.choose_crestereo_model).grid(row=0, column=7, padx=(0, 8), pady=4)
+        ttk.Checkbutton(recon_panel, text="SGBM fallback", variable=self.recon_allow_fallback_var).grid(row=0, column=8, padx=(0, 8), pady=4, sticky="w")
+        ttk.Button(recon_panel, text="保存参数", command=self.apply_reconstruction_settings).grid(row=0, column=9, padx=(0, 0), pady=4, sticky="w")
+        ttk.Button(recon_panel, text="自检", command=self.run_reconstruction_preflight).grid(row=0, column=10, padx=(8, 0), pady=4, sticky="w")
+        ttk.Checkbutton(recon_panel, text="WLS", variable=self.recon_wls_var).grid(row=1, column=0, padx=(0, 4), pady=4, sticky="w")
+        self._grid_entry(recon_panel, "lambda", self.recon_wls_lambda_var, 8, 1, 1)
+        self._grid_entry(recon_panel, "sigma", self.recon_wls_sigma_var, 7, 1, 3)
+        ttk.Checkbutton(recon_panel, text="Confidence", variable=self.recon_confidence_var).grid(row=1, column=5, padx=(8, 4), pady=4, sticky="w")
+        self._grid_entry(recon_panel, "阈值", self.recon_confidence_threshold_var, 7, 1, 6)
+        self._grid_entry(recon_panel, "LR px", self.recon_lr_threshold_var, 7, 1, 8)
+        ttk.Button(recon_panel, text="独立深度重建", command=self.open_reconstruction_dialog, style="Accent.TButton").grid(row=1, column=10, padx=(8, 0), pady=4, sticky="e")
+        self._grid_entry(recon_panel, "最大宽度", self.recon_max_width_var, 8, 2, 0)
+        ttk.Label(recon_panel, text="0 或留空 = 内存/显存足够时使用原图宽度，否则自动回退", style="Muted.TLabel").grid(row=2, column=2, columnspan=6, padx=(8, 4), pady=3, sticky="w")
+
+        left_col = ttk.Frame(container)
+        left_col.grid(row=1, column=0, sticky="nsew", padx=(0, 5))
+
+        summary_panel = ttk.LabelFrame(left_col, text="标定结果摘要", padding=(10, 8))
+        summary_panel.pack(side=TOP, fill=X, pady=(0, 10))
         summary_panel.grid_columnconfigure(0, weight=1)
         self.calibration_summary_vars = {}
         summary_items = [
@@ -598,7 +822,7 @@ class StereoCaptureApp:
             ("valid_pairs", "单目有效图像"),
             ("stereo_rms", "双目 RMS"),
             ("baseline", "基线"),
-            ("intrinsics", "内参 / 畸变"),
+            ("intrinsics", "内参/畸变"),
             ("calibration_date", "标定日期"),
         ]
         for column, (key, label) in enumerate(summary_items):
@@ -608,94 +832,93 @@ class StereoCaptureApp:
             value_var = StringVar(value="--")
             self.calibration_summary_vars[key] = value_var
             ttk.Label(frame, textvariable=value_var, font=(FONT_FAMILY, 12, "bold")).pack(side=TOP, anchor="w")
-        ttk.Button(summary_panel, text="刷新标定摘要", command=self.refresh_calibration_summary).grid(row=0, column=len(summary_items), padx=(12, 8), pady=2)
-        ttk.Button(summary_panel, text="打开 ChArUco 三维图", command=self.open_calibration_3d_view).grid(row=0, column=len(summary_items) + 1, padx=(0, 0), pady=2)
-        summary_detail_frame = ttk.Frame(summary_panel)
-        summary_detail_frame.grid(row=1, column=0, columnspan=len(summary_items) + 2, sticky="ew", pady=(8, 0))
-        summary_detail_frame.grid_rowconfigure(0, weight=1)
-        summary_detail_frame.grid_columnconfigure(0, weight=1)
-        self.calibration_summary_text = Text(
-            summary_detail_frame,
-            bg=CANVAS_COLOR,
-            fg=TEXT_COLOR,
-            insertbackground=TEXT_COLOR,
-            relief="flat",
-            wrap="word",
-            font=("Consolas", 10),
-            height=8,
-        )
-        self.calibration_summary_text.grid(row=0, column=0, sticky="ew")
-        summary_scroll = Scrollbar(summary_detail_frame, command=self.calibration_summary_text.yview)
-        summary_scroll.grid(row=0, column=1, sticky="ns")
-        self.calibration_summary_text.configure(yscrollcommand=summary_scroll.set, state="disabled")
+        ttk.Button(summary_panel, text="刷新摘要", command=self.refresh_calibration_summary).grid(row=0, column=len(summary_items), padx=(12, 8), pady=2)
+        ttk.Button(summary_panel, text="打开三维图", command=self.open_calibration_3d_view).grid(row=0, column=len(summary_items) + 1, padx=(0, 8), pady=2)
+        ttk.Button(summary_panel, text="打开点云", command=self.open_point_cloud_viewer).grid(row=0, column=len(summary_items) + 2, padx=(0, 0), pady=2)
 
-        progress_panel = ttk.LabelFrame(container, text="标定进度", padding=(10, 8))
-        progress_panel.grid(row=3, column=0, sticky="ew", pady=(0, 10))
-        progress_panel.grid_columnconfigure(0, weight=1)
-        self.calibration_progress_bar = ttk.Progressbar(progress_panel, maximum=100.0, variable=self.calibration_progress_var)
-        self.calibration_progress_bar.grid(row=0, column=0, sticky="ew", padx=(0, 10))
-        ttk.Label(progress_panel, textvariable=self.calibration_progress_text_var).grid(row=0, column=1, sticky="e")
+        images_frame = ttk.Frame(left_col)
+        images_frame.pack(side=TOP, fill=BOTH, expand=True)
+        images_frame.grid_rowconfigure(1, weight=1)
+        images_frame.grid_columnconfigure(0, weight=1)
+        images_frame.grid_columnconfigure(1, weight=1)
 
-        result_panel = ttk.LabelFrame(container, text="标定可视化", padding=(10, 8))
-        result_panel.grid(row=4, column=0, sticky="nsew")
-        result_panel.grid_columnconfigure(0, weight=1)
-        result_panel.grid_columnconfigure(1, weight=1)
-        result_panel.grid_columnconfigure(2, weight=1)
-        result_panel.grid_rowconfigure(1, weight=1)
-        container.grid_rowconfigure(4, weight=1)
-        self.calibration_status_var = StringVar(value="选择左右图目录，确认标定板参数后开始标定。")
-        ttk.Label(result_panel, textvariable=self.calibration_status_var, style="Status.TLabel", anchor="w", padding=(0, 4)).grid(row=0, column=0, columnspan=3, sticky="ew")
-
-        self.calibration_left_image_pane = CalibrationImagePane(result_panel, "左相机识别")
-        self.calibration_right_image_pane = CalibrationImagePane(result_panel, "右相机识别")
-        self.calibration_left_image_pane.grid(row=1, column=0, sticky="nsew", padx=(0, 6), pady=(4, 0))
-        self.calibration_right_image_pane.grid(row=1, column=1, sticky="nsew", padx=(6, 6), pady=(4, 0))
-
-        right_result = ttk.Frame(result_panel)
-        right_result.grid(row=1, column=2, sticky="nsew", padx=(6, 0), pady=(4, 0))
-        right_result.grid_rowconfigure(1, weight=1)
-        right_result.grid_rowconfigure(3, weight=1)
-        right_result.grid_columnconfigure(0, weight=1)
-        nav = ttk.Frame(right_result)
-        nav.grid(row=0, column=0, sticky="ew", pady=(0, 6))
-        ttk.Button(nav, text="上一张", command=lambda: self.show_calibration_pair(self.calibration_pair_index - 1)).pack(side=LEFT, padx=(0, 6))
+        nav = ttk.Frame(images_frame)
+        nav.grid(row=0, column=0, columnspan=2, sticky="ew", pady=(0, 6))
         self.calibration_pair_var = StringVar(value="--")
-        ttk.Label(nav, textvariable=self.calibration_pair_var).pack(side=LEFT, padx=(0, 6))
-        ttk.Button(nav, text="下一张", command=lambda: self.show_calibration_pair(self.calibration_pair_index + 1)).pack(side=LEFT, padx=(0, 12))
-        ttk.Button(nav, text="重绘三维图", command=self.refresh_calibration_3d_plot).pack(side=LEFT)
+        self.pair_index_label = ttk.Label(nav, textvariable=self.calibration_pair_var)
+        self.pair_index_label.pack(side=LEFT, padx=(0, 6))
+        self.prev_button = ttk.Button(nav, text="上一张", command=lambda: self.show_calibration_pair(self.calibration_pair_index - 1))
+        self.next_button = ttk.Button(nav, text="下一张", command=lambda: self.show_calibration_pair(self.calibration_pair_index + 1))
+        self.prev_button.pack(side=LEFT, padx=(0, 6))
+        self.next_button.pack(side=LEFT, padx=(0, 12))
 
-        self.calibration_3d_canvas = Canvas(right_result, bg="white", highlightthickness=0, height=260)
-        self.calibration_3d_canvas.grid(row=1, column=0, sticky="nsew")
-        detail_frame = ttk.Frame(right_result)
-        detail_frame.grid(row=3, column=0, sticky="nsew", pady=(8, 0))
-        detail_frame.grid_rowconfigure(0, weight=1)
-        detail_frame.grid_columnconfigure(0, weight=1)
-        self.calibration_result_text = Text(
-            detail_frame,
-            bg=CANVAS_COLOR,
-            fg=TEXT_COLOR,
-            insertbackground=TEXT_COLOR,
-            relief="flat",
-            wrap="word",
-            font=("Consolas", 10),
-            height=10,
-        )
+        self.calibration_left_image_pane = CalibrationImagePane(images_frame, "左相机识别")
+        self.calibration_right_image_pane = CalibrationImagePane(images_frame, "右相机识别")
+        self.calibration_left_image_pane.grid(row=1, column=0, sticky="nsew", padx=(0, 4))
+        self.calibration_right_image_pane.grid(row=1, column=1, sticky="nsew", padx=(4, 0))
+
+        right_col = ttk.Frame(container)
+        right_col.grid(row=1, column=1, sticky="nsew", padx=(5, 0))
+        right_col.grid_rowconfigure(0, weight=3)
+        right_col.grid_rowconfigure(1, weight=2)
+        right_col.grid_columnconfigure(0, weight=1)
+
+        notebook = ttk.Notebook(right_col)
+        notebook.grid(row=0, column=0, sticky="nsew", pady=(0, 8))
+
+        tab_3d = ttk.Frame(notebook)
+        tab_heat = ttk.Frame(notebook)
+        tab_err = ttk.Frame(notebook)
+        tab_depth = ttk.Frame(notebook)
+        tab_recon = ttk.Frame(notebook)
+
+        notebook.add(tab_3d, text="三维图")
+        notebook.add(tab_heat, text="覆盖热图")
+        notebook.add(tab_err, text="误差分布图")
+        notebook.add(tab_depth, text="深度误差曲线")
+        notebook.add(tab_recon, text="重建输出图")
+
+        tab_3d.grid_rowconfigure(0, weight=1)
+        tab_3d.grid_columnconfigure(0, weight=1)
+        self.calibration_3d_canvas = Canvas(tab_3d, bg="white", highlightthickness=0)
+        self.calibration_3d_canvas.grid(row=0, column=0, sticky="nsew")
+        ttk.Button(tab_3d, text="重绘三维图", command=self.refresh_calibration_3d_plot).grid(row=1, column=0, pady=4)
+
+        self.heatmap_pane = CalibrationImagePane(tab_heat, "覆盖热图")
+        self.heatmap_pane.pack(fill=BOTH, expand=True)
+        self.errordist_pane = CalibrationImagePane(tab_err, "误差分布图")
+        self.errordist_pane.pack(fill=BOTH, expand=True)
+        self.deptherr_pane = CalibrationImagePane(tab_depth, "深度误差曲线")
+        self.deptherr_pane.pack(fill=BOTH, expand=True)
+        self.recon_pane = CalibrationImagePane(tab_recon, "重建输出图")
+        self.recon_pane.pack(fill=BOTH, expand=True)
+
+        text_frame = ttk.Frame(right_col)
+        text_frame.grid(row=1, column=0, sticky="nsew")
+        text_frame.grid_rowconfigure(0, weight=1)
+        text_frame.grid_columnconfigure(0, weight=1)
+        self.calibration_result_text = Text(text_frame, bg=CANVAS_COLOR, fg=TEXT_COLOR, insertbackground=TEXT_COLOR, relief="flat", wrap="word", font=("Consolas", 10))
         self.calibration_result_text.grid(row=0, column=0, sticky="nsew")
-        result_scroll = Scrollbar(detail_frame, command=self.calibration_result_text.yview)
-        result_scroll.grid(row=0, column=1, sticky="ns")
-        self.calibration_result_text.configure(yscrollcommand=result_scroll.set, state="disabled")
+        scroll = Scrollbar(text_frame, command=self.calibration_result_text.yview)
+        scroll.grid(row=0, column=1, sticky="ns")
+        self.calibration_result_text.configure(yscrollcommand=scroll.set, state="disabled")
+
+        self.calibration_3d_image_ref = None
+        self._set_calibration_progress(0.0, "等待开始")
+
         self._set_calibration_status("选择左右图目录，确认标定板参数后开始标定。")
         if self.last_calibration_result is not None:
             self.render_calibration_result(self.last_calibration_result)
 
     def close_calibration_page(self) -> None:
+        self._close_progress_window()
         if self.calibration_window is not None and self.calibration_window.winfo_exists():
             self.calibration_window.destroy()
         self.calibration_window = None
         self.calibrate_button = None
 
     def _set_calibration_status(self, text: str) -> None:
-        if hasattr(self, "calibration_status_var"):
+        if hasattr(self, "calibration_status_var") and self.calibration_status_var is not self.status_var:
             self.calibration_status_var.set(text)
         self.status_var.set(text)
 
@@ -706,18 +929,227 @@ class StereoCaptureApp:
             self.calibration_result_text.insert("1.0", text)
             self.calibration_result_text.configure(state="disabled")
 
-    def _set_calibration_summary_text(self, text: str) -> None:
-        if hasattr(self, "calibration_summary_text"):
-            self.calibration_summary_text.configure(state="normal")
-            self.calibration_summary_text.delete("1.0", "end")
-            self.calibration_summary_text.insert("1.0", text)
-            self.calibration_summary_text.configure(state="disabled")
+    def _show_progress_window(self) -> None:
+        if hasattr(self, "progress_window") and self.progress_window is not None and self.progress_window.winfo_exists():
+            return
+        self.progress_window = Toplevel(self.root)
+        self.progress_window.title("标定进度")
+        self.progress_window.geometry("400x120")
+        if self.calibration_window and self.calibration_window.winfo_exists():
+            self.progress_window.transient(self.calibration_window)
+        self.progress_window.protocol("WM_DELETE_WINDOW", self._close_progress_window)
+        self.progress_window.grab_set()
+
+        ttk.Label(self.progress_window, textvariable=self.calibration_progress_text_var, font=(FONT_FAMILY, 10)).pack(pady=(20, 10))
+        self.calibration_progress_bar = ttk.Progressbar(self.progress_window, maximum=100.0, variable=self.calibration_progress_var)
+        self.calibration_progress_bar.pack(fill=X, padx=30)
+
+    def _close_progress_window(self) -> None:
+        if hasattr(self, "progress_window") and self.progress_window is not None:
+            if self.progress_window.winfo_exists():
+                try:
+                    self.progress_window.grab_release()
+                except Exception:
+                    pass
+                self.progress_window.destroy()
+            self.progress_window = None
 
     def _set_calibration_progress(self, value: float, text: str) -> None:
         if hasattr(self, "calibration_progress_var"):
             self.calibration_progress_var.set(max(0.0, min(100.0, float(value))))
         if hasattr(self, "calibration_progress_text_var"):
             self.calibration_progress_text_var.set(text)
+
+    def choose_crestereo_model(self) -> None:
+        selected = filedialog.askopenfilename(
+            title="选择 CREStereo ONNX 模型",
+            initialdir=str(Path(self.recon_model_path_var.get() or BASE_DIR).parent),
+            filetypes=[("ONNX model", "*.onnx"), ("All files", "*.*")],
+        )
+        if selected:
+            self.recon_model_path_var.set(selected)
+
+    def _current_reconstruction_config(self) -> dict:
+        method = self.recon_method_var.get().strip().lower() or "auto"
+        if method not in {"auto", "crestereo", "sgbm"}:
+            raise ValueError("重建算法必须是 auto、crestereo 或 sgbm。")
+        max_width_text = self.recon_max_width_var.get().strip()
+        reconstruction_max_width = 0 if not max_width_text else int(float(max_width_text))
+        if reconstruction_max_width != 0 and reconstruction_max_width < 320:
+            raise ValueError("reconstruction_max_width must be 0 or at least 320.")
+        return {
+            "reconstruction_method": method,
+            "allow_sgbm_fallback": bool(self.recon_allow_fallback_var.get()),
+            "crestereo_model_path": self.recon_model_path_var.get().strip(),
+            "crestereo_providers": self.config.get("crestereo_providers", ["CUDAExecutionProvider", "CPUExecutionProvider"]),
+            "use_wls_filter": bool(self.recon_wls_var.get()),
+            "wls_lambda": float(self.recon_wls_lambda_var.get()),
+            "wls_sigma_color": float(self.recon_wls_sigma_var.get()),
+            "confidence_filter": bool(self.recon_confidence_var.get()),
+            "confidence_threshold": float(self.recon_confidence_threshold_var.get()),
+            "confidence_photometric_sigma": float(self.config.get("confidence_photometric_sigma", 0.15)),
+            "left_right_consistency_px": float(self.recon_lr_threshold_var.get()),
+            "left_right_consistency_min_mean": float(self.config.get("left_right_consistency_min_mean", 0.05)),
+            "left_right_consistency_min_pass_ratio": float(self.config.get("left_right_consistency_min_pass_ratio", 0.01)),
+            "wls_consistency_px": float(self.config.get("wls_consistency_px", 2.0)),
+            "reconstruction_max_width": int(reconstruction_max_width),
+        }
+
+    def apply_reconstruction_settings(self) -> bool:
+        try:
+            reconstruction_config = self._current_reconstruction_config()
+        except ValueError:
+            self.status_var.set("重建参数中的数值必须合法。")
+            return False
+        self.config.update(reconstruction_config)
+        save_config(self.config)
+        self._set_calibration_status("重建参数已保存到 config.json。")
+        return True
+
+    def _format_preflight_summary(self, report: dict) -> str:
+        errors = report.get("errors", [])
+        warnings = report.get("warnings", [])
+        checks = report.get("checks", {})
+        status = "通过" if report.get("ok") else "失败"
+        parts = [f"重建自检{status}"]
+        if errors:
+            parts.append("错误：" + "；".join(map(str, errors)))
+        if warnings:
+            parts.append("警告：" + "；".join(map(str, warnings)))
+        if not errors and not warnings:
+            cuda = checks.get("cuda_provider", {})
+            wls = checks.get("wls_interfaces", {})
+            parts.append(
+                f"CUDA={'可用' if cuda.get('ok') else '不可用'}；WLS={'可用' if wls.get('ok') else '不可用'}"
+            )
+        return "；".join(parts)
+
+    def _format_bool_status(self, ok: bool, required: bool = True) -> str:
+        if not required:
+            return "未启用" if not ok else "可用但当前非必需"
+        if ok:
+            return "正常"
+        return "异常"
+
+    def _format_reconstruction_preflight_detail(self, report: dict) -> str:
+        checks = report.get("checks", {})
+        method_labels = {
+            "crestereo": "CREStereo",
+            "cres": "CREStereo",
+            "crestereo_onnx": "CREStereo",
+            "sgbm": "SGBM",
+            "auto": "自动选择",
+        }
+        method = str(report.get("method", "--"))
+        lines = [
+            "重建环境自检报告",
+            "",
+            f"总体结果：{'通过，可以开始重建。' if report.get('ok') else '失败，请先处理错误项。'}",
+            f"当前算法：{method_labels.get(method, method)}",
+            f"SGBM fallback：{'允许' if report.get('allow_sgbm_fallback') else '不允许'}",
+            "",
+            "检查项目：",
+        ]
+
+        model = checks.get("crestereo_model_file", {})
+        lines.extend(
+            [
+                f"1. CREStereo 模型文件：{self._format_bool_status(bool(model.get('ok')), bool(model.get('required')))}",
+                f"   是否必需：{'是' if model.get('required') else '否'}",
+                f"   文件路径：{model.get('path') or '未填写'}",
+            ]
+        )
+
+        ort = checks.get("onnxruntime", {})
+        providers = ort.get("available_providers") or []
+        lines.extend(
+            [
+                f"2. onnxruntime：{self._format_bool_status(bool(ort.get('ok')), bool(ort.get('required')))}",
+                f"   是否必需：{'是' if ort.get('required') else '否'}",
+                f"   可用推理后端：{', '.join(providers) if providers else '未检测到'}",
+            ]
+        )
+        if ort.get("error"):
+            lines.append(f"   错误信息：{ort.get('error')}")
+
+        cuda = checks.get("cuda_provider", {})
+        requested = cuda.get("requested") or []
+        lines.extend(
+            [
+                f"3. CUDA GPU 推理：{self._format_bool_status(bool(cuda.get('ok')), bool(cuda.get('required')))}",
+                f"   是否必需：{'是' if cuda.get('required') else '否'}",
+                f"   程序请求后端：{', '.join(requested) if requested else '未指定，使用 onnxruntime 默认选择'}",
+                f"   说明：正常时 CREStereo 可使用 GPU；不可用时会使用 CPU 或按配置回退到 SGBM。",
+            ]
+        )
+
+        ximgproc = checks.get("opencv_ximgproc", {})
+        lines.extend(
+            [
+                f"4. OpenCV ximgproc 模块：{self._format_bool_status(bool(ximgproc.get('ok')), bool(ximgproc.get('required')))}",
+                f"   是否必需：{'是' if ximgproc.get('required') else '否'}",
+                "   说明：该模块来自 opencv-contrib-python，用于 WLS 滤波。",
+            ]
+        )
+        if ximgproc.get("error"):
+            lines.append(f"   错误信息：{ximgproc.get('error')}")
+
+        wls = checks.get("wls_interfaces", {})
+        lines.extend(
+            [
+                f"5. WLS 滤波接口：{self._format_bool_status(bool(wls.get('ok')), bool(wls.get('required')))}",
+                f"   通用 WLS：{'可用' if wls.get('generic_wls') else '不可用'}",
+                f"   SGBM 专用 WLS：{'可用' if wls.get('sgbm_wls') else '不可用'}",
+            ]
+        )
+
+        warnings = report.get("warnings", [])
+        errors = report.get("errors", [])
+        if warnings:
+            lines.extend(["", "警告："])
+            lines.extend(f"- {item}" for item in warnings)
+        if errors:
+            lines.extend(["", "错误："])
+            lines.extend(f"- {item}" for item in errors)
+        if not warnings and not errors:
+            lines.extend(["", "结论：当前环境完整，CREStereo、CUDA、OpenCV ximgproc 和 WLS 均可用。"])
+        return "\n".join(lines)
+
+    def run_reconstruction_preflight(self) -> None:
+        try:
+            reconstruction_config = self._current_reconstruction_config()
+        except ValueError:
+            self.status_var.set("重建参数中的数值必须合法，无法自检。")
+            return
+
+        def worker() -> None:
+            try:
+                from calibration import check_reconstruction_environment
+
+                report = check_reconstruction_environment(reconstruction_config)
+                self.ui_queue.put(("reconstruction_preflight_done", report))
+            except Exception as exc:
+                self.ui_queue.put(("error", exc))
+
+        threading.Thread(target=worker, daemon=True).start()
+
+    def ensure_reconstruction_preflight(self) -> bool:
+        try:
+            from calibration import check_reconstruction_environment
+
+            report = check_reconstruction_environment(self._current_reconstruction_config())
+        except Exception as exc:
+            self._show_error(exc)
+            return False
+        self.reconstruction_preflight = report
+        if not report.get("ok"):
+            messagebox.showerror("重建自检失败", self._format_reconstruction_preflight_detail(report))
+            return False
+        if report.get("warnings"):
+            self._set_calibration_status(self._format_preflight_summary(report))
+            if hasattr(self, "calibration_result_text") and self.last_calibration_result is None:
+                self._set_calibration_result_text(self._format_reconstruction_preflight_detail(report))
+        return True
 
     def refresh_calibration_summary(self) -> None:
         if not hasattr(self, "calibration_summary_vars") or not self.calibration_summary_vars:
@@ -727,7 +1159,7 @@ class StereoCaptureApp:
         else:
             self._set_calibration_status("暂无标定结果。请先开始标定。")
         if self.last_calibration_result is not None:
-            self._set_calibration_summary_text(self._format_calibration_detail(self.last_calibration_result))
+            self._set_calibration_result_text(self._format_calibration_detail(self.last_calibration_result))
 
     def open_calibration_3d_view(self) -> None:
         if not self.calibration_view_pairs:
@@ -737,6 +1169,63 @@ class StereoCaptureApp:
         if self.calibration_window is not None and self.calibration_window.winfo_exists():
             self.calibration_window.lift()
             self.calibration_window.focus_force()
+
+    def _resolve_point_cloud_path(self, point_cloud_path: str | Path | None = None) -> Path:
+        if point_cloud_path is not None and str(point_cloud_path).strip():
+            return resolve_app_path(point_cloud_path)
+
+        if self.last_calibration_result is not None:
+            reconstruction = self.last_calibration_result.get("artifacts", {}).get("reconstruction", {})
+            result_path = reconstruction.get("point_cloud_ply")
+            if result_path:
+                return resolve_app_path(result_path)
+
+        calibration_dir = resolve_app_path(self.calib_output_dir_var.get())
+        if calibration_dir.name == "calibration_result.json":
+            calibration_dir = calibration_dir.parent
+        return calibration_dir / "reconstruction" / "point_cloud.ply"
+
+    def open_point_cloud_viewer(self, point_cloud_path: str | Path | None = None) -> None:
+        path = self._resolve_point_cloud_path(point_cloud_path)
+        if not path.exists():
+            self.status_var.set("未找到点云文件，请先完成标定诊断重建或独立深度重建。")
+            messagebox.showerror("点云文件不存在", f"未找到点云文件：\n{path}")
+            return
+        self._launch_point_cloud_viewer(path)
+
+    def open_point_cloud_file_viewer(self) -> None:
+        self._launch_point_cloud_viewer(None)
+
+    def _launch_point_cloud_viewer(self, point_cloud_path: Path | None) -> None:
+        if not POINT_CLOUD_VIEWER_SCRIPT.exists():
+            self.status_var.set("未找到独立点云查看器脚本。")
+            messagebox.showerror("点云查看器不存在", f"未找到：\n{POINT_CLOUD_VIEWER_SCRIPT}")
+            return
+
+        command = [
+            *python_launcher_command(),
+            str(POINT_CLOUD_VIEWER_SCRIPT),
+        ]
+        if point_cloud_path is not None:
+            command.append(str(point_cloud_path.resolve()))
+        try:
+            subprocess.Popen(command, cwd=str(BASE_DIR), close_fds=True)
+        except FileNotFoundError as exc:
+            message = (
+                "无法启动 Python 3.12 点云查看器。\n"
+                "请确认 Windows Python Launcher 可用，或在 config.json 中设置 point_cloud_viewer_python 为 Python 3.12 的 python.exe 路径。\n\n"
+                f"启动命令：{' '.join(command)}"
+            )
+            self.status_var.set("Open3D 点云查看器启动失败。")
+            messagebox.showerror("点云查看器启动失败", message)
+            return
+        except Exception as exc:
+            self.ui_queue.put(("viewer_error", str(exc)))
+            return
+        if point_cloud_path is None:
+            self.status_var.set("已启动独立点云查看器，请在弹出的窗口中选择点云文件。")
+        else:
+            self.status_var.set(f"已启动独立 Open3D 点云查看器：{point_cloud_path.name}")
 
     def show_calibration_pair(self, index: int) -> None:
         if not self.calibration_view_pairs:
@@ -793,9 +1282,34 @@ class StereoCaptureApp:
         summary = self._format_calibration_summary(result)
         self._update_calibration_summary_vars(result)
         self._set_calibration_status(summary)
-        self._set_calibration_summary_text(self._format_calibration_detail(result))
         self.show_calibration_pair(0)
+        self._set_calibration_result_text(self._format_calibration_detail(result))
         self.refresh_calibration_3d_plot(result)
+        artifacts = result.get("artifacts", {})
+        if hasattr(self, "heatmap_pane"):
+            path = artifacts.get("board_coverage_heatmap", {}).get("image")
+            if path:
+                self.heatmap_pane.set_image(path)
+            else:
+                self.heatmap_pane.clear_image()
+        if hasattr(self, "errordist_pane"):
+            path = artifacts.get("reprojection_error_distribution", {}).get("image")
+            if path:
+                self.errordist_pane.set_image(path)
+            else:
+                self.errordist_pane.clear_image()
+        if hasattr(self, "deptherr_pane"):
+            path = artifacts.get("depth_error_curve", {}).get("image")
+            if path:
+                self.deptherr_pane.set_image(path)
+            else:
+                self.deptherr_pane.clear_image()
+        if hasattr(self, "recon_pane"):
+            path = artifacts.get("reconstruction", {}).get("reconstruction_result")
+            if path:
+                self.recon_pane.set_image(path)
+            else:
+                self.recon_pane.clear_image()
 
     def _format_calibration_summary(self, result: dict) -> str:
         left = result["left"]
@@ -808,7 +1322,7 @@ class StereoCaptureApp:
             f"双目 RMS {stereo['rms_reprojection_error_px']:.4f}px，"
             f"基线 {stereo['baseline_mm']:.3f} mm；"
             f"标定日期 {result.get('calibration_date', '--')}；"
-            f"详细参数见下方摘要文本。"
+            f"详细参数见右侧结果文本。"
         )
 
     def _update_calibration_summary_vars(self, result: dict) -> None:
@@ -816,14 +1330,15 @@ class StereoCaptureApp:
             return
         left_rms = result["left"]["rms_reprojection_error_px"]
         right_rms = result["right"]["rms_reprojection_error_px"]
-        self.calibration_summary_vars["mono_error"].set(f"左 {left_rms:.3f}px / 右 {right_rms:.3f}px")
+        self.calibration_summary_vars["mono_error"].set(f"左 {left_rms:.4f}px / 右 {right_rms:.4f}px")
         self.calibration_summary_vars["valid_pairs"].set(f"{result['accepted_pair_count']} / {result['total_pairs']} 对")
-        self.calibration_summary_vars["stereo_rms"].set(f"{result['stereo']['rms_reprojection_error_px']:.3f}px")
+        self.calibration_summary_vars["stereo_rms"].set(f"{result['stereo']['rms_reprojection_error_px']:.4f}px")
         self.calibration_summary_vars["baseline"].set(f"{result['stereo']['baseline_mm']:.3f} mm")
         left_intr = result["left"]["matlab_like_intrinsics"]
         self.calibration_summary_vars["intrinsics"].set(
             f"fx {left_intr['focal_length_px'][0]:.1f}, fy {left_intr['focal_length_px'][1]:.1f}"
         )
+        self.calibration_summary_vars["calibration_date"].set(str(result.get("calibration_date", "--")))
 
     def _format_calibration_detail(self, result: dict) -> str:
         left = result["left"]["matlab_like_intrinsics"]
@@ -831,6 +1346,15 @@ class StereoCaptureApp:
         stereo = result["stereo"]
         rect = stereo.get("rectification", {})
         reconstruction = result.get("artifacts", {}).get("reconstruction", {})
+        wls_filter = reconstruction.get("wls_filter", {})
+        confidence_filter = reconstruction.get("confidence_filter", {})
+        resource_policy = reconstruction.get("resource_policy", {})
+        quality = reconstruction.get("quality_metrics", {})
+        depth_quality = quality.get("depth_mm", {}).get("valid", {})
+        confidence_quality = quality.get("confidence", {}).get("valid_depth", {})
+        point_quality = quality.get("point_cloud", {})
+        confidence_warnings = confidence_filter.get("warnings") or []
+        warning_text = "；".join(map(str, confidence_warnings)) if confidence_warnings else "无"
         return (
             f"标定日期: {result.get('calibration_date', '--')}\n"
             f"分辨率: {result.get('image_size', [])}\n"
@@ -850,6 +1374,17 @@ class StereoCaptureApp:
             f"覆盖热图: {result.get('artifacts', {}).get('board_coverage_heatmap', {}).get('image', '--')}\n"
             f"误差分布图: {result.get('artifacts', {}).get('reprojection_error_distribution', {}).get('image', '--')}\n"
             f"深度误差曲线: {result.get('artifacts', {}).get('depth_error_curve', {}).get('image', '--')}\n"
+            f"重建算法: {reconstruction.get('method_used', '--')} (requested {reconstruction.get('method_requested', '--')})\n"
+            f"重建宽度: requested={resource_policy.get('requested_max_width', '--')} effective={resource_policy.get('effective_max_width', '--')} "
+            f"scale={resource_policy.get('scale', '--')} fallback={resource_policy.get('fallback_applied', '--')}\n"
+            f"WLS: {wls_filter.get('status', '--')} enabled={wls_filter.get('enabled', '--')}\n"
+            f"Confidence Filtering: enabled={confidence_filter.get('enabled', '--')} threshold={confidence_filter.get('threshold', '--')} sources={confidence_filter.get('sources', '--')}\n"
+            f"Confidence Warnings: {warning_text}\n"
+            f"质量指标: 有效深度 {quality.get('valid_depth_ratio', '--')}；有效视差 {quality.get('valid_disparity_ratio', '--')}；"
+            f"置信度均值 {confidence_quality.get('mean', '--')}；深度范围 {depth_quality.get('p01', '--')}~{depth_quality.get('p99', '--')} mm；"
+            f"点云离群比例 {point_quality.get('outlier_ratio', '--')}\n"
+            f"Confidence Map: {reconstruction.get('confidence_map', '--')}\n"
+            f"Quality Metrics: {reconstruction.get('quality_metrics_json', '--')}\n"
             f"重建输出: {reconstruction.get('reconstruction_result', '--')}\n"
         )
 
@@ -933,8 +1468,13 @@ class StereoCaptureApp:
         return image
 
     def _camera_points_to_plot_points(self, points: np.ndarray) -> np.ndarray:
-        pts = np.asarray(points, dtype=float).reshape(-1, 3)
-        return np.column_stack((pts[:, 0], pts[:, 2], -pts[:, 1]))
+        try:
+            from calibration import camera_points_to_display
+
+            return camera_points_to_display(points)
+        except Exception:
+            pts = np.asarray(points, dtype=float).reshape(-1, 3)
+            return np.column_stack((pts[:, 0], pts[:, 2], -pts[:, 1]))
 
     def _set_3d_axes_equal(self, ax, points: np.ndarray) -> None:
         pts = np.asarray(points, dtype=float).reshape(-1, 3)
@@ -1001,6 +1541,9 @@ class StereoCaptureApp:
     def start_preview(self) -> None:
         if self.camera_system is None:
             return
+        if self.depth_previewing:
+            self.status_var.set("请先停止实时深度预览。")
+            return
         self._reset_stats()
         self.previewing = True
         self.preview_button.configure(text="停止采集")
@@ -1014,6 +1557,149 @@ class StereoCaptureApp:
         self.previewing = False
         self.preview_button.configure(state=DISABLED)
         self.status_var.set("正在停止实时采集...")
+
+    def toggle_depth_preview(self) -> None:
+        if self.depth_previewing:
+            self.stop_depth_preview()
+        else:
+            self.start_depth_preview()
+
+    def _latest_calibration_result_path(self) -> Path:
+        path = resolve_app_path(self.calib_output_dir_var.get())
+        if path.is_dir():
+            return path / "calibration_result.json"
+        if path.name == "calibration_result.json":
+            return path
+        return path / "calibration_result.json"
+
+    def _open_depth_preview_window(self) -> None:
+        if self.depth_preview_window is not None and self.depth_preview_window.winfo_exists():
+            self.depth_preview_window.lift()
+            return
+        window = Toplevel(self.root)
+        self.depth_preview_window = window
+        window.title("实时深度预览")
+        window.configure(bg=BG_COLOR)
+        window.geometry("1320x820")
+        window.minsize(980, 640)
+        window.protocol("WM_DELETE_WINDOW", self.stop_depth_preview)
+
+        frame = ttk.Frame(window, padding=(10, 8))
+        frame.pack(side=TOP, fill=BOTH, expand=True)
+        for column in range(2):
+            frame.grid_columnconfigure(column, weight=1)
+        for row in range(2):
+            frame.grid_rowconfigure(row, weight=1)
+        self.depth_preview_left_pane = ArrayImagePane(frame, "左图校正")
+        self.depth_preview_depth_pane = ArrayImagePane(frame, "深度图")
+        self.depth_preview_disparity_pane = ArrayImagePane(frame, "视差图")
+        self.depth_preview_confidence_pane = ArrayImagePane(frame, "置信度")
+        self.depth_preview_left_pane.grid(row=0, column=0, sticky="nsew", padx=(0, 4), pady=(0, 4))
+        self.depth_preview_depth_pane.grid(row=0, column=1, sticky="nsew", padx=(4, 0), pady=(0, 4))
+        self.depth_preview_disparity_pane.grid(row=1, column=0, sticky="nsew", padx=(0, 4), pady=(4, 0))
+        self.depth_preview_confidence_pane.grid(row=1, column=1, sticky="nsew", padx=(4, 0), pady=(4, 0))
+        ttk.Label(window, textvariable=self.depth_preview_status_var, style="Status.TLabel", anchor="w", padding=(10, 6)).pack(side=BOTTOM, fill=X)
+
+    def start_depth_preview(self) -> None:
+        if self.camera_system is None:
+            return
+        if self.previewing or self.recording or self.interval_capturing:
+            self.status_var.set("请先停止普通采集、录像或定时拍照，再启动实时深度。")
+            return
+        if not self.apply_reconstruction_settings():
+            return
+        if not self.ensure_reconstruction_preflight():
+            return
+        calibration_path = self._latest_calibration_result_path()
+        if not calibration_path.exists():
+            messagebox.showerror("缺少标定结果", f"未找到：{calibration_path}")
+            return
+        try:
+            with calibration_path.open("r", encoding="utf-8") as fh:
+                calibration_result = json.load(fh)
+        except Exception as exc:
+            self._show_error(exc)
+            return
+        if not calibration_result.get("stereo", {}).get("rectification"):
+            messagebox.showerror("缺少校正参数", "calibration_result.json 中没有 stereo.rectification，无法实时深度预览。")
+            return
+        self._open_depth_preview_window()
+        self._reset_stats()
+        self.depth_previewing = True
+        self.depth_preview_stop_event.clear()
+        self.depth_preview_button.configure(text="停止深度")
+        self._set_capture_buttons(NORMAL)
+        self.status_var.set("实时深度预览启动中...")
+        reconstruction_config = self._current_reconstruction_config()
+        self.depth_preview_thread = threading.Thread(
+            target=self._depth_preview_loop,
+            args=(calibration_result, reconstruction_config),
+            daemon=True,
+        )
+        self.depth_preview_thread.start()
+
+    def stop_depth_preview(self) -> None:
+        self.depth_previewing = False
+        self.depth_preview_stop_event.set()
+        self.depth_preview_button.configure(state=DISABLED)
+        self.status_var.set("正在停止实时深度预览...")
+        if self.depth_preview_window is not None and self.depth_preview_window.winfo_exists():
+            self.depth_preview_window.destroy()
+        self.depth_preview_window = None
+        self.depth_preview_left_pane = None
+        self.depth_preview_depth_pane = None
+        self.depth_preview_disparity_pane = None
+        self.depth_preview_confidence_pane = None
+
+    def _pil_to_bgr(self, image: Image.Image) -> np.ndarray:
+        array = np.asarray(image.convert("RGB"))
+        return array[..., ::-1].copy()
+
+    def _depth_preview_loop(self, calibration_result: dict, reconstruction_config: dict) -> None:
+        assert self.camera_system is not None
+        had_error = False
+        target_fps = max(min(float(self.config.get("depth_preview_fps", 1.0)), 5.0), 0.1)
+        interval = 1.0 / target_fps
+        next_time = time.perf_counter()
+        try:
+            from calibration import StereoRectifier, reconstruct_rectified_pair_preview
+
+            rectifier = StereoRectifier(calibration_result)
+
+            while self.depth_previewing:
+                left, right, _trigger_time = self.camera_system.capture_pair()
+                self._update_stats(left, right)
+                left_bgr = self._pil_to_bgr(left.image)
+                right_bgr = self._pil_to_bgr(right.image)
+                left_rectified, right_rectified = rectifier.rectify(left_bgr, right_bgr)
+                preview = reconstruct_rectified_pair_preview(left_rectified, right_rectified, calibration_result, reconstruction_config)
+                info = self._status_with_stats(
+                    f"实时深度：{preview['method_requested']} -> {preview['disparity_result']['method']}；目标 {target_fps:g} fps"
+                )
+                self.ui_queue.put(
+                    (
+                        "depth_preview_frames",
+                        (
+                            left_rectified,
+                            preview["depth_image"],
+                            preview["disparity_image"],
+                            preview["confidence_image"],
+                            info,
+                        ),
+                    )
+                )
+                next_time += interval
+                sleep_s = next_time - time.perf_counter()
+                if sleep_s > 0:
+                    if self.depth_preview_stop_event.wait(sleep_s):
+                        break
+                else:
+                    next_time = time.perf_counter()
+        except Exception as exc:
+            had_error = True
+            self.ui_queue.put(("error", exc))
+        finally:
+            self.ui_queue.put(("depth_preview_done", had_error))
 
     def _preview_loop(self) -> None:
         assert self.camera_system is not None
@@ -1116,6 +1802,7 @@ class StereoCaptureApp:
     def stop_interval_capture(self) -> None:
         self.interval_capturing = False
         self.interval_stop_event.set()
+        self.depth_preview_stop_event.set()
         self.interval_button.configure(state=DISABLED)
         self.status_var.set("正在停止定时拍照...")
 
@@ -1316,6 +2003,62 @@ class StereoCaptureApp:
                     self.record_button.configure(text="开始录像")
                     self._set_capture_buttons(NORMAL)
                     self.status_var.set(f"录像完成：{payload}")
+                elif kind == "reconstruction_done":
+                    result, status_var, disparity_pane, depth_pane, *extras = payload
+                    disparity_pane.set_image_file(result["disparity_map"])
+                    depth_pane.set_image_file(result["depth_map"])
+                    point_cloud_path = result.get("point_cloud_ply", "")
+                    if len(extras) >= 2:
+                        open_cloud_button, cloud_path_var = extras[:2]
+                        cloud_path_var.set(str(point_cloud_path or ""))
+                        try:
+                            cloud_exists = bool(point_cloud_path) and self._resolve_point_cloud_path(point_cloud_path).exists()
+                            open_cloud_button.configure(state=NORMAL if cloud_exists else DISABLED)
+                        except Exception:
+                            pass
+                    quality = result.get("quality_metrics", {})
+                    confidence_warnings = result.get("confidence_filter", {}).get("warnings") or []
+                    status_var.set(
+                        f"完成：{result.get('method_used')}；有效深度 {quality.get('valid_depth_ratio', 0):.1%}；"
+                        f"点云 {result.get('valid_point_count', 0)} 点；离群 {quality.get('point_cloud', {}).get('outlier_ratio', 0):.1%}；"
+                        f"输出 {result.get('reconstruction_result')}"
+                    )
+                    suffix = f"；提示：{'；'.join(confidence_warnings)}" if confidence_warnings else ""
+                    self.status_var.set(f"独立深度重建完成：{result.get('reconstruction_result')}{suffix}")
+                elif kind == "reconstruction_idle":
+                    self.reconstructing = False
+                    try:
+                        payload.configure(state=NORMAL)
+                    except Exception:
+                        pass
+                elif kind == "reconstruction_preflight_done":
+                    self.reconstruction_preflight = payload
+                    self.status_var.set(self._format_preflight_summary(payload))
+                    if hasattr(self, "calibration_result_text") and self.last_calibration_result is None:
+                        self._set_calibration_result_text(self._format_reconstruction_preflight_detail(payload))
+                elif kind == "viewer_error":
+                    self.status_var.set(str(payload).splitlines()[0] if str(payload).strip() else "Open3D 点云查看器打开失败。")
+                    messagebox.showerror("点云查看器打开失败", str(payload))
+                elif kind == "depth_preview_frames":
+                    left_image, depth_image, disparity_image, confidence_image, info = payload
+                    if self.depth_preview_left_pane is not None:
+                        self.depth_preview_left_pane.set_array(left_image, info)
+                    if self.depth_preview_depth_pane is not None:
+                        self.depth_preview_depth_pane.set_array(depth_image, info)
+                    if self.depth_preview_disparity_pane is not None:
+                        self.depth_preview_disparity_pane.set_array(disparity_image, info)
+                    if self.depth_preview_confidence_pane is not None:
+                        self.depth_preview_confidence_pane.set_array(confidence_image, info)
+                    self.depth_preview_status_var.set(info)
+                elif kind == "depth_preview_done":
+                    self.depth_previewing = False
+                    self.depth_preview_button.configure(text="实时深度")
+                    if self.camera_system is not None and not self.recording and not self.interval_capturing and not self.previewing:
+                        self._set_capture_buttons(NORMAL)
+                    elif self.camera_system is not None:
+                        self.depth_preview_button.configure(state=NORMAL)
+                    if not payload:
+                        self.status_var.set("实时深度预览已停止。")
                 elif kind == "gain_idle":
                     if self.camera_system is not None:
                         self._set_parameter_buttons(NORMAL)
@@ -1328,11 +2071,13 @@ class StereoCaptureApp:
                         self.calibrate_button.configure(state=NORMAL)
                     self._set_calibration_progress(100.0, "标定完成")
                     self.render_calibration_result(payload)
+                    self._close_progress_window()
                 elif kind == "calibration_idle":
                     self.calibrating = False
                     if self.calibrate_button is not None:
                         self.calibrate_button.configure(state=NORMAL)
                     self._set_calibration_progress(0.0, "等待开始")
+                    self._close_progress_window()
                 elif kind == "calibration_progress":
                     value, text = payload
                     self._set_calibration_progress(float(value), str(text))
@@ -1349,16 +2094,25 @@ class StereoCaptureApp:
             self.photo_button.configure(state=DISABLED)
             self.interval_button.configure(state=state)
             self.record_button.configure(state=DISABLED)
+            self.depth_preview_button.configure(state=DISABLED)
+        elif self.depth_previewing:
+            self.preview_button.configure(state=DISABLED)
+            self.photo_button.configure(state=DISABLED)
+            self.interval_button.configure(state=DISABLED)
+            self.record_button.configure(state=DISABLED)
+            self.depth_preview_button.configure(state=state)
         elif self.previewing:
             self.preview_button.configure(state=preview_state)
             self.photo_button.configure(state=state)
             self.interval_button.configure(state=state)
             self.record_button.configure(state=DISABLED)
+            self.depth_preview_button.configure(state=DISABLED)
         else:
             self.preview_button.configure(state=preview_state)
             self.photo_button.configure(state=state)
             self.interval_button.configure(state=state)
             self.record_button.configure(state=state)
+            self.depth_preview_button.configure(state=state if self.camera_system is not None else DISABLED)
         self.connect_button.configure(state=DISABLED if self.camera_system is not None else NORMAL)
 
     def _set_parameter_buttons(self, state: str) -> None:
@@ -1610,6 +2364,109 @@ class StereoCaptureApp:
         self._set_calibration_status(summary)
         self._set_calibration_result_text(json.dumps(info, ensure_ascii=False, indent=2))
 
+    def open_reconstruction_dialog(self) -> None:
+        if not self.apply_reconstruction_settings():
+            return
+        if not self.ensure_reconstruction_preflight():
+            return
+        window = Toplevel(self.root)
+        window.title("独立深度重建")
+        window.configure(bg=BG_COLOR)
+        window.geometry("1180x760")
+        window.minsize(980, 640)
+
+        left_var = StringVar(value="")
+        right_var = StringVar(value="")
+        calib_var = StringVar(value=str(resolve_app_path(self.calib_output_dir_var.get()) / "calibration_result.json"))
+        output_var = StringVar(value=str(resolve_output_root(self.config) / "reconstruction_jobs" / time.strftime("%Y%m%d_%H%M%S")))
+        cloud_path_var = StringVar(value="")
+        status_var = StringVar(value="选择左右图和 calibration_result.json 后开始。")
+
+        root_frame = ttk.Frame(window, padding=(12, 10))
+        root_frame.pack(side=TOP, fill=BOTH, expand=True)
+        root_frame.grid_columnconfigure(1, weight=1)
+        root_frame.grid_rowconfigure(4, weight=1)
+
+        def choose_file(variable: StringVar, title: str, filetypes: list[tuple[str, str]]) -> None:
+            selected = filedialog.askopenfilename(title=title, filetypes=filetypes)
+            if selected:
+                variable.set(selected)
+
+        def choose_dir(variable: StringVar) -> None:
+            selected = filedialog.askdirectory(title="选择输出目录", initialdir=str(resolve_output_root(self.config)))
+            if selected:
+                variable.set(selected)
+
+        image_types = [("Image files", "*.bmp *.dib *.jpg *.jpeg *.png *.tif *.tiff"), ("All files", "*.*")]
+        rows = [
+            ("左图", left_var, lambda: choose_file(left_var, "选择左图", image_types)),
+            ("右图", right_var, lambda: choose_file(right_var, "选择右图", image_types)),
+            ("标定结果", calib_var, lambda: choose_file(calib_var, "选择 calibration_result.json", [("JSON", "*.json"), ("All files", "*.*")])),
+            ("输出目录", output_var, lambda: choose_dir(output_var)),
+        ]
+        for row, (label, variable, command) in enumerate(rows):
+            ttk.Label(root_frame, text=label).grid(row=row, column=0, padx=(0, 6), pady=4, sticky="w")
+            ttk.Entry(root_frame, textvariable=variable).grid(row=row, column=1, padx=(0, 6), pady=4, sticky="ew")
+            ttk.Button(root_frame, text="选择", command=command).grid(row=row, column=2, padx=(0, 0), pady=4)
+
+        preview = ttk.Frame(root_frame)
+        preview.grid(row=4, column=0, columnspan=3, sticky="nsew", pady=(8, 0))
+        preview.grid_columnconfigure(0, weight=1)
+        preview.grid_columnconfigure(1, weight=1)
+        preview.grid_rowconfigure(0, weight=1)
+        left_preview = ArrayImagePane(preview, "视差图")
+        right_preview = ArrayImagePane(preview, "深度图")
+        left_preview.grid(row=0, column=0, sticky="nsew", padx=(0, 4))
+        right_preview.grid(row=0, column=1, sticky="nsew", padx=(4, 0))
+
+        actions = ttk.Frame(root_frame)
+        actions.grid(row=5, column=0, columnspan=3, sticky="ew", pady=(8, 0))
+        ttk.Label(actions, textvariable=status_var, style="Status.TLabel").pack(side=LEFT, fill=X, expand=True)
+
+        start_button = ttk.Button(actions, text="开始重建", style="Accent.TButton")
+        start_button.pack(side=RIGHT)
+        open_cloud_button = ttk.Button(
+            actions,
+            text="打开点云",
+            command=lambda: self.open_point_cloud_viewer(cloud_path_var.get()),
+            state=DISABLED,
+        )
+        open_cloud_button.pack(side=RIGHT, padx=(0, 8))
+
+        def worker() -> None:
+            try:
+                from calibration import reconstruct_stereo_images
+
+                result = reconstruct_stereo_images(
+                    left_var.get(),
+                    right_var.get(),
+                    calib_var.get(),
+                    output_var.get(),
+                    self._current_reconstruction_config(),
+                )
+                self.ui_queue.put(("reconstruction_done", (result, status_var, left_preview, right_preview, open_cloud_button, cloud_path_var)))
+            except Exception as exc:
+                self.ui_queue.put(("error", exc))
+            finally:
+                self.ui_queue.put(("reconstruction_idle", start_button))
+
+        def start() -> None:
+            if self.reconstructing:
+                return
+            if not left_var.get().strip() or not right_var.get().strip() or not calib_var.get().strip():
+                status_var.set("请先选择左图、右图和标定结果。")
+                return
+            if not self.apply_reconstruction_settings():
+                return
+            self.reconstructing = True
+            start_button.configure(state=DISABLED)
+            open_cloud_button.configure(state=DISABLED)
+            cloud_path_var.set("")
+            status_var.set("正在重建，请等待...")
+            threading.Thread(target=worker, daemon=True).start()
+
+        start_button.configure(command=start)
+
     def start_calibration(self) -> None:
         if self.calibrating:
             return
@@ -1628,6 +2485,10 @@ class StereoCaptureApp:
         if pattern in {"charuco", "charuco_legacy"} and (marker_size is None or marker_size <= 0):
             self.status_var.set("ChArUco 标定需要填写码尺寸。")
             return
+        if not self.apply_reconstruction_settings():
+            return
+        if not self.ensure_reconstruction_preflight():
+            return
         try:
             from calibration import normalize_aruco_dictionary_name
 
@@ -1642,6 +2503,7 @@ class StereoCaptureApp:
         self._set_calibration_status("正在标定，请等待...")
         self._set_calibration_result_text("")
         self._set_calibration_progress(0.0, "准备开始")
+        self._show_progress_window()
         self.config.update(
             {
                 "calibration_left_dir": self.calib_left_dir_var.get(),
@@ -1656,6 +2518,7 @@ class StereoCaptureApp:
             }
         )
         save_config(self.config)
+        reconstruction_config = self._current_reconstruction_config()
 
         def worker() -> None:
             try:
@@ -1672,6 +2535,7 @@ class StereoCaptureApp:
                     marker_size_mm=marker_size,
                     aruco_dictionary=aruco_dictionary,
                     legacy_charuco=pattern == "charuco_legacy",
+                    reconstruction_config=reconstruction_config,
                     progress_callback=lambda value, text: self.ui_queue.put(("calibration_progress", (value, text))),
                 )
                 result["summary_text"] = summarize_result(result)
@@ -1721,6 +2585,17 @@ class StereoCaptureApp:
         self.roi_height_var.set("" if self.config.get("roi_height") is None else str(self.config.get("roi_height")))
         self.roi_offset_x_var.set(str(self.config.get("roi_offset_x", 0)))
         self.roi_offset_y_var.set(str(self.config.get("roi_offset_y", 0)))
+        self.recon_method_var.set(str(self.config.get("reconstruction_method", "auto")))
+        self.recon_model_path_var.set(optional_config_text(self.config, "crestereo_model_path", ""))
+        self.recon_wls_var.set(config_bool(self.config, "use_wls_filter", True))
+        self.recon_wls_lambda_var.set(str(self.config.get("wls_lambda", 8000.0)))
+        self.recon_wls_sigma_var.set(str(self.config.get("wls_sigma_color", 1.5)))
+        self.recon_confidence_var.set(config_bool(self.config, "confidence_filter", True))
+        self.recon_confidence_threshold_var.set(str(self.config.get("confidence_threshold", 0.35)))
+        self.recon_lr_threshold_var.set(str(self.config.get("left_right_consistency_px", 2.0)))
+        recon_max_width = self.config.get("reconstruction_max_width", 2400)
+        self.recon_max_width_var.set("" if recon_max_width in (None, "") else str(recon_max_width))
+        self.recon_allow_fallback_var.set(config_bool(self.config, "allow_sgbm_fallback", True))
 
     def _format_apply_result(self, prefix: str, warnings: list[str]) -> str:
         if warnings:
@@ -1873,6 +2748,8 @@ class StereoCaptureApp:
         self.interval_stop_event.set()
         if self.preview_thread and self.preview_thread.is_alive():
             self.preview_thread.join(timeout=3)
+        if self.depth_preview_thread and self.depth_preview_thread.is_alive():
+            self.depth_preview_thread.join(timeout=3)
         if self.record_thread and self.record_thread.is_alive():
             self.record_thread.join(timeout=3)
         if self.interval_thread and self.interval_thread.is_alive():

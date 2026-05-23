@@ -43,6 +43,9 @@ class CalibrationError(RuntimeError):
     pass
 
 
+_CRESTEREO_MODEL_CACHE: dict[tuple[str, tuple[str, ...] | None], Any] = {}
+
+
 def _load_cv2():
     os.environ.setdefault("OPENCV_OPENCL_RUNTIME", "disabled")
     try:
@@ -687,8 +690,22 @@ def _draw_detection_overlay(cv2, image, detected_points, reprojected_points=None
     overlay = image.copy()
     radius = max(4, min(12, int(round(max(image.shape[:2]) / 650))))
     thickness = max(2, radius // 2)
-    for x, y in np.asarray(detected_points, dtype=float).reshape(-1, 2):
+    points = np.asarray(detected_points, dtype=float).reshape(-1, 2)
+    for x, y in points:
         cv2.circle(overlay, (int(round(x)), int(round(y))), radius, (0, 210, 0), thickness, cv2.LINE_AA)
+    if len(points) >= 2:
+        origin = points[0]
+        x_axis = points[min(len(points) - 1, max(1, len(points) // 2))]
+        y_axis = points[min(len(points) - 1, max(2, len(points) - 1))]
+        origin_pt = tuple(map(int, np.round(origin)))
+        x_pt = tuple(map(int, np.round(x_axis)))
+        y_pt = tuple(map(int, np.round(y_axis)))
+        cv2.arrowedLine(overlay, origin_pt, x_pt, (255, 80, 80), thickness, cv2.LINE_AA, 0, 0.08)
+        cv2.arrowedLine(overlay, origin_pt, y_pt, (80, 120, 255), thickness, cv2.LINE_AA, 0, 0.08)
+        cv2.putText(overlay, "X", (x_pt[0] + 6, x_pt[1] - 6), cv2.FONT_HERSHEY_SIMPLEX, 0.9, (255, 80, 80), max(1, thickness), cv2.LINE_AA)
+        cv2.putText(overlay, "Y", (y_pt[0] + 6, y_pt[1] - 6), cv2.FONT_HERSHEY_SIMPLEX, 0.9, (80, 120, 255), max(1, thickness), cv2.LINE_AA)
+        cv2.circle(overlay, origin_pt, radius + 4, (255, 255, 0), max(1, thickness), cv2.LINE_AA)
+        cv2.putText(overlay, "(0,0)", (origin_pt[0] + 8, origin_pt[1] - 8), cv2.FONT_HERSHEY_SIMPLEX, 0.8, (255, 255, 0), max(1, thickness), cv2.LINE_AA)
     if reprojected_points is not None:
         arm = radius + 3
         for x, y in np.asarray(reprojected_points, dtype=float).reshape(-1, 2):
@@ -736,6 +753,29 @@ def _rectify_pair(cv2, result: dict[str, Any], left_image, right_image):
     return left_rectified, right_rectified
 
 
+class StereoRectifier:
+    def __init__(self, calibration_result: dict[str, Any]):
+        self.cv2 = _load_cv2()
+        mats = _rectification_matrices(calibration_result)
+        if mats is None:
+            raise CalibrationError("缺少 stereoRectify 校正参数，无法进行极线校正。")
+        self.image_size = tuple(map(int, calibration_result["image_size"]))
+        self.left_map1, self.left_map2 = self.cv2.initUndistortRectifyMap(
+            mats["K1"], mats["D1"], mats["R1"], mats["P1"][:, :3], self.image_size, self.cv2.CV_16SC2
+        )
+        self.right_map1, self.right_map2 = self.cv2.initUndistortRectifyMap(
+            mats["K2"], mats["D2"], mats["R2"], mats["P2"][:, :3], self.image_size, self.cv2.CV_16SC2
+        )
+
+    def rectify(self, left_image, right_image):
+        current_size = (int(left_image.shape[1]), int(left_image.shape[0]))
+        if current_size != self.image_size:
+            raise CalibrationError(f"输入图像尺寸 {current_size} 与标定尺寸 {self.image_size} 不一致。")
+        left_rectified = self.cv2.remap(left_image, self.left_map1, self.left_map2, self.cv2.INTER_LINEAR)
+        right_rectified = self.cv2.remap(right_image, self.right_map1, self.right_map2, self.cv2.INTER_LINEAR)
+        return left_rectified, right_rectified
+
+
 def _draw_epipolar_pair(cv2, left_rectified, right_rectified):
     left = left_rectified.copy()
     right = right_rectified.copy()
@@ -778,6 +818,710 @@ def _choose_disparity_range(disparities: np.ndarray, scale: float, width: int) -
     return int(min_disp), int(num_disp)
 
 
+def _config_bool(config: dict[str, Any], key: str, default: bool) -> bool:
+    value = config.get(key, default)
+    if isinstance(value, bool):
+        return value
+    if value is None:
+        return default
+    if isinstance(value, (int, float)):
+        return bool(value)
+    text = str(value).strip().lower()
+    if text in {"1", "true", "yes", "y", "on", "enabled"}:
+        return True
+    if text in {"0", "false", "no", "n", "off", "disabled"}:
+        return False
+    return default
+
+
+def _config_float(config: dict[str, Any], key: str, default: float, minimum: float | None = None) -> float:
+    try:
+        value = float(config.get(key, default))
+    except (TypeError, ValueError):
+        value = float(default)
+    if not np.isfinite(value):
+        value = float(default)
+    if minimum is not None:
+        value = max(float(minimum), value)
+    return value
+
+
+def _config_int(config: dict[str, Any], key: str, default: int, minimum: int | None = None) -> int:
+    try:
+        value = int(float(config.get(key, default)))
+    except (TypeError, ValueError):
+        value = int(default)
+    if minimum is not None:
+        value = max(int(minimum), value)
+    return value
+
+
+def _available_system_memory_bytes() -> int | None:
+    try:
+        import psutil  # type: ignore
+
+        return int(psutil.virtual_memory().available)
+    except Exception:
+        pass
+
+    if os.name == "nt":
+        try:
+            import ctypes
+
+            class MEMORYSTATUSEX(ctypes.Structure):
+                _fields_ = [
+                    ("dwLength", ctypes.c_ulong),
+                    ("dwMemoryLoad", ctypes.c_ulong),
+                    ("ullTotalPhys", ctypes.c_ulonglong),
+                    ("ullAvailPhys", ctypes.c_ulonglong),
+                    ("ullTotalPageFile", ctypes.c_ulonglong),
+                    ("ullAvailPageFile", ctypes.c_ulonglong),
+                    ("ullTotalVirtual", ctypes.c_ulonglong),
+                    ("ullAvailVirtual", ctypes.c_ulonglong),
+                    ("sullAvailExtendedVirtual", ctypes.c_ulonglong),
+                ]
+
+            status = MEMORYSTATUSEX()
+            status.dwLength = ctypes.sizeof(MEMORYSTATUSEX)
+            if ctypes.windll.kernel32.GlobalMemoryStatusEx(ctypes.byref(status)):
+                return int(status.ullAvailPhys)
+        except Exception:
+            return None
+
+    try:
+        page_size = int(os.sysconf("SC_PAGE_SIZE"))
+        available_pages = int(os.sysconf("SC_AVPHYS_PAGES"))
+        return page_size * available_pages
+    except Exception:
+        return None
+
+
+def _available_cuda_memory_bytes() -> int | None:
+    nvidia_smi = shutil.which("nvidia-smi")
+    if not nvidia_smi:
+        return None
+    try:
+        import subprocess
+
+        completed = subprocess.run(
+            [
+                nvidia_smi,
+                "--query-gpu=memory.free",
+                "--format=csv,noheader,nounits",
+            ],
+            capture_output=True,
+            text=True,
+            timeout=3,
+            check=False,
+        )
+    except Exception:
+        return None
+    if completed.returncode != 0:
+        return None
+    values: list[int] = []
+    for line in completed.stdout.splitlines():
+        try:
+            values.append(int(float(line.strip())) * 1024 * 1024)
+        except ValueError:
+            continue
+    return max(values) if values else None
+
+
+def _estimate_reconstruction_memory_bytes(width: int, height: int, config: dict[str, Any], method_requested: str) -> int:
+    pixels = max(int(width) * int(height), 1)
+    method = str(method_requested).lower()
+    per_pixel = 112
+    if method == "sgbm":
+        per_pixel += 48
+    if _config_bool(config, "use_wls_filter", True):
+        per_pixel += 48
+    if _config_bool(config, "confidence_filter", True):
+        per_pixel += 24
+    # Include point coordinates, colors, masks, and temporary OpenCV/NumPy buffers.
+    return int(pixels * per_pixel + 512 * 1024 * 1024)
+
+
+def _estimate_crestereo_cuda_memory_bytes(config: dict[str, Any], method_requested: str) -> int | None:
+    wants_crestereo = method_requested in {"cres", "crestereo", "crestereo_onnx"} or (
+        method_requested == "auto" and bool(str(config.get("crestereo_model_path", "") or "").strip())
+    )
+    if not wants_crestereo:
+        return None
+    providers = config.get("crestereo_providers")
+    requested = list(providers or [])
+    cuda_requested = "CUDAExecutionProvider" in requested or not requested
+    if not cuda_requested:
+        return None
+    # CREStereo ONNX inputs are fixed-size, but ORT/CUDA still needs workspace.
+    return 2 * 1024 * 1024 * 1024
+
+
+def _resolve_reconstruction_scale(
+    config: dict[str, Any],
+    width: int,
+    height: int,
+    method_requested: str,
+) -> tuple[float, dict[str, Any]]:
+    default_safe_width = 2400
+    requested_max_width = int(config.get("reconstruction_max_width", default_safe_width) or 0)
+    target_width = int(width) if requested_max_width <= 0 else min(int(width), requested_max_width)
+    requests_original = target_width >= int(width)
+    resource_policy: dict[str, Any] = {
+        "requested_max_width": int(requested_max_width),
+        "default_safe_max_width": int(default_safe_width),
+        "original_size": [int(width), int(height)],
+        "requested_original_width": bool(requests_original),
+        "fallback_applied": False,
+        "fallback_reasons": [],
+    }
+
+    if requests_original:
+        estimated_memory = _estimate_reconstruction_memory_bytes(width, height, config, method_requested)
+        available_memory = _available_system_memory_bytes()
+        required_memory = int(estimated_memory * 1.25 + 512 * 1024 * 1024)
+        resource_policy.update(
+            {
+                "estimated_memory_bytes": int(estimated_memory),
+                "required_memory_bytes": int(required_memory),
+                "available_memory_bytes": int(available_memory) if available_memory is not None else None,
+            }
+        )
+        if available_memory is not None and available_memory < required_memory:
+            resource_policy["fallback_reasons"].append(
+                f"available system memory {available_memory} B is below required {required_memory} B"
+            )
+        elif available_memory is None:
+            resource_policy["memory_check"] = "unknown"
+        else:
+            resource_policy["memory_check"] = "ok"
+
+        required_cuda_memory = _estimate_crestereo_cuda_memory_bytes(config, method_requested)
+        if required_cuda_memory is not None:
+            available_cuda_memory = _available_cuda_memory_bytes()
+            resource_policy.update(
+                {
+                    "estimated_cuda_memory_bytes": int(required_cuda_memory),
+                    "available_cuda_memory_bytes": int(available_cuda_memory) if available_cuda_memory is not None else None,
+                }
+            )
+            if available_cuda_memory is not None and available_cuda_memory < required_cuda_memory:
+                resource_policy["fallback_reasons"].append(
+                    f"available CUDA memory {available_cuda_memory} B is below required {required_cuda_memory} B"
+                )
+            elif available_cuda_memory is None:
+                resource_policy["cuda_memory_check"] = "unknown"
+            else:
+                resource_policy["cuda_memory_check"] = "ok"
+
+        if resource_policy["fallback_reasons"]:
+            target_width = min(int(width), default_safe_width)
+            resource_policy["fallback_applied"] = True
+
+    scale = min(1.0, float(max(target_width, 1)) / max(float(width), 1.0))
+    resource_policy["effective_max_width"] = int(target_width)
+    resource_policy["effective_size"] = [
+        max(1, int(round(width * scale))),
+        max(1, int(round(height * scale))),
+    ]
+    resource_policy["scale"] = float(scale)
+    return scale, resource_policy
+
+
+def _normalize_reconstruction_config(config: dict[str, Any] | None) -> dict[str, Any]:
+    normalized = {
+        "reconstruction_method": "sgbm",
+        "allow_sgbm_fallback": True,
+        "crestereo_model_path": "",
+        "crestereo_providers": ["CUDAExecutionProvider", "CPUExecutionProvider"],
+        "use_wls_filter": True,
+        "confidence_filter": True,
+        "confidence_threshold": 0.35,
+        "confidence_photometric_sigma": 0.15,
+        "left_right_consistency_px": 2.0,
+        "left_right_consistency_min_mean": 0.05,
+        "left_right_consistency_min_pass_ratio": 0.01,
+        "wls_consistency_px": 2.0,
+        "wls_lambda": 8000.0,
+        "wls_sigma_color": 1.5,
+        "reconstruction_max_width": 2400,
+    }
+    if config:
+        normalized.update(config)
+    normalized["reconstruction_method"] = str(normalized.get("reconstruction_method", "sgbm")).strip().lower() or "sgbm"
+    normalized["allow_sgbm_fallback"] = _config_bool(normalized, "allow_sgbm_fallback", True)
+    normalized["use_wls_filter"] = _config_bool(normalized, "use_wls_filter", True)
+    normalized["confidence_filter"] = _config_bool(normalized, "confidence_filter", True)
+    normalized["confidence_threshold"] = _config_float(normalized, "confidence_threshold", 0.35, 0.0)
+    normalized["confidence_photometric_sigma"] = _config_float(normalized, "confidence_photometric_sigma", 0.15, 1e-6)
+    normalized["left_right_consistency_px"] = _config_float(normalized, "left_right_consistency_px", 2.0, 1e-6)
+    normalized["left_right_consistency_min_mean"] = _config_float(normalized, "left_right_consistency_min_mean", 0.05, 0.0)
+    normalized["left_right_consistency_min_pass_ratio"] = _config_float(normalized, "left_right_consistency_min_pass_ratio", 0.01, 0.0)
+    normalized["wls_consistency_px"] = _config_float(normalized, "wls_consistency_px", 2.0, 1e-6)
+    normalized["wls_lambda"] = _config_float(normalized, "wls_lambda", 8000.0, 0.0)
+    normalized["wls_sigma_color"] = _config_float(normalized, "wls_sigma_color", 1.5, 0.0)
+    max_width = _config_int(normalized, "reconstruction_max_width", 2400)
+    if max_width <= 0:
+        normalized["reconstruction_max_width"] = 0
+    else:
+        normalized["reconstruction_max_width"] = max(320, max_width)
+    providers = normalized.get("crestereo_providers")
+    if isinstance(providers, str):
+        normalized["crestereo_providers"] = [item.strip() for item in providers.split(",") if item.strip()]
+    elif providers is None:
+        normalized["crestereo_providers"] = None
+    else:
+        normalized["crestereo_providers"] = [str(item) for item in providers]
+    return normalized
+
+
+def check_reconstruction_environment(config: dict[str, Any] | None = None) -> dict[str, Any]:
+    normalized = _normalize_reconstruction_config(config)
+    method = str(normalized.get("reconstruction_method", "sgbm")).lower()
+    wants_crestereo = method in {"cres", "crestereo", "crestereo_onnx"} or (
+        method == "auto" and bool(str(normalized.get("crestereo_model_path", "") or "").strip())
+    )
+    checks: dict[str, dict[str, Any]] = {}
+    warnings: list[str] = []
+    errors: list[str] = []
+
+    model_path_text = str(normalized.get("crestereo_model_path", "") or "").strip()
+    model_path = Path(model_path_text) if model_path_text else None
+    model_exists = bool(model_path and model_path.exists() and model_path.is_file())
+    checks["crestereo_model_file"] = {
+        "required": bool(wants_crestereo),
+        "ok": bool(model_exists) if wants_crestereo else (not model_path_text or bool(model_exists)),
+        "path": model_path_text,
+    }
+    if wants_crestereo and not model_exists:
+        message = f"CREStereo ONNX 模型文件不存在：{model_path_text or '(未填写)'}"
+        if bool(normalized.get("allow_sgbm_fallback", True)):
+            warnings.append(message + "；将尝试 SGBM fallback。")
+        else:
+            errors.append(message)
+
+    ort_available = False
+    ort_providers: list[str] = []
+    ort_error = ""
+    try:
+        import onnxruntime as ort
+
+        ort_available = True
+        ort_providers = list(ort.get_available_providers())
+    except Exception as exc:
+        ort_error = str(exc)
+    checks["onnxruntime"] = {
+        "required": bool(wants_crestereo),
+        "ok": bool(ort_available) if wants_crestereo else bool(ort_available),
+        "available_providers": ort_providers,
+        "error": ort_error,
+    }
+    if wants_crestereo and not ort_available:
+        message = "onnxruntime 不可用，无法执行 CREStereo。"
+        if bool(normalized.get("allow_sgbm_fallback", True)):
+            warnings.append(message + " 将尝试 SGBM fallback。")
+        else:
+            errors.append(message)
+
+    requested_providers = list(normalized.get("crestereo_providers") or [])
+    cuda_requested = "CUDAExecutionProvider" in requested_providers or not requested_providers
+    cuda_available = "CUDAExecutionProvider" in ort_providers
+    checks["cuda_provider"] = {
+        "required": bool(wants_crestereo and cuda_requested),
+        "ok": bool(cuda_available),
+        "requested": requested_providers,
+        "available_providers": ort_providers,
+    }
+    if wants_crestereo and cuda_requested and ort_available and not cuda_available:
+        warnings.append("onnxruntime 未检测到 CUDAExecutionProvider；CREStereo 将使用 CPU 或 fallback，速度会明显下降。")
+
+    cv2_error = ""
+    ximgproc_available = False
+    wls_generic_available = False
+    wls_sgbm_available = False
+    try:
+        cv2 = _load_cv2()
+        ximgproc_available = hasattr(cv2, "ximgproc")
+        wls_generic_available = ximgproc_available and hasattr(cv2.ximgproc, "createDisparityWLSFilterGeneric")
+        wls_sgbm_available = ximgproc_available and hasattr(cv2.ximgproc, "createDisparityWLSFilter") and hasattr(cv2.ximgproc, "createRightMatcher")
+    except Exception as exc:
+        cv2_error = str(exc)
+    checks["opencv_ximgproc"] = {
+        "required": bool(normalized.get("use_wls_filter", True)),
+        "ok": bool(ximgproc_available),
+        "error": cv2_error,
+    }
+    checks["wls_interfaces"] = {
+        "required": bool(normalized.get("use_wls_filter", True)),
+        "ok": bool(wls_generic_available or wls_sgbm_available),
+        "generic_wls": bool(wls_generic_available),
+        "sgbm_wls": bool(wls_sgbm_available),
+    }
+    if bool(normalized.get("use_wls_filter", True)) and not (wls_generic_available or wls_sgbm_available):
+        warnings.append("OpenCV ximgproc/WLS 接口不可用；重建会跳过 WLS 滤波。")
+
+    ok = not errors
+    return {
+        "ok": bool(ok),
+        "method": method,
+        "allow_sgbm_fallback": bool(normalized.get("allow_sgbm_fallback", True)),
+        "checks": checks,
+        "warnings": warnings,
+        "errors": errors,
+    }
+
+
+def _make_sgbm_matcher(cv2, min_disp: int, num_disp: int, block_size: int = 5):
+    return cv2.StereoSGBM_create(
+        minDisparity=int(min_disp),
+        numDisparities=int(num_disp),
+        blockSize=int(block_size),
+        P1=8 * block_size * block_size,
+        P2=32 * block_size * block_size,
+        disp12MaxDiff=1,
+        uniquenessRatio=8,
+        speckleWindowSize=80,
+        speckleRange=2,
+        preFilterCap=63,
+        mode=getattr(cv2, "STEREO_SGBM_MODE_SGBM_3WAY", cv2.STEREO_SGBM_MODE_SGBM),
+    )
+
+
+def _wls_metadata(enabled: bool, status: str, config: dict[str, Any], note: str = "") -> dict[str, Any]:
+    return {
+        "enabled": bool(enabled),
+        "status": status,
+        "lambda": float(config.get("wls_lambda", 8000.0)),
+        "sigma_color": float(config.get("wls_sigma_color", 1.5)),
+        "note": note,
+    }
+
+
+def _apply_generic_wls_filter(cv2, disparity: np.ndarray, guide_image, config: dict[str, Any]) -> tuple[np.ndarray, dict[str, Any]]:
+    if not _config_bool(config, "use_wls_filter", True):
+        return disparity.astype(np.float32), _wls_metadata(False, "disabled", config)
+    if not hasattr(cv2, "ximgproc") or not hasattr(cv2.ximgproc, "createDisparityWLSFilterGeneric"):
+        return disparity.astype(np.float32), _wls_metadata(False, "unavailable", config, "OpenCV ximgproc WLS is unavailable")
+
+    finite = np.isfinite(disparity)
+    scaled = np.where(finite, disparity, -1.0) * 16.0
+    scaled = np.clip(np.round(scaled), -32768, 32767).astype(np.int16)
+    try:
+        wls_filter = cv2.ximgproc.createDisparityWLSFilterGeneric(False)
+        wls_filter.setLambda(float(config.get("wls_lambda", 8000.0)))
+        wls_filter.setSigmaColor(float(config.get("wls_sigma_color", 1.5)))
+        filtered = wls_filter.filter(scaled, guide_image).astype(np.float32) / 16.0
+        filtered[~finite] = np.nan
+    except Exception as exc:
+        return disparity.astype(np.float32), _wls_metadata(False, "failed", config, str(exc))
+    return filtered.astype(np.float32), _wls_metadata(True, "applied", config)
+
+
+def _compute_sgbm_disparity(
+    cv2,
+    gray_left: np.ndarray,
+    gray_right: np.ndarray,
+    left_guide,
+    min_disp: int,
+    num_disp: int,
+    config: dict[str, Any],
+) -> dict[str, Any]:
+    block_size = 5
+    left_matcher = _make_sgbm_matcher(cv2, min_disp, num_disp, block_size)
+    raw_left = left_matcher.compute(gray_left, gray_right)
+    raw_disparity = raw_left.astype(np.float32) / 16.0
+    filtered = raw_disparity
+    right_disparity = None
+    wls_confidence = None
+    wls_info = _wls_metadata(False, "disabled", config)
+
+    if _config_bool(config, "use_wls_filter", True):
+        if hasattr(cv2, "ximgproc") and hasattr(cv2.ximgproc, "createDisparityWLSFilter") and hasattr(cv2.ximgproc, "createRightMatcher"):
+            try:
+                right_matcher = cv2.ximgproc.createRightMatcher(left_matcher)
+                raw_right = right_matcher.compute(gray_right, gray_left)
+                wls_filter = cv2.ximgproc.createDisparityWLSFilter(matcher_left=left_matcher)
+                wls_filter.setLambda(float(config.get("wls_lambda", 8000.0)))
+                wls_filter.setSigmaColor(float(config.get("wls_sigma_color", 1.5)))
+                filtered = wls_filter.filter(raw_left, left_guide, None, raw_right).astype(np.float32) / 16.0
+                right_disparity = raw_right.astype(np.float32) / 16.0
+                wls_confidence = wls_filter.getConfidenceMap().astype(np.float32)
+                wls_info = _wls_metadata(True, "applied", config)
+            except Exception as exc:
+                filtered, wls_info = _apply_generic_wls_filter(cv2, raw_disparity, left_guide, config)
+                wls_info["note"] = f"SGBM WLS with right matcher failed; generic WLS used. {exc}"
+        else:
+            filtered, wls_info = _apply_generic_wls_filter(cv2, raw_disparity, left_guide, config)
+
+    return {
+        "method": "sgbm",
+        "raw_disparity": raw_disparity.astype(np.float32),
+        "disparity": filtered.astype(np.float32),
+        "right_disparity": right_disparity,
+        "wls_confidence": wls_confidence,
+        "wls_filter": wls_info,
+        "metadata": {
+            "block_size": int(block_size),
+            "min_disparity": int(min_disp),
+            "num_disparities": int(num_disp),
+        },
+    }
+
+
+def _compute_crestereo_disparity(cv2, left_image, right_image, config: dict[str, Any]) -> dict[str, Any]:
+    model_path = str(config.get("crestereo_model_path", "") or "").strip()
+    if not model_path:
+        raise CalibrationError("已选择 CREStereo，但未配置 crestereo_model_path。")
+    try:
+        from crestereo_inference import CREStereoONNX
+    except Exception as exc:
+        raise CalibrationError(f"无法导入 CREStereo 推理模块：{exc}") from exc
+
+    providers = config.get("crestereo_providers")
+    provider_key = tuple(providers) if providers is not None else None
+    cache_key = (str(Path(model_path)), provider_key)
+    model = _CRESTEREO_MODEL_CACHE.get(cache_key)
+    if model is None:
+        model = CREStereoONNX(model_path, providers=providers)
+        _CRESTEREO_MODEL_CACHE[cache_key] = model
+
+    result = model.predict(cv2, left_image, right_image)
+    right_result = model.predict(cv2, right_image, left_image)
+    right_disparity = -np.abs(np.asarray(right_result.disparity, dtype=np.float32))
+    filtered, wls_info = _apply_generic_wls_filter(cv2, result.disparity, left_image, config)
+    return {
+        "method": "crestereo",
+        "raw_disparity": result.disparity.astype(np.float32),
+        "disparity": filtered.astype(np.float32),
+        "right_disparity": right_disparity.astype(np.float32),
+        "wls_confidence": None,
+        "wls_filter": wls_info,
+        "metadata": {
+            "model_path": result.model_path,
+            "input_width": int(result.input_width),
+            "input_height": int(result.input_height),
+            "providers": result.providers,
+            "input_names": result.input_names,
+            "output_names": result.output_names,
+            "right_inference": True,
+        },
+    }
+
+
+def _photometric_confidence(
+    cv2,
+    gray_left: np.ndarray,
+    gray_right: np.ndarray,
+    disparity: np.ndarray,
+    valid: np.ndarray,
+    sigma: float,
+) -> np.ndarray:
+    height, width = disparity.shape[:2]
+    xs, ys = np.meshgrid(np.arange(width, dtype=np.float32), np.arange(height, dtype=np.float32))
+    map_x = xs - disparity.astype(np.float32)
+    map_y = ys
+    in_bounds = valid & np.isfinite(map_x) & (map_x >= 0.0) & (map_x <= float(width - 1))
+    warped_right = cv2.remap(
+        gray_right,
+        map_x.astype(np.float32),
+        map_y.astype(np.float32),
+        cv2.INTER_LINEAR,
+        borderMode=cv2.BORDER_CONSTANT,
+        borderValue=0,
+    )
+    error = np.abs(gray_left.astype(np.float32) - warped_right.astype(np.float32)) / 255.0
+    confidence = np.exp(-error / max(float(sigma), 1e-6)).astype(np.float32)
+    confidence[~in_bounds] = 0.0
+    return confidence
+
+
+def _left_right_confidence(
+    cv2,
+    disparity: np.ndarray,
+    right_disparity: np.ndarray | None,
+    valid: np.ndarray,
+    threshold_px: float,
+) -> np.ndarray | None:
+    if right_disparity is None:
+        return None
+    height, width = disparity.shape[:2]
+    xs, ys = np.meshgrid(np.arange(width, dtype=np.float32), np.arange(height, dtype=np.float32))
+    map_x = xs - disparity.astype(np.float32)
+    map_y = ys
+    in_bounds = valid & np.isfinite(map_x) & (map_x >= 0.0) & (map_x <= float(width - 1))
+    sampled_right = cv2.remap(
+        right_disparity.astype(np.float32),
+        map_x.astype(np.float32),
+        map_y.astype(np.float32),
+        cv2.INTER_LINEAR,
+        borderMode=cv2.BORDER_CONSTANT,
+        borderValue=1.0e6,
+    )
+    error = np.abs(disparity.astype(np.float32) + sampled_right)
+    confidence = np.clip(1.0 - error / max(float(threshold_px), 1e-6), 0.0, 1.0).astype(np.float32)
+    confidence[~in_bounds] = 0.0
+    return confidence
+
+
+def _normalize_wls_confidence(confidence: np.ndarray | None, valid: np.ndarray) -> np.ndarray | None:
+    if confidence is None:
+        return None
+    normalized = np.asarray(confidence, dtype=np.float32)
+    if normalized.shape != valid.shape:
+        return None
+    finite = np.isfinite(normalized)
+    if not np.any(finite):
+        return None
+    max_value = float(np.nanmax(normalized[finite]))
+    if max_value > 1.5:
+        normalized = normalized / 255.0
+    normalized = np.clip(normalized, 0.0, 1.0).astype(np.float32)
+    normalized[~valid] = 0.0
+    return normalized
+
+
+def _wls_consistency_confidence(
+    raw_disparity: np.ndarray | None,
+    filtered_disparity: np.ndarray,
+    valid: np.ndarray,
+    threshold_px: float,
+) -> np.ndarray | None:
+    if raw_disparity is None:
+        return None
+    raw = np.asarray(raw_disparity, dtype=np.float32)
+    filtered = np.asarray(filtered_disparity, dtype=np.float32)
+    if raw.shape != filtered.shape or raw.shape != valid.shape:
+        return None
+    finite = valid & np.isfinite(raw) & np.isfinite(filtered)
+    if not np.any(finite):
+        return None
+    delta = np.abs(raw - filtered)
+    if float(np.nanmax(delta[finite])) <= 1e-4:
+        return None
+    confidence = np.exp(-delta / max(float(threshold_px), 1e-6)).astype(np.float32)
+    confidence[~finite] = 0.0
+    return confidence
+
+
+def _confidence_source_metrics(confidence: np.ndarray, valid: np.ndarray, threshold: float) -> dict[str, Any]:
+    values = np.asarray(confidence, dtype=np.float32)
+    mask = np.asarray(valid, dtype=bool) & np.isfinite(values)
+    if not np.any(mask):
+        return {
+            "count": 0,
+            "mean": None,
+            "median": None,
+            "p95": None,
+            "p99": None,
+            "max": None,
+            "pass_ratio": 0.0,
+            "pass_count": 0,
+        }
+    selected = values[mask]
+    pass_mask = selected >= float(threshold)
+    return {
+        "count": int(selected.size),
+        "mean": float(np.mean(selected)),
+        "median": float(np.percentile(selected, 50)),
+        "p95": float(np.percentile(selected, 95)),
+        "p99": float(np.percentile(selected, 99)),
+        "max": float(np.max(selected)),
+        "pass_ratio": float(np.count_nonzero(pass_mask) / max(int(selected.size), 1)),
+        "pass_count": int(np.count_nonzero(pass_mask)),
+    }
+
+
+def _compute_confidence_map(
+    cv2,
+    gray_left: np.ndarray,
+    gray_right: np.ndarray,
+    disparity: np.ndarray,
+    valid: np.ndarray,
+    config: dict[str, Any],
+    raw_disparity: np.ndarray | None = None,
+    right_disparity: np.ndarray | None = None,
+    wls_confidence: np.ndarray | None = None,
+) -> tuple[np.ndarray, dict[str, Any]]:
+    maps: list[tuple[str, np.ndarray]] = []
+    warnings: list[str] = []
+    source_metrics: dict[str, Any] = {}
+    photometric = _photometric_confidence(
+        cv2,
+        gray_left,
+        gray_right,
+        disparity,
+        valid,
+        _config_float(config, "confidence_photometric_sigma", 0.15, 1e-6),
+    )
+    maps.append(("photometric", photometric))
+    source_metrics["photometric"] = _confidence_source_metrics(photometric, valid, float(config.get("confidence_threshold", 0.35)))
+    lr_confidence = _left_right_confidence(
+        cv2,
+        disparity,
+        right_disparity,
+        valid,
+        _config_float(config, "left_right_consistency_px", 2.0, 1e-6),
+    )
+    if lr_confidence is not None:
+        lr_metrics = _confidence_source_metrics(lr_confidence, valid, float(config.get("confidence_threshold", 0.35)))
+        source_metrics["left_right_consistency"] = lr_metrics
+        min_mean = _config_float(config, "left_right_consistency_min_mean", 0.05, 0.0)
+        min_pass_ratio = _config_float(config, "left_right_consistency_min_pass_ratio", 0.01, 0.0)
+        if float(lr_metrics["mean"] or 0.0) >= min_mean and float(lr_metrics["pass_ratio"] or 0.0) >= min_pass_ratio:
+            maps.append(("left_right_consistency", lr_confidence))
+        else:
+            warnings.append(
+                "left-right consistency 置信度整体过低，已自动忽略该分量，避免把整张深度图过滤成黑图。"
+                f" mean={float(lr_metrics['mean'] or 0.0):.6f}, pass_ratio={float(lr_metrics['pass_ratio'] or 0.0):.6f}"
+            )
+    normalized_wls = _normalize_wls_confidence(wls_confidence, valid)
+    if normalized_wls is not None:
+        maps.append(("wls_confidence", normalized_wls))
+        source_metrics["wls_confidence"] = _confidence_source_metrics(normalized_wls, valid, float(config.get("confidence_threshold", 0.35)))
+    wls_consistency = _wls_consistency_confidence(
+        raw_disparity,
+        disparity,
+        valid,
+        _config_float(config, "wls_consistency_px", 2.0, 1e-6),
+    )
+    if wls_consistency is not None:
+        maps.append(("wls_consistency", wls_consistency))
+        source_metrics["wls_consistency"] = _confidence_source_metrics(wls_consistency, valid, float(config.get("confidence_threshold", 0.35)))
+
+    weights = {
+        "photometric": 0.45,
+        "left_right_consistency": 0.35,
+        "wls_confidence": 0.20,
+        "wls_consistency": 0.20,
+    }
+    stacked = np.stack([np.clip(item[1], 1e-6, 1.0) for item in maps], axis=0)
+    active_weights = np.asarray([weights.get(item[0], 0.2) for item in maps], dtype=np.float32)
+    active_weights /= max(float(active_weights.sum()), 1e-6)
+    confidence = np.exp(np.sum(np.log(stacked) * active_weights[:, None, None], axis=0)).astype(np.float32)
+    confidence[~valid] = 0.0
+    return confidence, {
+        "sources": [item[0] for item in maps],
+        "ignored_sources": [name for name in source_metrics if name not in {item[0] for item in maps}],
+        "warnings": warnings,
+        "source_metrics": source_metrics,
+        "fusion": "weighted_geometric_mean",
+        "photometric_sigma": float(config.get("confidence_photometric_sigma", 0.15)),
+        "left_right_consistency_px": float(config.get("left_right_consistency_px", 2.0)),
+        "left_right_consistency_min_mean": float(config.get("left_right_consistency_min_mean", 0.05)),
+        "left_right_consistency_min_pass_ratio": float(config.get("left_right_consistency_min_pass_ratio", 0.01)),
+        "wls_consistency_px": float(config.get("wls_consistency_px", 2.0)),
+    }
+
+
+def _confidence_image(cv2, confidence: np.ndarray, valid: np.ndarray):
+    color_map = getattr(cv2, "COLORMAP_VIRIDIS", getattr(cv2, "COLORMAP_JET"))
+    clipped = np.clip(confidence, 0.0, 1.0)
+    gray = (clipped * 255.0).astype(np.uint8)
+    colored = cv2.applyColorMap(gray, color_map)
+    output = np.zeros_like(colored)
+    output[valid] = colored[valid]
+    return output
+
+
 def _colored_range_image(cv2, values: np.ndarray, valid: np.ndarray, colormap: int | None = None, invert: bool = False):
     color_map = colormap if colormap is not None else getattr(cv2, "COLORMAP_TURBO", cv2.COLORMAP_JET)
     output = np.zeros((*values.shape, 3), dtype=np.uint8)
@@ -817,9 +1561,167 @@ def _save_ply(path: Path, points: np.ndarray, colors: np.ndarray) -> None:
             )
 
 
-def _camera_points_to_plot(points: np.ndarray) -> np.ndarray:
+def _basic_stats(values: np.ndarray) -> dict[str, Any]:
+    finite = np.asarray(values, dtype=np.float64)
+    finite = finite[np.isfinite(finite)]
+    if finite.size == 0:
+        return {
+            "count": 0,
+            "mean": None,
+            "std": None,
+            "min": None,
+            "p01": None,
+            "p05": None,
+            "p25": None,
+            "median": None,
+            "p75": None,
+            "p95": None,
+            "p99": None,
+            "max": None,
+        }
+    percentiles = np.percentile(finite, [1, 5, 25, 50, 75, 95, 99])
+    return {
+        "count": int(finite.size),
+        "mean": float(np.mean(finite)),
+        "std": float(np.std(finite)),
+        "min": float(np.min(finite)),
+        "p01": float(percentiles[0]),
+        "p05": float(percentiles[1]),
+        "p25": float(percentiles[2]),
+        "median": float(percentiles[3]),
+        "p75": float(percentiles[4]),
+        "p95": float(percentiles[5]),
+        "p99": float(percentiles[6]),
+        "max": float(np.max(finite)),
+    }
+
+
+def _point_cloud_outlier_metrics(points: np.ndarray) -> dict[str, Any]:
+    pts = np.asarray(points, dtype=np.float32).reshape(-1, 3)
+    if len(pts) < 16:
+        return {
+            "method": "robust_distance_iqr",
+            "point_count": int(len(pts)),
+            "outlier_count": 0,
+            "outlier_ratio": 0.0,
+            "threshold_mm": None,
+        }
+    center = np.median(pts, axis=0)
+    distance = np.linalg.norm(pts - center, axis=1)
+    q1, q3 = np.percentile(distance, [25, 75])
+    iqr = max(float(q3 - q1), 1e-6)
+    threshold = float(q3 + 3.0 * iqr)
+    outliers = distance > threshold
+    return {
+        "method": "robust_distance_iqr",
+        "point_count": int(len(pts)),
+        "outlier_count": int(np.count_nonzero(outliers)),
+        "outlier_ratio": float(np.count_nonzero(outliers) / max(len(pts), 1)),
+        "threshold_mm": threshold,
+    }
+
+
+def _calibration_depth_link_metrics(result: dict[str, Any]) -> dict[str, Any]:
+    stereo = result.get("stereo", {})
+    baseline = float(stereo.get("baseline_mm", 0.0) or 0.0)
+    rectification = stereo.get("rectification", {})
+    focal = None
+    try:
+        p1 = np.asarray(rectification.get("P1", []), dtype=np.float64)
+        if p1.shape[0] >= 1 and p1.shape[1] >= 1:
+            focal = abs(float(p1[0, 0]))
+    except Exception:
+        focal = None
+    stereo_rms = float(stereo.get("rms_reprojection_error_px", 0.0) or 0.0)
+    disparity_samples = []
+    try:
+        cv2 = _load_cv2()
+        for pair in result.get("accepted_pairs", []):
+            disparity = _rectified_point_disparities(cv2, result, pair)
+            disparity = disparity[np.isfinite(disparity) & (disparity > 1e-6)]
+            if disparity.size:
+                disparity_samples.append(disparity)
+    except Exception:
+        disparity_samples = []
+    if disparity_samples:
+        disparities = np.concatenate(disparity_samples).astype(np.float64)
+        estimated_depth = (float(focal) * baseline / disparities) if focal and baseline > 0 else np.array([], dtype=np.float64)
+        with np.errstate(divide="ignore", invalid="ignore"):
+            depth_error_from_stereo_rms = (float(focal) * baseline / np.maximum(disparities - stereo_rms, 1e-6)) - (
+                float(focal) * baseline / disparities
+            ) if focal and baseline > 0 else np.array([], dtype=np.float64)
+        return {
+            "stereo_rms_px": stereo_rms,
+            "baseline_mm": baseline,
+            "focal_px": focal,
+            "rectified_corner_disparity_px": _basic_stats(disparities),
+            "estimated_corner_depth_mm": _basic_stats(estimated_depth),
+            "estimated_depth_error_from_stereo_rms_mm": _basic_stats(np.abs(depth_error_from_stereo_rms)),
+        }
+    return {
+        "stereo_rms_px": stereo_rms,
+        "baseline_mm": baseline,
+        "focal_px": focal,
+        "rectified_corner_disparity_px": _basic_stats(np.array([], dtype=np.float32)),
+        "estimated_corner_depth_mm": _basic_stats(np.array([], dtype=np.float32)),
+        "estimated_depth_error_from_stereo_rms_mm": _basic_stats(np.array([], dtype=np.float32)),
+    }
+
+
+def _evaluate_reconstruction_quality(
+    result: dict[str, Any],
+    arrays: dict[str, Any],
+    points: np.ndarray,
+) -> dict[str, Any]:
+    disparity = np.asarray(arrays["disparity"], dtype=np.float32)
+    confidence = np.asarray(arrays["confidence"], dtype=np.float32)
+    depth_mm = np.asarray(arrays["depth_mm"], dtype=np.float32)
+    valid_disparity = np.asarray(arrays["valid_disparity"], dtype=bool)
+    valid_depth = np.asarray(arrays["valid_depth"], dtype=bool)
+    total_pixels = int(disparity.size)
+    finite_disparity = np.isfinite(disparity)
+    finite_depth = np.isfinite(depth_mm) & (depth_mm > 0)
+    confidence_valid = confidence[finite_disparity]
+    quality = {
+        "image_size": [int(disparity.shape[1]), int(disparity.shape[0])],
+        "total_pixels": total_pixels,
+        "valid_disparity_pixels": int(np.count_nonzero(valid_disparity)),
+        "valid_disparity_ratio": float(np.count_nonzero(valid_disparity) / max(total_pixels, 1)),
+        "valid_depth_pixels": int(np.count_nonzero(valid_depth)),
+        "valid_depth_ratio": float(np.count_nonzero(valid_depth) / max(total_pixels, 1)),
+        "finite_disparity_ratio_before_filter": float(np.count_nonzero(finite_disparity) / max(total_pixels, 1)),
+        "finite_depth_ratio_before_filter": float(np.count_nonzero(finite_depth) / max(total_pixels, 1)),
+        "confidence": {
+            "all_finite_disparity": _basic_stats(confidence_valid),
+            "valid_depth": _basic_stats(confidence[valid_depth]),
+            "below_threshold_ratio": float(
+                np.count_nonzero(confidence_valid < float(arrays["confidence_threshold"])) / max(int(confidence_valid.size), 1)
+            )
+            if confidence_valid.size
+            else None,
+        },
+        "disparity_px": {
+            "valid": _basic_stats(disparity[valid_disparity]),
+            "finite_before_filter": _basic_stats(disparity[finite_disparity]),
+        },
+        "depth_mm": {
+            "valid": _basic_stats(depth_mm[valid_depth]),
+            "finite_before_filter": _basic_stats(depth_mm[finite_depth]),
+        },
+        "point_cloud": _point_cloud_outlier_metrics(points),
+        "calibration_depth_link": _calibration_depth_link_metrics(result),
+    }
+    return quality
+
+
+def camera_points_to_display(points: np.ndarray) -> np.ndarray:
+    """Map OpenCV camera coordinates to the MATLAB-style 3D display axes."""
     pts = np.asarray(points, dtype=float).reshape(-1, 3)
     return np.column_stack((pts[:, 0], pts[:, 2], -pts[:, 1]))
+
+
+def _camera_points_to_plot(points: np.ndarray) -> np.ndarray:
+    return camera_points_to_display(points)
 
 
 def _set_axes_equal(ax, points: np.ndarray) -> None:
@@ -1229,46 +2131,70 @@ def _make_reconstruction_montage(cv2, rectified_pair, disparity_image, depth_ima
     _write_image(cv2, output_path, montage, quality=98)
 
 
-def _generate_reconstruction_artifacts(
+def _compute_reconstruction_arrays(
     cv2,
     result: dict[str, Any],
-    pair: dict[str, Any],
     left_rectified,
     right_rectified,
-    rectified_pair_image,
-    reconstruction_dir: Path,
+    reconstruction_config: dict[str, Any] | None = None,
+    point_disparities: np.ndarray | None = None,
 ) -> dict[str, Any]:
+    config = _normalize_reconstruction_config(reconstruction_config)
     height, width = left_rectified.shape[:2]
-    scale = min(1.0, 1400.0 / max(width, 1))
+    method_requested = str(config["reconstruction_method"]).lower()
+    scale, resource_policy = _resolve_reconstruction_scale(config, width, height, method_requested)
     small_size = (max(1, int(round(width * scale))), max(1, int(round(height * scale))))
     left_small = cv2.resize(left_rectified, small_size, interpolation=cv2.INTER_AREA) if scale < 1 else left_rectified.copy()
     right_small = cv2.resize(right_rectified, small_size, interpolation=cv2.INTER_AREA) if scale < 1 else right_rectified.copy()
-    gray_left = cv2.cvtColor(left_small, cv2.COLOR_BGR2GRAY)
-    gray_right = cv2.cvtColor(right_small, cv2.COLOR_BGR2GRAY)
-    gray_left = cv2.equalizeHist(gray_left)
-    gray_right = cv2.equalizeHist(gray_right)
+    gray_left_raw = cv2.cvtColor(left_small, cv2.COLOR_BGR2GRAY)
+    gray_right_raw = cv2.cvtColor(right_small, cv2.COLOR_BGR2GRAY)
+    gray_left = cv2.equalizeHist(gray_left_raw)
+    gray_right = cv2.equalizeHist(gray_right_raw)
 
-    point_disparities = _rectified_point_disparities(cv2, result, pair)
+    if point_disparities is None:
+        point_disparities = np.array([], dtype=np.float32)
     min_disp, num_disp = _choose_disparity_range(point_disparities, scale, small_size[0])
-    block_size = 5
-    matcher = cv2.StereoSGBM_create(
-        minDisparity=min_disp,
-        numDisparities=num_disp,
-        blockSize=block_size,
-        P1=8 * block_size * block_size,
-        P2=32 * block_size * block_size,
-        disp12MaxDiff=1,
-        uniquenessRatio=8,
-        speckleWindowSize=80,
-        speckleRange=2,
-        preFilterCap=63,
-        mode=getattr(cv2, "STEREO_SGBM_MODE_SGBM_3WAY", cv2.STEREO_SGBM_MODE_SGBM),
+
+    fallback_error = ""
+    if method_requested in {"cres", "crestereo", "crestereo_onnx"}:
+        try:
+            disparity_result = _compute_crestereo_disparity(cv2, left_small, right_small, config)
+        except Exception as exc:
+            if not bool(config["allow_sgbm_fallback"]):
+                raise
+            fallback_error = str(exc)
+            disparity_result = _compute_sgbm_disparity(cv2, gray_left, gray_right, left_small, min_disp, num_disp, config)
+            disparity_result["metadata"]["fallback_from"] = "crestereo"
+            disparity_result["metadata"]["fallback_reason"] = fallback_error
+    elif method_requested == "auto" and str(config.get("crestereo_model_path", "") or "").strip():
+        try:
+            disparity_result = _compute_crestereo_disparity(cv2, left_small, right_small, config)
+        except Exception as exc:
+            fallback_error = str(exc)
+            disparity_result = _compute_sgbm_disparity(cv2, gray_left, gray_right, left_small, min_disp, num_disp, config)
+            disparity_result["metadata"]["fallback_from"] = "crestereo"
+            disparity_result["metadata"]["fallback_reason"] = fallback_error
+    else:
+        disparity_result = _compute_sgbm_disparity(cv2, gray_left, gray_right, left_small, min_disp, num_disp, config)
+
+    raw_disparity = np.asarray(disparity_result["raw_disparity"], dtype=np.float32)
+    disparity = np.asarray(disparity_result["disparity"], dtype=np.float32)
+    valid = np.isfinite(disparity) & (disparity > max(0.5, float(min_disp) + 0.25))
+    confidence, confidence_info = _compute_confidence_map(
+        cv2,
+        gray_left_raw,
+        gray_right_raw,
+        disparity,
+        valid,
+        config,
+        raw_disparity=raw_disparity,
+        right_disparity=disparity_result.get("right_disparity"),
+        wls_confidence=disparity_result.get("wls_confidence"),
     )
-    disparity = matcher.compute(gray_left, gray_right).astype(np.float32) / 16.0
-    valid = disparity > (min_disp + 1)
-    disparity_image, disparity_range = _colored_range_image(cv2, disparity, valid)
-    disparity_path = reconstruction_dir / "disparity_map.png"
-    _write_image(cv2, disparity_path, disparity_image)
+    confidence_threshold = float(config["confidence_threshold"])
+    confidence_enabled = bool(config["confidence_filter"])
+    if confidence_enabled:
+        valid &= confidence >= confidence_threshold
 
     rectification = result["stereo"]["rectification"]
     p1 = np.asarray(rectification["P1"], dtype=np.float64)
@@ -1281,6 +2207,172 @@ def _generate_reconstruction_artifacts(
     if np.any(valid_depth):
         lo, hi = np.percentile(depth_mm[valid_depth], [1, 99])
         valid_depth &= (depth_mm >= lo) & (depth_mm <= hi)
+
+    return {
+        "config": config,
+        "scale": float(scale),
+        "left_small": left_small,
+        "right_small": right_small,
+        "raw_disparity": raw_disparity,
+        "disparity": disparity,
+        "confidence": confidence.astype(np.float32),
+        "depth_mm": depth_mm.astype(np.float32),
+        "valid_disparity": valid,
+        "valid_depth": valid_depth,
+        "method_requested": method_requested,
+        "resource_policy": resource_policy,
+        "fallback_error": fallback_error,
+        "min_disparity": int(min_disp),
+        "num_disparities": int(num_disp),
+        "disparity_result": disparity_result,
+        "confidence_info": confidence_info,
+        "confidence_threshold": float(confidence_threshold),
+        "confidence_enabled": bool(confidence_enabled),
+        "focal_px": float(focal),
+        "baseline_mm": float(baseline),
+    }
+
+
+def reconstruct_rectified_pair_preview(
+    left_rectified,
+    right_rectified,
+    calibration_result: dict[str, Any],
+    reconstruction_config: dict[str, Any] | None = None,
+) -> dict[str, Any]:
+    cv2 = _load_cv2()
+    arrays = _compute_reconstruction_arrays(
+        cv2,
+        calibration_result,
+        left_rectified,
+        right_rectified,
+        reconstruction_config,
+    )
+    disparity_image, disparity_range = _colored_range_image(cv2, arrays["disparity"], arrays["valid_disparity"])
+    depth_image, depth_range = _colored_range_image(cv2, arrays["depth_mm"], arrays["valid_depth"], invert=True)
+    confidence_image = _confidence_image(cv2, arrays["confidence"], np.isfinite(arrays["disparity"]))
+    return {
+        **arrays,
+        "disparity_image": disparity_image,
+        "depth_image": depth_image,
+        "confidence_image": confidence_image,
+        "disparity_range_px": list(disparity_range) if disparity_range else None,
+        "depth_range_mm": list(depth_range) if depth_range else None,
+    }
+
+
+def rectify_stereo_image_arrays(
+    left_image,
+    right_image,
+    calibration_result: dict[str, Any],
+):
+    return StereoRectifier(calibration_result).rectify(left_image, right_image)
+
+
+def reconstruct_stereo_images(
+    left_image_path: str | Path,
+    right_image_path: str | Path,
+    calibration_result_path: str | Path,
+    output_dir: str | Path,
+    reconstruction_config: dict[str, Any] | None = None,
+) -> dict[str, Any]:
+    cv2 = _load_cv2()
+    calibration_path = Path(calibration_result_path)
+    with calibration_path.open("r", encoding="utf-8") as fh:
+        calibration_result = json.load(fh)
+    left_image = _read_color(cv2, left_image_path)
+    right_image = _read_color(cv2, right_image_path)
+    if left_image.shape[:2] != right_image.shape[:2]:
+        raise CalibrationError(f"左右图像尺寸不同：{left_image.shape[1]}x{left_image.shape[0]} vs {right_image.shape[1]}x{right_image.shape[0]}")
+    expected_size = tuple(map(int, calibration_result.get("image_size", [])))
+    current_size = (int(left_image.shape[1]), int(left_image.shape[0]))
+    if expected_size and current_size != expected_size:
+        raise CalibrationError(f"图像尺寸 {current_size} 与标定尺寸 {expected_size} 不一致。")
+    if not calibration_result.get("stereo", {}).get("rectification"):
+        raise CalibrationError("标定结果缺少 stereoRectify 参数，无法进行独立深度重建。")
+
+    output_path = Path(output_dir)
+    output_path.mkdir(parents=True, exist_ok=True)
+    left_rectified, right_rectified = _rectify_pair(cv2, calibration_result, left_image, right_image)
+    rectified_pair_image = _draw_epipolar_pair(cv2, left_rectified, right_rectified)
+    rectified_dir = output_path / "rectification"
+    _write_image(cv2, rectified_dir / "left_rectified.png", _resize_max(cv2, left_rectified, 1800, 1200))
+    _write_image(cv2, rectified_dir / "right_rectified.png", _resize_max(cv2, right_rectified, 1800, 1200))
+    rectified_pair_path = rectified_dir / "rectified_pair.png"
+    _write_image(cv2, rectified_pair_path, rectified_pair_image)
+
+    reconstruction = _generate_reconstruction_artifacts(
+        cv2,
+        calibration_result,
+        {},
+        left_rectified,
+        right_rectified,
+        rectified_pair_image,
+        output_path,
+        reconstruction_config,
+    )
+    reconstruction["left_source"] = str(Path(left_image_path))
+    reconstruction["right_source"] = str(Path(right_image_path))
+    reconstruction["calibration_result"] = str(calibration_path)
+    reconstruction["rectified_pair"] = str(rectified_pair_path)
+    result_path = output_path / "reconstruction_job.json"
+    _write_json(result_path, reconstruction)
+    reconstruction["result_json"] = str(result_path)
+    return reconstruction
+
+
+def _generate_reconstruction_artifacts(
+    cv2,
+    result: dict[str, Any],
+    pair: dict[str, Any],
+    left_rectified,
+    right_rectified,
+    rectified_pair_image,
+    reconstruction_dir: Path,
+    reconstruction_config: dict[str, Any] | None = None,
+) -> dict[str, Any]:
+    point_disparities = _rectified_point_disparities(cv2, result, pair)
+    arrays = _compute_reconstruction_arrays(
+        cv2,
+        result,
+        left_rectified,
+        right_rectified,
+        reconstruction_config,
+        point_disparities=point_disparities,
+    )
+    config = arrays["config"]
+    scale = float(arrays["scale"])
+    left_small = arrays["left_small"]
+    raw_disparity = arrays["raw_disparity"]
+    disparity = arrays["disparity"]
+    confidence = arrays["confidence"]
+    valid = arrays["valid_disparity"]
+    depth_mm = arrays["depth_mm"]
+    valid_depth = arrays["valid_depth"]
+    method_requested = arrays["method_requested"]
+    fallback_error = arrays["fallback_error"]
+    resource_policy = arrays["resource_policy"]
+    min_disp = int(arrays["min_disparity"])
+    num_disp = int(arrays["num_disparities"])
+    disparity_result = arrays["disparity_result"]
+    confidence_info = arrays["confidence_info"]
+    confidence_threshold = float(arrays["confidence_threshold"])
+    confidence_enabled = bool(arrays["confidence_enabled"])
+
+    disparity_image, disparity_range = _colored_range_image(cv2, disparity, valid)
+    disparity_path = reconstruction_dir / "disparity_map.png"
+    raw_disparity_path = reconstruction_dir / "raw_disparity.npy"
+    filtered_disparity_path = reconstruction_dir / "disparity.npy"
+    confidence_path = reconstruction_dir / "confidence_map.png"
+    confidence_npy_path = reconstruction_dir / "confidence.npy"
+    _write_image(cv2, disparity_path, disparity_image)
+    _write_image(cv2, confidence_path, _confidence_image(cv2, confidence, np.isfinite(disparity)))
+    np.save(raw_disparity_path, raw_disparity.astype(np.float32))
+    np.save(filtered_disparity_path, disparity.astype(np.float32))
+    np.save(confidence_npy_path, confidence.astype(np.float32))
+
+    rectification = result["stereo"]["rectification"]
+    p1 = np.asarray(rectification["P1"], dtype=np.float64)
+    focal = float(arrays["focal_px"])
     depth_image, depth_range = _colored_range_image(cv2, depth_mm, valid_depth, invert=True)
     depth_path = reconstruction_dir / "depth_map.png"
     depth_npy_path = reconstruction_dir / "depth_mm.npy"
@@ -1289,11 +2381,6 @@ def _generate_reconstruction_artifacts(
 
     ys, xs = np.nonzero(valid_depth)
     if len(xs) > 0:
-        max_points = 200000
-        if len(xs) > max_points:
-            indices = np.linspace(0, len(xs) - 1, max_points, dtype=int)
-            xs = xs[indices]
-            ys = ys[indices]
         z = depth_mm[ys, xs]
         cx = float(p1[0, 2]) * scale
         cy = float(p1[1, 2]) * scale
@@ -1305,10 +2392,14 @@ def _generate_reconstruction_artifacts(
         points = np.empty((0, 3), dtype=np.float32)
         colors = np.empty((0, 3), dtype=np.uint8)
 
+    quality_metrics = _evaluate_reconstruction_quality(result, arrays, points)
+
     point_cloud_path = reconstruction_dir / "point_cloud.ply"
     point_cloud_preview_path = reconstruction_dir / "point_cloud_preview.png"
     reconstruction_path = reconstruction_dir / "reconstruction_result.png"
+    quality_metrics_path = reconstruction_dir / "quality_metrics.json"
     _save_ply(point_cloud_path, points, colors)
+    _write_json(quality_metrics_path, quality_metrics)
     _save_point_cloud_plot(point_cloud_preview_path, points, colors, "Point cloud")
     _make_reconstruction_montage(
         cv2,
@@ -1320,17 +2411,34 @@ def _generate_reconstruction_artifacts(
     )
     return {
         "preview_scale": float(scale),
+        "resource_policy": resource_policy,
+        "method_requested": str(method_requested),
+        "method_used": str(disparity_result["method"]),
+        "fallback_error": fallback_error,
         "min_disparity": int(min_disp),
         "num_disparities": int(num_disp),
+        "wls_filter": disparity_result.get("wls_filter", {}),
+        "confidence_filter": {
+            "enabled": bool(confidence_enabled),
+            "threshold": float(confidence_threshold),
+            **confidence_info,
+        },
         "disparity_range_px": list(disparity_range) if disparity_range else None,
         "depth_range_mm": list(depth_range) if depth_range else None,
         "valid_point_count": int(len(points)),
+        "quality_metrics": quality_metrics,
+        "quality_metrics_json": str(quality_metrics_path),
         "disparity_map": str(disparity_path),
+        "raw_disparity_npy": str(raw_disparity_path),
+        "disparity_npy": str(filtered_disparity_path),
+        "confidence_map": str(confidence_path),
+        "confidence_npy": str(confidence_npy_path),
         "depth_map": str(depth_path),
         "depth_mm_npy": str(depth_npy_path),
         "point_cloud_ply": str(point_cloud_path),
         "point_cloud_preview": str(point_cloud_preview_path),
         "reconstruction_result": str(reconstruction_path),
+        "method_metadata": disparity_result.get("metadata", {}),
     }
 
 
@@ -1345,7 +2453,12 @@ def _select_diagnostic_pair(accepted_pairs: list[dict[str, Any]]) -> int:
     return min(scores)[1]
 
 
-def _generate_calibration_artifacts(cv2, output_path: Path, result: dict[str, Any]) -> dict[str, Any]:
+def _generate_calibration_artifacts(
+    cv2,
+    output_path: Path,
+    result: dict[str, Any],
+    reconstruction_config: dict[str, Any] | None = None,
+) -> dict[str, Any]:
     images_dir = output_path / "images"
     raw_dir = images_dir / "raw_pairs"
     corner_dir = images_dir / "corner_detection"
@@ -1462,6 +2575,7 @@ def _generate_calibration_artifacts(cv2, output_path: Path, result: dict[str, An
             right_rectified,
             rectified_pair_image,
             reconstruction_dir,
+            reconstruction_config,
         )
         _save_depth_error_curve(plots_dir / "depth_error_curve.png", cv2, result)
 
@@ -1593,9 +2707,11 @@ def calibrate_stereo_from_folders(
     aruco_dictionary: str = "DICT_4X4_50",
     legacy_charuco: bool = False,
     min_pairs: int = 3,
+    reconstruction_config: dict[str, Any] | None = None,
     progress_callback: Callable[[float, str], None] | None = None,
 ) -> dict[str, Any]:
     cv2 = _load_cv2()
+    reconstruction_config = _normalize_reconstruction_config(reconstruction_config)
     pattern = pattern.strip().lower()
     aruco_dictionary = normalize_aruco_dictionary_name(aruco_dictionary)
     if pattern not in {"chessboard", "charuco", "charuco_legacy", "circles", "acircles"}:
@@ -1859,6 +2975,7 @@ def calibrate_stereo_from_folders(
             "left_source_dir": str(Path(left_dir)),
             "right_source_dir": str(Path(right_dir)),
             "output_dir": str(output_path),
+            "reconstruction": reconstruction_config,
         },
         "left": {
             "rms_reprojection_error_px": float(left_rms),
@@ -1893,7 +3010,7 @@ def calibrate_stereo_from_folders(
         "rejected_pairs": str(rejected_path),
         "output_dir": str(output_path),
     }
-    result["artifacts"] = _generate_calibration_artifacts(cv2, output_path, result)
+    result["artifacts"] = _generate_calibration_artifacts(cv2, output_path, result, reconstruction_config)
     result["files"]["parameter_table"] = _write_parameter_exports(output_path, result)
     _write_json(json_path, result)
     _invoke_progress(progress_callback, 100.0, "标定完成")

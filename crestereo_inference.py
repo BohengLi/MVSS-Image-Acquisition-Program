@@ -1,7 +1,9 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+import os
 from pathlib import Path
+import site
 from typing import Any
 
 import numpy as np
@@ -9,6 +11,28 @@ import numpy as np
 
 class CREStereoError(RuntimeError):
     pass
+
+
+_CUDA_DLL_HANDLES: list[Any] = []
+
+
+def _add_nvidia_cuda_dll_directories() -> None:
+    if os.name != "nt" or not hasattr(os, "add_dll_directory"):
+        return
+    candidates: list[Path] = []
+    for base in [*site.getsitepackages(), site.getusersitepackages()]:
+        nvidia_dir = Path(base) / "nvidia"
+        if not nvidia_dir.exists():
+            continue
+        candidates.extend(path for path in nvidia_dir.glob("*/bin") if path.is_dir())
+    for path in candidates:
+        text = str(path)
+        if text not in os.environ.get("PATH", ""):
+            os.environ["PATH"] = text + os.pathsep + os.environ.get("PATH", "")
+        try:
+            _CUDA_DLL_HANDLES.append(os.add_dll_directory(text))
+        except OSError:
+            pass
 
 
 @dataclass(frozen=True)
@@ -27,6 +51,7 @@ class CREStereoONNX:
         self.model_path = Path(model_path)
         if not self.model_path.exists():
             raise CREStereoError(f"CREStereo ONNX 模型文件不存在：{self.model_path}")
+        _add_nvidia_cuda_dll_directories()
         try:
             import onnxruntime as ort
         except Exception as exc:
@@ -72,6 +97,7 @@ class CREStereoONNX:
     def predict(self, cv2: Any, left_bgr: np.ndarray, right_bgr: np.ndarray) -> CREStereoResult:
         if left_bgr.shape[:2] != right_bgr.shape[:2]:
             raise CREStereoError(f"CREStereo 左右图尺寸不同：{left_bgr.shape[:2]} vs {right_bgr.shape[:2]}")
+        source_height, source_width = left_bgr.shape[:2]
         left_tensor = self._prepare_input(cv2, left_bgr, self.input_width, self.input_height)
         right_tensor = self._prepare_input(cv2, right_bgr, self.input_width, self.input_height)
         feed = {
@@ -92,6 +118,9 @@ class CREStereoONNX:
             disparity = disparity[0]
         if disparity.ndim != 2:
             raise CREStereoError(f"CREStereo 输出维度应为 2D 视差图，当前为 {output.shape}。")
+        if disparity.shape[:2] != (source_height, source_width):
+            disparity = cv2.resize(disparity, (source_width, source_height), interpolation=cv2.INTER_LINEAR)
+            disparity *= float(source_width) / max(float(self.input_width), 1.0)
         return CREStereoResult(
             disparity=disparity,
             model_path=str(self.model_path),
