@@ -7,6 +7,7 @@ import os
 import re
 import shutil
 import sys
+import time
 from datetime import datetime
 from pathlib import Path
 from typing import Any, Callable
@@ -1930,13 +1931,26 @@ def _confidence_image(cv2, confidence: np.ndarray, valid: np.ndarray):
 
 def _mask_preview_image(cv2, image, mask: np.ndarray):
     valid_mask = np.asarray(mask, dtype=bool)
-    overlay = image.copy()
+    overlay = np.asarray(image).copy()
+    if overlay.ndim == 2:
+        overlay = cv2.cvtColor(overlay, cv2.COLOR_GRAY2BGR)
+    if valid_mask.shape != overlay.shape[:2]:
+        valid_mask = cv2.resize(
+            valid_mask.astype(np.uint8),
+            (overlay.shape[1], overlay.shape[0]),
+            interpolation=cv2.INTER_NEAREST,
+        ) > 0
+    if not np.any(valid_mask):
+        return overlay
     color = np.zeros_like(overlay)
     color[:, :] = (0, 190, 255)
-    overlay[valid_mask] = cv2.addWeighted(image[valid_mask], 0.45, color[valid_mask], 0.55, 0)
-    if np.any(valid_mask):
-        contours, _hierarchy = cv2.findContours(valid_mask.astype(np.uint8) * 255, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
-        cv2.drawContours(overlay, contours, -1, (0, 255, 255), max(1, int(round(min(image.shape[:2]) / 600))))
+    overlay[valid_mask] = np.clip(
+        overlay[valid_mask].astype(np.float32) * 0.45 + color[valid_mask].astype(np.float32) * 0.55,
+        0,
+        255,
+    ).astype(np.uint8)
+    contours, _hierarchy = cv2.findContours(valid_mask.astype(np.uint8) * 255, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+    cv2.drawContours(overlay, contours, -1, (0, 255, 255), max(1, int(round(min(overlay.shape[:2]) / 600))))
     return overlay
 
 
@@ -3408,7 +3422,20 @@ def _generate_reconstruction_artifacts(
     rectified_pair_image,
     reconstruction_dir: Path,
     reconstruction_config: dict[str, Any] | None = None,
+    progress_callback: Callable[[float, str], None] | None = None,
+    progress_base: float = 80.0,
+    progress_span: float = 12.0,
 ) -> dict[str, Any]:
+    started = time.perf_counter()
+    timings: dict[str, float] = {}
+
+    def mark_timing(name: str) -> None:
+        timings[name] = round(time.perf_counter() - started, 3)
+
+    def progress(offset_ratio: float, message: str) -> None:
+        _invoke_progress(progress_callback, progress_base + progress_span * float(offset_ratio), message)
+
+    progress(0.02, "正在计算诊断重建视差与深度...")
     point_disparities = _rectified_point_disparities(cv2, result, pair)
     arrays = _compute_reconstruction_arrays(
         cv2,
@@ -3418,6 +3445,7 @@ def _generate_reconstruction_artifacts(
         reconstruction_config,
         point_disparities=point_disparities,
     )
+    mark_timing("disparity_depth_seconds")
     config = arrays["config"]
     scale = float(arrays["scale"])
     left_small = arrays["left_small"]
@@ -3436,7 +3464,9 @@ def _generate_reconstruction_artifacts(
     confidence_info = arrays["confidence_info"]
     confidence_threshold = float(arrays["confidence_threshold"])
     confidence_enabled = bool(arrays["confidence_enabled"])
+    progress(0.28, "正在运行 SAM3 object_mask 分割...")
     object_mask_result = _run_sam3_object_mask(cv2, left_small, reconstruction_dir, config)
+    mark_timing("sam3_object_mask_seconds")
     object_mask = np.asarray(object_mask_result["mask"], dtype=bool)
     object_mask_metadata = dict(object_mask_result.get("metadata", {}))
     object_mask_paths = dict(object_mask_result.get("paths", {}))
@@ -3464,6 +3494,7 @@ def _generate_reconstruction_artifacts(
     if object_mask_paths.get("metadata"):
         _write_json(Path(object_mask_paths["metadata"]), object_mask_metadata)
 
+    progress(0.42, "正在保存视差、置信度和深度矩阵...")
     disparity_image, disparity_range = _colored_range_image(cv2, disparity, valid)
     disparity_path = reconstruction_dir / "disparity_map.png"
     raw_disparity_path = reconstruction_dir / "raw_disparity.npy"
@@ -3479,6 +3510,7 @@ def _generate_reconstruction_artifacts(
     np.save(confidence_npy_path, confidence.astype(np.float32))
     np.save(valid_disparity_npy_path, valid.astype(np.uint8))
     np.save(valid_depth_npy_path, valid_depth.astype(np.uint8))
+    mark_timing("array_outputs_seconds")
 
     rectification = result["stereo"]["rectification"]
     p1 = np.asarray(rectification["P1"], dtype=np.float64)
@@ -3502,6 +3534,7 @@ def _generate_reconstruction_artifacts(
         points = np.empty((0, 3), dtype=np.float32)
         colors = np.empty((0, 3), dtype=np.uint8)
 
+    progress(0.58, f"正在生成点云文件（{len(points)} 点）...")
     semantic_payload, semantic_labels, _semantic_paths = _semantic_payload_from_mask(
         cv2,
         object_mask_result,
@@ -3557,6 +3590,8 @@ def _generate_reconstruction_artifacts(
     if world_payload["metadata_path"]:
         _write_json(Path(world_payload["metadata_path"]), world_payload["metadata"])
     _write_json(quality_metrics_path, quality_metrics)
+    mark_timing("point_cloud_outputs_seconds")
+    progress(0.82, "正在绘制点云预览和重建拼图...")
     _save_point_cloud_plot(point_cloud_preview_path, points, colors, "Point cloud")
     _make_reconstruction_montage(
         cv2,
@@ -3566,6 +3601,8 @@ def _generate_reconstruction_artifacts(
         point_cloud_preview_path,
         reconstruction_path,
     )
+    mark_timing("preview_outputs_seconds")
+    progress(0.96, "诊断重建结果写入完成。")
     return {
         "preview_scale": float(scale),
         "resource_policy": resource_policy,
@@ -3585,6 +3622,7 @@ def _generate_reconstruction_artifacts(
         "depth_range_mm": list(depth_range) if depth_range else None,
         "valid_point_count": int(len(points)),
         "quality_metrics": quality_metrics,
+        "timings": timings,
         "quality_metrics_json": str(quality_metrics_path),
         "disparity_map": str(disparity_path),
         "raw_disparity_npy": str(raw_disparity_path),
@@ -3750,6 +3788,9 @@ def _generate_calibration_artifacts(
             rectified_pair_image,
             reconstruction_dir,
             reconstruction_config,
+            progress_callback=progress_callback,
+            progress_base=80.0,
+            progress_span=12.0,
         )
         _save_depth_error_curve(plots_dir / "depth_error_curve.png", cv2, result)
 
@@ -4186,7 +4227,7 @@ def calibrate_stereo_from_folders(
     _write_json(rejected_path, rejected_pairs)
     _write_opencv_yaml(cv2, yaml_path, result)
 
-    _invoke_progress(progress_callback, 78.0, "正在生成诊断图与重建结果...")
+    _invoke_progress(progress_callback, 78.0, "正在生成诊断图、诊断重建与点云结果...")
 
     result["files"] = {
         "json": str(json_path),
