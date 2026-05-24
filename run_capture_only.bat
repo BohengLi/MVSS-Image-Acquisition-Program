@@ -1,4 +1,4 @@
 @echo off
 cd /d "%~dp0"
-python app.py
+python stereo_capture_only.py
 pause

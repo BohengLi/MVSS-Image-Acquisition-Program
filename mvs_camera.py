@@ -20,6 +20,10 @@ class MvsError(RuntimeError):
     pass
 
 
+class FrameTimeoutError(MvsError):
+    pass
+
+
 def _config_bool(config: dict[str, Any], key: str, default: bool) -> bool:
     value = config.get(key, default)
     if isinstance(value, bool):
@@ -177,6 +181,20 @@ class CameraParameters:
     roi_offset_y: int = 0
 
 
+@dataclass(frozen=True)
+class IntNodeInfo:
+    current: int
+    minimum: int
+    maximum: int
+    increment: int
+
+
+class RoiApplyResult(list[str]):
+    def __init__(self, warnings: list[str] | None = None, actual_roi: tuple[int, int, int, int] | None = None):
+        super().__init__(warnings or [])
+        self.actual_roi = actual_roi
+
+
 def enumerate_cameras() -> tuple[list[CameraInfo], Any]:
     s = sdk()
     dev_list = s["MV_CC_DEVICE_INFO_LIST"]()
@@ -249,6 +267,25 @@ def select_stereo_devices(left_serial: str = "", right_serial: str = "") -> tupl
     if left.serial == right.serial:
         raise MvsError("左右相机序列号相同，请检查 config.json。")
     return left, right, dev_list
+
+
+def select_capture_devices(
+    left_serial: str = "",
+    right_serial: str = "",
+    allow_single: bool = False,
+) -> tuple[CameraInfo | None, CameraInfo | None, Any]:
+    cameras, dev_list = enumerate_cameras()
+    if not cameras:
+        raise MvsError("未检测到相机。")
+    if len(cameras) >= 2:
+        return select_stereo_devices(left_serial, right_serial)
+    if not allow_single:
+        raise MvsError(f"至少需要两台相机，当前检测到 {len(cameras)} 台。")
+
+    camera = cameras[0]
+    if right_serial and camera.serial == right_serial and camera.serial != left_serial:
+        return None, camera, dev_list
+    return camera, None, dev_list
 
 
 class MvsCamera:
@@ -435,20 +472,24 @@ class MvsCamera:
         offset_x: int = 0,
         offset_y: int = 0,
         restart_stream: bool = True,
-    ) -> list[str]:
+    ) -> RoiApplyResult:
         warnings: list[str] = []
         if width is None and height is None:
-            return warnings
+            return RoiApplyResult(warnings)
         was_grabbing = self._grabbing
         if restart_stream and was_grabbing:
             self.stop()
         try:
             self._try_set_int("OffsetX", 0)
             self._try_set_int("OffsetY", 0)
-            if width is not None and width > 0 and not self._try_set_int("Width", width):
+            width, height, normalize_warnings = self._normalize_roi_size(width, height)
+            warnings.extend(normalize_warnings)
+            if width > 0 and not self._try_set_int("Width", width):
                 warnings.append(f"{self.info.label}: Width={width} 设置失败")
-            if height is not None and height > 0 and not self._try_set_int("Height", height):
+            if height > 0 and not self._try_set_int("Height", height):
                 warnings.append(f"{self.info.label}: Height={height} 设置失败")
+            offset_x, offset_y, normalize_warnings = self._normalize_roi_offset(width, height, offset_x, offset_y)
+            warnings.extend(normalize_warnings)
             if offset_x >= 0 and not self._try_set_int("OffsetX", offset_x):
                 warnings.append(f"{self.info.label}: OffsetX={offset_x} 设置失败")
             if offset_y >= 0 and not self._try_set_int("OffsetY", offset_y):
@@ -460,7 +501,64 @@ class MvsCamera:
         finally:
             if restart_stream and was_grabbing:
                 self.start()
-        return warnings
+        return RoiApplyResult(warnings, (width, height, offset_x, offset_y))
+
+    def _normalize_roi_size(
+        self,
+        width: int | None,
+        height: int | None,
+    ) -> tuple[int, int, list[str]]:
+        warnings: list[str] = []
+        width_info = self._get_int_info("Width")
+        height_info = self._get_int_info("Height")
+
+        requested_width = width if width is not None and width > 0 else width_info.maximum
+        requested_height = height if height is not None and height > 0 else height_info.maximum
+
+        norm_width = self._align_to_increment(requested_width, width_info.minimum, width_info.maximum, width_info.increment, "down")
+        norm_height = self._align_to_increment(
+            requested_height,
+            height_info.minimum,
+            height_info.maximum,
+            height_info.increment,
+            "down",
+        )
+
+        if norm_width != requested_width or norm_height != requested_height:
+            warnings.append(f"{self.info.label}: ROI 尺寸已按节点范围/步进修正为 W={norm_width}, H={norm_height}")
+        return norm_width, norm_height, warnings
+
+    def _normalize_roi_offset(
+        self,
+        width: int,
+        height: int,
+        offset_x: int,
+        offset_y: int,
+    ) -> tuple[int, int, list[str]]:
+        warnings: list[str] = []
+        offset_x_info = self._get_int_info("OffsetX")
+        offset_y_info = self._get_int_info("OffsetY")
+        requested_offset_x = max(offset_x, 0)
+        requested_offset_y = max(offset_y, 0)
+
+        norm_offset_x = self._align_to_increment(
+            requested_offset_x,
+            offset_x_info.minimum,
+            offset_x_info.maximum,
+            offset_x_info.increment,
+            "down",
+        )
+        norm_offset_y = self._align_to_increment(
+            requested_offset_y,
+            offset_y_info.minimum,
+            offset_y_info.maximum,
+            offset_y_info.increment,
+            "down",
+        )
+
+        if norm_offset_x != requested_offset_x or norm_offset_y != requested_offset_y:
+            warnings.append(f"{self.info.label}: ROI 偏移已按节点范围/步进修正为 X={norm_offset_x}, Y={norm_offset_y}")
+        return norm_offset_x, norm_offset_y, warnings
 
     def _normalize_auto_mode(self, gain_auto: str) -> str:
         value = str(gain_auto).strip().lower()
@@ -520,6 +618,8 @@ class MvsCamera:
             memset(byref(frame_info), 0, sizeof(frame_info))
             ret = self._cam.MV_CC_GetOneFrameTimeout(raw_buffer, self._payload_size, frame_info, timeout_ms)
             if ret != 0:
+                if ret == 0x80000007:
+                    raise FrameTimeoutError(f"{self.info.label} 等待图像超时: 0x{ret:08x}")
                 raise MvsError(f"{self.info.label} 等待图像超时或失败: 0x{ret:08x}")
 
             image = self._frame_to_image(raw_buffer, frame_info)
@@ -572,6 +672,34 @@ class MvsCamera:
         if ret != 0:
             raise MvsError(f"{self.info.label} 读取 {key} 失败: 0x{ret:08x}")
         return int(value.nCurValue)
+
+    def _get_int_info(self, key: str) -> IntNodeInfo:
+        s = sdk()
+        value = s["MVCC_INTVALUE"]()
+        memset(byref(value), 0, sizeof(value))
+        ret = self._cam.MV_CC_GetIntValue(key, value)
+        if ret != 0:
+            raise MvsError(f"{self.info.label} 读取 {key} 范围失败: 0x{ret:08x}")
+        increment = int(getattr(value, "nInc", 1) or 1)
+        return IntNodeInfo(
+            current=int(value.nCurValue),
+            minimum=int(value.nMin),
+            maximum=int(value.nMax),
+            increment=max(increment, 1),
+        )
+
+    def _align_to_increment(self, value: int, minimum: int, maximum: int, increment: int, direction: str) -> int:
+        if maximum < minimum:
+            maximum = minimum
+        value = min(max(int(value), minimum), maximum)
+        increment = max(int(increment), 1)
+        offset = value - minimum
+        if direction == "up":
+            steps = (offset + increment - 1) // increment
+        else:
+            steps = offset // increment
+        aligned = minimum + steps * increment
+        return min(max(aligned, minimum), maximum)
 
     def _set_enum(self, key: str, value: int) -> None:
         ret = self._cam.MV_CC_SetEnumValue(key, int(value))
@@ -627,17 +755,21 @@ class StereoCameraSystem:
         self.require_hardware_trigger = _config_bool(config, "require_hardware_trigger", False)
         self._capture_lock = threading.Lock()
 
-    def connect(self) -> tuple[CameraInfo, CameraInfo]:
-        left_info, right_info, dev_list = select_stereo_devices(
+    def connect(self) -> tuple[CameraInfo | None, CameraInfo | None]:
+        left_info, right_info, dev_list = select_capture_devices(
             str(self.config.get("left_serial", "")).strip(),
             str(self.config.get("right_serial", "")).strip(),
+            _config_bool(self.config, "allow_single_camera", False),
         )
-        left = MvsCamera(dev_list, left_info)
-        right = MvsCamera(dev_list, right_info)
+        left = MvsCamera(dev_list, left_info) if left_info is not None else None
+        right = MvsCamera(dev_list, right_info) if right_info is not None else None
+        opened: list[MvsCamera] = []
         try:
-            left.open()
-            right.open()
             for cam in (left, right):
+                if cam is None:
+                    continue
+                cam.open()
+                opened.append(cam)
                 cam.configure(
                     trigger_source=self.trigger_source,
                     exposure_time_us=float(self.config.get("exposure_time_us", 0) or 0),
@@ -660,8 +792,8 @@ class StereoCameraSystem:
                 )
                 cam.start()
         except Exception:
-            left.close()
-            right.close()
+            for cam in opened:
+                cam.close()
             raise
 
         self.left = left
@@ -696,6 +828,14 @@ class StereoCameraSystem:
         if errors:
             raise MvsError("; ".join(errors))
 
+    def _connected_cameras(self) -> list[tuple[str, MvsCamera]]:
+        cameras: list[tuple[str, MvsCamera]] = []
+        if self.left is not None:
+            cameras.append(("left", self.left))
+        if self.right is not None:
+            cameras.append(("right", self.right))
+        return cameras
+
     def apply_gain_settings(
         self,
         gain_auto: str,
@@ -703,16 +843,13 @@ class StereoCameraSystem:
         auto_gain_lower_limit: float | None,
         auto_gain_upper_limit: float | None,
     ) -> list[str]:
-        if self.left is None or self.right is None:
+        cameras = self._connected_cameras()
+        if not cameras:
             raise MvsError("相机尚未连接。")
         with self._capture_lock:
             warnings: list[str] = []
-            warnings.extend(
-                self.left.apply_gain_settings(gain_auto, gain, auto_gain_lower_limit, auto_gain_upper_limit)
-            )
-            warnings.extend(
-                self.right.apply_gain_settings(gain_auto, gain, auto_gain_lower_limit, auto_gain_upper_limit)
-            )
+            for _name, cam in cameras:
+                warnings.extend(cam.apply_gain_settings(gain_auto, gain, auto_gain_lower_limit, auto_gain_upper_limit))
             return warnings
 
     def apply_exposure_settings(
@@ -722,26 +859,20 @@ class StereoCameraSystem:
         auto_exposure_lower_limit: float | None,
         auto_exposure_upper_limit: float | None,
     ) -> list[str]:
-        if self.left is None or self.right is None:
+        cameras = self._connected_cameras()
+        if not cameras:
             raise MvsError("相机尚未连接。")
         with self._capture_lock:
             warnings: list[str] = []
-            warnings.extend(
-                self.left.apply_exposure_settings(
-                    exposure_auto,
-                    exposure_time_us,
-                    auto_exposure_lower_limit,
-                    auto_exposure_upper_limit,
+            for _name, cam in cameras:
+                warnings.extend(
+                    cam.apply_exposure_settings(
+                        exposure_auto,
+                        exposure_time_us,
+                        auto_exposure_lower_limit,
+                        auto_exposure_upper_limit,
+                    )
                 )
-            )
-            warnings.extend(
-                self.right.apply_exposure_settings(
-                    exposure_auto,
-                    exposure_time_us,
-                    auto_exposure_lower_limit,
-                    auto_exposure_upper_limit,
-                )
-            )
             return warnings
 
     def apply_white_balance_settings(
@@ -751,12 +882,13 @@ class StereoCameraSystem:
         green: float | None,
         blue: float | None,
     ) -> list[str]:
-        if self.left is None or self.right is None:
+        cameras = self._connected_cameras()
+        if not cameras:
             raise MvsError("相机尚未连接。")
         with self._capture_lock:
             warnings: list[str] = []
-            warnings.extend(self.left.apply_white_balance_settings(balance_white_auto, red, green, blue))
-            warnings.extend(self.right.apply_white_balance_settings(balance_white_auto, red, green, blue))
+            for _name, cam in cameras:
+                warnings.extend(cam.apply_white_balance_settings(balance_white_auto, red, green, blue))
             return warnings
 
     def apply_roi_settings(
@@ -765,38 +897,59 @@ class StereoCameraSystem:
         height: int | None,
         offset_x: int,
         offset_y: int,
-    ) -> list[str]:
-        if self.left is None or self.right is None:
+    ) -> RoiApplyResult:
+        cameras = self._connected_cameras()
+        if not cameras:
             raise MvsError("相机尚未连接。")
         with self._capture_lock:
             warnings: list[str] = []
-            warnings.extend(self.left.apply_roi_settings(width, height, offset_x, offset_y))
-            warnings.extend(self.right.apply_roi_settings(width, height, offset_x, offset_y))
-            return warnings
+            results: dict[str, RoiApplyResult] = {}
+            for name, cam in cameras:
+                result = cam.apply_roi_settings(width, height, offset_x, offset_y)
+                results[name] = result
+                warnings.extend(result)
+            left_result = results.get("left")
+            right_result = results.get("right")
+            actual_roi = next((result.actual_roi for result in results.values() if result.actual_roi), None)
+            if (
+                left_result is not None
+                and right_result is not None
+                and left_result.actual_roi
+                and right_result.actual_roi
+                and left_result.actual_roi != right_result.actual_roi
+            ):
+                warnings.append(
+                    "左右相机实际 ROI 不一致："
+                    f"左 W={left_result.actual_roi[0]}, H={left_result.actual_roi[1]}, X={left_result.actual_roi[2]}, Y={left_result.actual_roi[3]}；"
+                    f"右 W={right_result.actual_roi[0]}, H={right_result.actual_roi[1]}, X={right_result.actual_roi[2]}, Y={right_result.actual_roi[3]}"
+                )
+            return RoiApplyResult(warnings, actual_roi)
 
     def apply_trigger_settings(self, trigger_source: str) -> list[str]:
-        if self.left is None or self.right is None:
+        cameras = self._connected_cameras()
+        if not cameras:
             raise MvsError("相机尚未连接。")
         with self._capture_lock:
             warnings: list[str] = []
-            warnings.extend(self.left.apply_trigger_settings(trigger_source))
-            warnings.extend(self.right.apply_trigger_settings(trigger_source))
+            for _name, cam in cameras:
+                warnings.extend(cam.apply_trigger_settings(trigger_source))
             self.trigger_source = trigger_source
             return warnings
 
-    def capture_pair(self) -> tuple[Frame, Frame, float]:
+    def capture_pair(self) -> tuple[Frame | None, Frame | None, float]:
         with self._capture_lock:
             return self._capture_pair_locked()
 
-    def _capture_pair_locked(self) -> tuple[Frame, Frame, float]:
-        if self.left is None or self.right is None:
+    def _capture_pair_locked(self) -> tuple[Frame | None, Frame | None, float]:
+        cameras = self._connected_cameras()
+        if not cameras:
             raise MvsError("相机尚未连接。")
 
         if self.require_hardware_trigger and self.trigger_source.lower() == "software":
             raise MvsError("Hardware trigger is required, but trigger_source is Software.")
 
         if self.trigger_source.lower() == "software":
-            barrier = threading.Barrier(3)
+            barrier = threading.Barrier(len(cameras) + 1)
             errors: list[BaseException] = []
 
             def fire(cam: MvsCamera) -> None:
@@ -806,16 +959,18 @@ class StereoCameraSystem:
                 except BaseException as exc:
                     errors.append(exc)
 
-            t_left = threading.Thread(target=fire, args=(self.left,), daemon=True)
-            t_right = threading.Thread(target=fire, args=(self.right,), daemon=True)
-            t_left.start()
-            t_right.start()
+            trigger_threads = [threading.Thread(target=fire, args=(cam,), daemon=True) for _name, cam in cameras]
+            for thread in trigger_threads:
+                thread.start()
             trigger_time = time.time()
             barrier.wait()
-            t_left.join()
-            t_right.join()
+            for thread in trigger_threads:
+                thread.join()
             if errors:
-                raise MvsError("; ".join(str(exc) for exc in errors))
+                message = "; ".join(str(exc) for exc in errors)
+                if all(isinstance(exc, FrameTimeoutError) for exc in errors):
+                    raise FrameTimeoutError(message)
+                raise MvsError(message)
         else:
             trigger_time = time.time()
 
@@ -828,17 +983,22 @@ class StereoCameraSystem:
             except BaseException as exc:
                 errors.append(exc)
 
-        g_left = threading.Thread(target=grab, args=("left", self.left), daemon=True)
-        g_right = threading.Thread(target=grab, args=("right", self.right), daemon=True)
-        g_left.start()
-        g_right.start()
-        g_left.join()
-        g_right.join()
+        grab_threads = [threading.Thread(target=grab, args=(name, cam), daemon=True) for name, cam in cameras]
+        for thread in grab_threads:
+            thread.start()
+        for thread in grab_threads:
+            thread.join()
 
         if errors:
-            raise MvsError("; ".join(str(exc) for exc in errors))
-        self._validate_frame_sync(frames["left"], frames["right"])
-        return frames["left"], frames["right"], trigger_time
+            message = "; ".join(str(exc) for exc in errors)
+            if all(isinstance(exc, FrameTimeoutError) for exc in errors):
+                raise FrameTimeoutError(message)
+            raise MvsError(message)
+        left = frames.get("left")
+        right = frames.get("right")
+        if left is not None and right is not None:
+            self._validate_frame_sync(left, right)
+        return left, right, trigger_time
 
     def _validate_frame_sync(self, left: Frame, right: Frame) -> None:
         if not self.timestamp_reject_enabled:
