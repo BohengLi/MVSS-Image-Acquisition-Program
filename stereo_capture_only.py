@@ -11,13 +11,24 @@ import traceback
 from dataclasses import asdict
 from pathlib import Path
 from queue import Empty, Full, Queue
-from tkinter import BOTH, BOTTOM, DISABLED, LEFT, NORMAL, RIGHT, TOP, X, Canvas, Frame, StringVar, Tk, Toplevel, filedialog, messagebox
+from tkinter import BOTH, BOTTOM, DISABLED, LEFT, NORMAL, RIGHT, TOP, X, BooleanVar, Canvas, Frame, StringVar, Tk, Toplevel, filedialog, messagebox
 from tkinter import ttk
 
 import cv2
 import numpy as np
 from PIL import Image, ImageTk
 
+from image_quality import (
+    DEFAULT_FOCUS_ROI,
+    calibration_board_coverage,
+    clamp_roi_frac,
+    epipolar_alignment,
+    exposure_metrics,
+    focus_pair_metrics,
+    make_anaglyph,
+    make_focus_peaking_overlay,
+    roi_from_pixels,
+)
 from mvs_camera import Frame as CameraFrame
 from mvs_camera import FrameTimeoutError, MvsError, StereoCameraSystem, enumerate_cameras
 
@@ -176,6 +187,15 @@ class ZoomImagePane(Frame):
         self._performance_text_id: int | None = None
         self._performance_status = "good"
         self._performance_text = "FPS -- | Drop -- | Delta --"
+        self._focus_peaking_enabled = False
+        self._focus_peaking_overlay: Image.Image | None = None
+        self._zebra_enabled = False
+        self._zebra_phase = 0
+        self._guide_mode = "off"
+        self._focus_roi_frac: dict[str, float] | None = None
+        self._focus_roi_rect_id: int | None = None
+        self._magnifier_rect_frac: dict[str, float] | None = None
+        self._magnifier_rect_id: int | None = None
         self.roi_callback = roi_callback
         self.zoom = 1.0
         self.pan_x = 0.0
@@ -235,6 +255,33 @@ class ZoomImagePane(Frame):
         )
         self._render()
 
+    def set_display_image(self, image: Image.Image | None, info: str = "") -> None:
+        self._last_image = image
+        self.info_var.set(info or (f"{image.width}x{image.height}" if image is not None else "No Signal"))
+        self._render()
+
+    def set_analysis_overlays(
+        self,
+        *,
+        focus_peaking_enabled: bool | None = None,
+        focus_peaking_overlay: Image.Image | None = None,
+        zebra_enabled: bool | None = None,
+        guide_mode: str | None = None,
+        focus_roi_frac: dict[str, float] | None = None,
+        magnifier_rect_frac: dict[str, float] | None = None,
+    ) -> None:
+        if focus_peaking_enabled is not None:
+            self._focus_peaking_enabled = focus_peaking_enabled
+        if focus_peaking_overlay is not None or not self._focus_peaking_enabled:
+            self._focus_peaking_overlay = focus_peaking_overlay
+        if zebra_enabled is not None:
+            self._zebra_enabled = zebra_enabled
+        if guide_mode is not None:
+            self._guide_mode = guide_mode
+        if focus_roi_frac is not None:
+            self._focus_roi_frac = clamp_roi_frac(focus_roi_frac)
+        self._magnifier_rect_frac = clamp_roi_frac(magnifier_rect_frac) if magnifier_rect_frac is not None else None
+
     def set_no_signal(self, reason: str = "No Signal") -> None:
         self._last_image = None
         self.info_var.set(reason)
@@ -275,15 +322,30 @@ class ZoomImagePane(Frame):
         height = max(self.canvas.winfo_height(), 100)
         if self._last_image is None:
             self._render_bounds = None
+            self.canvas.delete("guide")
+            if self._focus_roi_rect_id is not None:
+                self.canvas.delete(self._focus_roi_rect_id)
+                self._focus_roi_rect_id = None
+            if self._magnifier_rect_id is not None:
+                self.canvas.delete(self._magnifier_rect_id)
+                self._magnifier_rect_id = None
             self.canvas.coords(self._canvas_text_id, width // 2, height // 2)
             self.canvas.itemconfigure(self._canvas_text_id, text="No Signal", state="normal")
             self._place_performance_overlay()
             return
 
-        image = self._last_image.copy()
+        image = self._last_image.copy().convert("RGB")
+        if self._focus_peaking_enabled and self._focus_peaking_overlay is not None:
+            overlay = self._focus_peaking_overlay
+            if overlay.size != image.size:
+                overlay = overlay.resize(image.size, Image.Resampling.BILINEAR)
+            image = Image.alpha_composite(image.convert("RGBA"), overlay.convert("RGBA")).convert("RGB")
         target_width = max(1, int(width * self.zoom))
         target_height = max(1, int(height * self.zoom))
         image.thumbnail((target_width, target_height), Image.Resampling.LANCZOS)
+        self._zebra_phase = (self._zebra_phase + 1) % 12
+        if self._zebra_enabled and self._zebra_phase < 6:
+            image = self._apply_zebra_overlay(image)
         image_width, image_height = image.size
         self._image_ref = ImageTk.PhotoImage(image)
         x = width // 2 + int(round(self.pan_x))
@@ -295,8 +357,72 @@ class ZoomImagePane(Frame):
             self.canvas.itemconfigure(self._canvas_image_id, image=self._image_ref)
             self.canvas.coords(self._canvas_image_id, x, y)
         self.canvas.itemconfigure(self._canvas_text_id, state="hidden")
+        self._draw_guides()
+        self._draw_fraction_rects()
         self._place_performance_overlay()
         self._raise_overlays()
+
+    def _apply_zebra_overlay(self, image: Image.Image) -> Image.Image:
+        gray = np.asarray(image.convert("L"), dtype=np.uint8)
+        rgb = np.asarray(image.convert("RGB"), dtype=np.float32).copy()
+        height, width = gray.shape
+        yy, xx = np.indices((height, width))
+        stripes = ((xx + yy) // 8) % 2 == 0
+        over = (gray >= 254) & stripes
+        under = (gray <= 2) & stripes
+        rgb[over] = rgb[over] * 0.50 + np.array([255.0, 30.0, 30.0]) * 0.50
+        rgb[under] = rgb[under] * 0.50 + np.array([35.0, 120.0, 255.0]) * 0.50
+        return Image.fromarray(np.clip(rgb, 0, 255).astype(np.uint8), "RGB")
+
+    def _draw_guides(self) -> None:
+        self.canvas.delete("guide")
+        if self._last_image is None or self._render_bounds is None or self._guide_mode == "off":
+            return
+        left, top, width, height = self._render_bounds
+        center_x = left + width / 2
+        center_y = top + height / 2
+        color = "#48e07b"
+        self.canvas.create_line(left, center_y, left + width, center_y, fill=color, width=1, tags=("guide",), stipple="gray50")
+        self.canvas.create_line(center_x, top, center_x, top + height, fill=color, width=1, tags=("guide",), stipple="gray50")
+        if self._guide_mode == "full":
+            for frac in (1 / 3, 2 / 3):
+                y = top + height * frac
+                self.canvas.create_line(
+                    left,
+                    y,
+                    left + width,
+                    y,
+                    fill=color,
+                    width=1,
+                    dash=(6, 5),
+                    tags=("guide",),
+                    stipple="gray50",
+                )
+        self._raise_overlays()
+
+    def _draw_fraction_rects(self) -> None:
+        if self._focus_roi_rect_id is not None:
+            self.canvas.delete(self._focus_roi_rect_id)
+            self._focus_roi_rect_id = None
+        if self._magnifier_rect_id is not None:
+            self.canvas.delete(self._magnifier_rect_id)
+            self._magnifier_rect_id = None
+        if self._last_image is None or self._render_bounds is None:
+            return
+        if self._focus_roi_frac is not None:
+            self._focus_roi_rect_id = self._create_fraction_rect(self._focus_roi_frac, "#ffd166", (5, 4), "focus_roi")
+        if self._magnifier_rect_frac is not None:
+            self._magnifier_rect_id = self._create_fraction_rect(self._magnifier_rect_frac, "#00d4ff", (3, 3), "magnifier")
+
+    def _create_fraction_rect(self, roi: dict[str, float], color: str, dash: tuple[int, int], tag: str) -> int | None:
+        if self._render_bounds is None:
+            return None
+        left, top, width, height = self._render_bounds
+        x0 = left + roi["x_frac"] * width
+        y0 = top + roi["y_frac"] * height
+        x1 = x0 + roi["w_frac"] * width
+        y1 = y0 + roi["h_frac"] * height
+        return self.canvas.create_rectangle(x0, y0, x1, y1, outline=color, width=2, dash=dash, tags=(tag,))
 
     def _on_mouse_wheel(self, event) -> None:
         scale = 1.1 if event.delta > 0 else 1 / 1.1
@@ -517,6 +643,11 @@ class ZoomImagePane(Frame):
         return offset_x, offset_y, width, height
 
     def _raise_overlays(self) -> None:
+        self.canvas.lift("guide")
+        if self._focus_roi_rect_id is not None:
+            self.canvas.lift(self._focus_roi_rect_id)
+        if self._magnifier_rect_id is not None:
+            self.canvas.lift(self._magnifier_rect_id)
         if self._roi_rect_id is not None:
             self.canvas.lift(self._roi_rect_id)
         if self._recording_dot_id is not None:
@@ -564,6 +695,62 @@ class ToolTip:
             self.tip_window = None
 
 
+class HistogramCanvas(ttk.Frame):
+    def __init__(self, master: Tk | Frame, title: str):
+        super().__init__(master, style="Panel.TFrame", padding=(6, 4))
+        self.title = title
+        self.histogram: list[float] | None = None
+        ttk.Label(self, text=title, style="Panel.TLabel").pack(side=TOP, anchor="w")
+        self.canvas = Canvas(self, width=280, height=130, bg="#151515", highlightthickness=1, highlightbackground="#555555")
+        self.canvas.pack(side=TOP, fill=BOTH, expand=True)
+        self.canvas.bind("<Configure>", lambda _event: self.draw())
+
+    def set_histogram(self, histogram: list[float] | None) -> None:
+        self.histogram = histogram
+        self.draw()
+
+    def draw(self) -> None:
+        self.canvas.delete("all")
+        width = max(self.canvas.winfo_width(), 120)
+        height = max(self.canvas.winfo_height(), 80)
+        margin_left = 24
+        margin_right = 8
+        margin_top = 8
+        margin_bottom = 18
+        plot_w = max(width - margin_left - margin_right, 1)
+        plot_h = max(height - margin_top - margin_bottom, 1)
+        x0 = margin_left
+        y0 = margin_top
+        x1 = margin_left + plot_w
+        y1 = margin_top + plot_h
+
+        self.canvas.create_rectangle(x0, y0, x1, y1, fill="#1f1f1f", outline="#555555")
+        self.canvas.create_rectangle(x0, y0, x0 + plot_w * 15 / 255, y1, fill="#20334d", outline="")
+        self.canvas.create_rectangle(x0 + plot_w * 240 / 255, y0, x1, y1, fill="#4a2525", outline="")
+        for value, color, dash in ((5, "#4c8dff", (2, 3)), (128, "#a8a8a8", (3, 3)), (250, "#ff6b6b", (2, 3))):
+            x = x0 + plot_w * value / 255
+            self.canvas.create_line(x, y0, x, y1, fill=color, dash=dash)
+        self.canvas.create_text(x0, y1 + 3, text="0", fill="#a8a8a8", anchor="nw", font=("Consolas", 8))
+        self.canvas.create_text(x0 + plot_w / 2, y1 + 3, text="128", fill="#a8a8a8", anchor="n", font=("Consolas", 8))
+        self.canvas.create_text(x1, y1 + 3, text="255", fill="#a8a8a8", anchor="ne", font=("Consolas", 8))
+        if not self.histogram:
+            self.canvas.create_text((x0 + x1) / 2, (y0 + y1) / 2, text="No Data", fill="#777777", anchor="center")
+            return
+        values = np.asarray(self.histogram, dtype=np.float32)
+        if values.size != 256:
+            return
+        max_value = float(np.max(values))
+        if max_value <= 0:
+            return
+        values = np.sqrt(values / max_value)
+        bar_w = max(plot_w / 256, 1.0)
+        for index, value in enumerate(values):
+            bar_h = float(value) * plot_h
+            x = x0 + index * plot_w / 256
+            color = "#c7d7ff" if 15 <= index <= 240 else "#ffb0a6" if index > 240 else "#94bdff"
+            self.canvas.create_rectangle(x, y1 - bar_h, x + bar_w, y1, fill=color, outline=color)
+
+
 class StereoCaptureOnlyApp:
     def __init__(self, root: Tk):
         self.root = root
@@ -578,6 +765,7 @@ class StereoCaptureOnlyApp:
         self.config = load_config()
         self._ensure_default_full_resolution()
         self._ensure_recording_config_defaults()
+        self._ensure_quality_config_defaults()
         self.camera_system: StereoCameraSystem | None = None
         self.ui_queue: Queue[tuple[str, object]] = Queue()
 
@@ -615,8 +803,25 @@ class StereoCaptureOnlyApp:
         self._last_right_frame: int | None = None
         self._drop_count = 0
         self.roi_editing = False
+        self.focus_roi_editing = False
         self._last_device_status = "尚未刷新设备。"
         self._last_video_sides: list[str] = []
+        self._last_quality_metrics: dict[str, object] = {}
+        self._last_left_frame_obj: CameraFrame | None = None
+        self._last_right_frame_obj: CameraFrame | None = None
+        self._last_analysis_time = 0.0
+        self._preview_frame_counter = 0
+        self._last_focus_overlay_score: float | None = None
+        self._last_focus_overlay_left: Image.Image | None = None
+        self._last_focus_overlay_right: Image.Image | None = None
+        self._last_reference_warning_score: float | None = None
+        self._focus_drift_timer: threading.Timer | None = None
+        self._focus_drift_warning_visible = False
+        self._focus_drift_warning_text = ""
+        self._magnifier_locked = False
+        self._magnifier_roi_frac = clamp_roi_frac(self.config.get("focus_roi"))
+        self._magnifier_zoom = 1
+        self._stereo_blink_phase = 0
 
         self.status_var = StringVar(value="准备就绪。请先连接相机。")
         self.save_dir_var = StringVar(value=str(self.config.get("save_dir", "captures")))
@@ -662,6 +867,27 @@ class StereoCaptureOnlyApp:
         self.interval_limit_var = StringVar(value=optional_config_text(self.config, "interval_capture_count", ""))
         self.record_fps_var = StringVar(value=str(self.config.get("record_fps", 5.0)))
         self.record_max_seconds_var = StringVar(value=optional_config_text(self.config, "record_max_seconds", "0"))
+        exposure_monitor = self.config.get("exposure_monitor", {})
+        self.focus_peaking_var = BooleanVar(value=False)
+        self.zebra_var = BooleanVar(value=bool(exposure_monitor.get("zebra_enabled", False)))
+        self.histogram_enabled_var = BooleanVar(value=bool(exposure_monitor.get("histogram_enabled", True)))
+        self.focus_panel_open_var = BooleanVar(value=True)
+        self.exposure_panel_open_var = BooleanVar(value=True)
+        self.validation_panel_open_var = BooleanVar(value=True)
+        self.magnifier_enabled_var = BooleanVar(value=False)
+        self.focus_score_var = StringVar(value="Focus --")
+        self.focus_detail_var = StringVar(value="L: -- | R: -- | Δ: --")
+        self.focus_status_var = StringVar(value="未标定")
+        self.focus_roi_var = StringVar(value=self._format_focus_roi())
+        self.exposure_status_var = StringVar(value="过曝: -- | 欠曝: -- | SNR: --")
+        self.exposure_advice_var = StringVar(value="曝光建议: --")
+        self.capture_gate_var = StringVar(value="采集检查: --")
+        self.epipolar_status_var = StringVar(value="极线偏差: --")
+        self.calibration_status_var = StringVar(value="标定板覆盖: --")
+        self.stereo_preview_mode_var = StringVar(value="正常预览")
+        self.guide_mode_var = StringVar(value="关闭")
+        self._focus_peaking_enabled_setting = bool(self.focus_peaking_var.get())
+        self._histogram_enabled_setting = bool(self.histogram_enabled_var.get())
 
     def _build_ui(self) -> None:
         toolbar = ttk.Frame(self.root, padding=(10, 8))
@@ -826,6 +1052,10 @@ class StereoCaptureOnlyApp:
         self.left_pane.grid(row=0, column=0, sticky="nsew", padx=(8, 4), pady=8)
         self.right_pane.grid(row=0, column=1, sticky="nsew", padx=(4, 8), pady=8)
 
+        self.quality_panel = ttk.Frame(self.root, padding=(8, 0))
+        self.quality_panel.pack(side=TOP, fill=X)
+        self._build_quality_panels(self.quality_panel)
+
         ttk.Separator(self.root, orient="horizontal").pack(side=TOP, fill=X)
         status_bar = ttk.Frame(self.root)
         status_bar.pack(side=BOTTOM, fill=X)
@@ -869,6 +1099,136 @@ class StereoCaptureOnlyApp:
         self.style.configure("TLabelframe", background=BG_COLOR, bordercolor="#555555", relief="solid")
         self.style.configure("TLabelframe.Label", background=BG_COLOR, foreground="#dcdcdc", font=(FONT_FAMILY, BASE_FONT_SIZE, "bold"))
         self.style.configure("Horizontal.TSeparator", background="#555555")
+        self.style.configure("Green.Horizontal.TProgressbar", troughcolor="#1f1f1f", background="#41c46d")
+        self.style.configure("Yellow.Horizontal.TProgressbar", troughcolor="#1f1f1f", background="#ffd166")
+        self.style.configure("Red.Horizontal.TProgressbar", troughcolor="#1f1f1f", background="#ff6b6b")
+        self.style.configure("Good.TLabel", background=BG_COLOR, foreground="#7bd88f", font=(FONT_FAMILY, BASE_FONT_SIZE, "bold"))
+        self.style.configure("Warn.TLabel", background=BG_COLOR, foreground="#ffd166", font=(FONT_FAMILY, BASE_FONT_SIZE, "bold"))
+        self.style.configure("Bad.TLabel", background=BG_COLOR, foreground="#ff6b6b", font=(FONT_FAMILY, BASE_FONT_SIZE, "bold"))
+        self.style.configure("PanelGood.TLabel", background=PANEL_COLOR, foreground="#7bd88f", font=(FONT_FAMILY, BASE_FONT_SIZE, "bold"))
+        self.style.configure("PanelWarn.TLabel", background=PANEL_COLOR, foreground="#ffd166", font=(FONT_FAMILY, BASE_FONT_SIZE, "bold"))
+        self.style.configure("PanelBad.TLabel", background=PANEL_COLOR, foreground="#ff6b6b", font=(FONT_FAMILY, BASE_FONT_SIZE, "bold"))
+
+    def _build_quality_panels(self, parent: ttk.Frame) -> None:
+        parent.grid_columnconfigure(0, weight=1)
+        parent.grid_columnconfigure(1, weight=1)
+        parent.grid_columnconfigure(2, weight=1)
+
+        self.focus_panel_body = ttk.Frame(parent)
+        self.focus_panel = ttk.LabelFrame(parent, text="对焦辅助", padding=(8, 6))
+        self.focus_panel.grid(row=0, column=0, sticky="nsew", padx=(0, 6), pady=(0, 8))
+        self._build_focus_panel(self.focus_panel)
+
+        self.exposure_panel = ttk.LabelFrame(parent, text="曝光监控", padding=(8, 6))
+        self.exposure_panel.grid(row=0, column=1, sticky="nsew", padx=6, pady=(0, 8))
+        self._build_exposure_panel(self.exposure_panel)
+
+        self.validation_panel = ttk.LabelFrame(parent, text="采集校验", padding=(8, 6))
+        self.validation_panel.grid(row=0, column=2, sticky="nsew", padx=(6, 0), pady=(0, 8))
+        self._build_validation_panel(self.validation_panel)
+
+    def _build_focus_panel(self, panel: ttk.LabelFrame) -> None:
+        top = ttk.Frame(panel)
+        top.pack(side=TOP, fill=X)
+        self.focus_collapse_button = ttk.Button(top, text="v", width=3, command=lambda: self._toggle_panel("focus"))
+        self.focus_collapse_button.pack(side=LEFT, padx=(0, 6))
+        ttk.Checkbutton(top, text="峰值对焦", variable=self.focus_peaking_var, command=self._sync_quality_toggles).pack(
+            side=LEFT, padx=(0, 8)
+        )
+        ttk.Checkbutton(top, text="放大镜", variable=self.magnifier_enabled_var, command=self._sync_quality_toggles).pack(
+            side=LEFT, padx=(0, 8)
+        )
+        self.focus_roi_button = ttk.Button(top, text="框选对焦ROI", command=self.toggle_focus_roi_edit_mode)
+        self.focus_roi_button.pack(side=LEFT, padx=(0, 6))
+        ttk.Button(top, text="设为目标", command=self.set_focus_reference).pack(side=LEFT, padx=(0, 6))
+        ttk.Button(top, text="保存对焦基准", command=self.save_focus_reference_snapshot).pack(side=LEFT, padx=(0, 6))
+
+        self.focus_panel_body = ttk.Frame(panel)
+        self.focus_panel_body.pack(side=TOP, fill=X)
+        score_row = ttk.Frame(self.focus_panel_body)
+        score_row.pack(side=TOP, fill=X, pady=(6, 0))
+        ttk.Label(score_row, textvariable=self.focus_score_var).pack(side=LEFT, padx=(0, 8))
+        self.focus_progress = ttk.Progressbar(score_row, mode="determinate", maximum=100, style="Yellow.Horizontal.TProgressbar")
+        self.focus_progress.pack(side=LEFT, fill=X, expand=True, padx=(0, 8))
+        self.focus_status_label = ttk.Label(score_row, textvariable=self.focus_status_var, style="Warn.TLabel", width=18)
+        self.focus_status_label.pack(side=LEFT)
+
+        detail_row = ttk.Frame(self.focus_panel_body)
+        detail_row.pack(side=TOP, fill=X, pady=(5, 0))
+        self.focus_detail_label = ttk.Label(detail_row, textvariable=self.focus_detail_var, style="Panel.TLabel")
+        self.focus_detail_label.pack(side=LEFT, fill=X, expand=True)
+        ttk.Label(detail_row, textvariable=self.focus_roi_var, style="Panel.TLabel").pack(side=RIGHT)
+
+        self.magnifier_frame = ttk.LabelFrame(self.focus_panel_body, text="对焦放大镜", padding=(6, 4))
+        self.magnifier_frame.pack(side=TOP, fill=X, pady=(6, 0))
+        mag_top = ttk.Frame(self.magnifier_frame)
+        mag_top.pack(side=TOP, fill=X)
+        self.magnifier_info_var = StringVar(value="倍率 100% | 点击预览锁定/解锁，滚轮调倍率")
+        ttk.Label(mag_top, textvariable=self.magnifier_info_var, style="Panel.TLabel").pack(side=LEFT, fill=X, expand=True)
+        self.magnifier_canvas = Canvas(self.magnifier_frame, width=240, height=180, bg="#111111", highlightthickness=1, highlightbackground="#555555")
+        self.magnifier_canvas.pack(side=TOP, fill=BOTH, expand=True, pady=(4, 0))
+        self._magnifier_image_ref: ImageTk.PhotoImage | None = None
+        self.left_pane.canvas.bind("<Motion>", self._on_magnifier_motion, add="+")
+        self.left_pane.canvas.bind("<ButtonPress-1>", self._on_magnifier_click, add="+")
+        self.left_pane.canvas.bind("<MouseWheel>", self._on_magnifier_wheel, add="+")
+
+    def _build_exposure_panel(self, panel: ttk.LabelFrame) -> None:
+        top = ttk.Frame(panel)
+        top.pack(side=TOP, fill=X)
+        self.exposure_collapse_button = ttk.Button(top, text="v", width=3, command=lambda: self._toggle_panel("exposure"))
+        self.exposure_collapse_button.pack(side=LEFT, padx=(0, 6))
+        ttk.Checkbutton(top, text="直方图", variable=self.histogram_enabled_var, command=self._sync_quality_toggles).pack(
+            side=LEFT, padx=(0, 8)
+        )
+        ttk.Checkbutton(top, text="斑马纹", variable=self.zebra_var, command=self._sync_quality_toggles).pack(side=LEFT)
+        self.exposure_status_label = ttk.Label(top, textvariable=self.exposure_status_var, style="Panel.TLabel")
+        self.exposure_status_label.pack(side=RIGHT)
+
+        self.exposure_panel_body = ttk.Frame(panel)
+        self.exposure_panel_body.pack(side=TOP, fill=X)
+        hist_row = ttk.Frame(self.exposure_panel_body)
+        hist_row.pack(side=TOP, fill=X, pady=(6, 0))
+        hist_row.grid_columnconfigure(0, weight=1)
+        hist_row.grid_columnconfigure(1, weight=1)
+        self.left_hist_canvas = HistogramCanvas(hist_row, "左直方图")
+        self.right_hist_canvas = HistogramCanvas(hist_row, "右直方图")
+        self.left_hist_canvas.grid(row=0, column=0, sticky="nsew", padx=(0, 4))
+        self.right_hist_canvas.grid(row=0, column=1, sticky="nsew", padx=(4, 0))
+        ttk.Label(self.exposure_panel_body, textvariable=self.exposure_advice_var, style="Panel.TLabel").pack(side=TOP, fill=X, pady=(5, 0))
+
+    def _build_validation_panel(self, panel: ttk.LabelFrame) -> None:
+        top = ttk.Frame(panel)
+        top.pack(side=TOP, fill=X)
+        self.validation_collapse_button = ttk.Button(top, text="v", width=3, command=lambda: self._toggle_panel("validation"))
+        self.validation_collapse_button.pack(side=LEFT, padx=(0, 6))
+        ttk.Label(top, text="预览模式", style="Panel.TLabel").pack(side=LEFT, padx=(0, 4))
+        ttk.OptionMenu(
+            top,
+            self.stereo_preview_mode_var,
+            self.stereo_preview_mode_var.get(),
+            "正常预览",
+            "红蓝立体",
+            "交替闪烁",
+            command=lambda _value: self._sync_quality_toggles(),
+        ).pack(side=LEFT, padx=(0, 10))
+        ttk.Label(top, text="辅助线", style="Panel.TLabel").pack(side=LEFT, padx=(0, 4))
+        ttk.OptionMenu(
+            top,
+            self.guide_mode_var,
+            self.guide_mode_var.get(),
+            "关闭",
+            "中心十字",
+            "全部网格线",
+            command=lambda _value: self._sync_quality_toggles(),
+        ).pack(side=LEFT, padx=(0, 10))
+        ttk.Button(top, text="极线对准检查", command=self.run_epipolar_check).pack(side=LEFT)
+
+        self.validation_panel_body = ttk.Frame(panel)
+        self.validation_panel_body.pack(side=TOP, fill=X)
+        ttk.Label(self.validation_panel_body, textvariable=self.capture_gate_var, style="Panel.TLabel").pack(side=TOP, fill=X, pady=(6, 0))
+        self.epipolar_label = ttk.Label(self.validation_panel_body, textvariable=self.epipolar_status_var, style="Panel.TLabel")
+        self.epipolar_label.pack(side=TOP, fill=X, pady=(4, 0))
+        ttk.Label(self.validation_panel_body, textvariable=self.calibration_status_var, style="Panel.TLabel").pack(side=TOP, fill=X, pady=(4, 0))
 
     def _configure_parameter_grid(self, panel: ttk.Frame) -> None:
         widths = {
@@ -897,6 +1257,23 @@ class StereoCaptureOnlyApp:
         entry = ttk.Entry(parent, textvariable=variable, width=width)
         entry.grid(row=row, column=column + 1, padx=(0, 4), pady=3, sticky="ew")
         return entry
+
+    def _toggle_panel(self, panel_name: str) -> None:
+        mapping = {
+            "focus": (self.focus_panel_body, self.focus_panel_open_var, self.focus_collapse_button),
+            "exposure": (self.exposure_panel_body, self.exposure_panel_open_var, self.exposure_collapse_button),
+            "validation": (self.validation_panel_body, self.validation_panel_open_var, self.validation_collapse_button),
+        }
+        body, variable, button = mapping[panel_name]
+        is_open = bool(variable.get())
+        if is_open:
+            body.pack_forget()
+            variable.set(False)
+            button.configure(text=">")
+        else:
+            body.pack(side=TOP, fill=X)
+            variable.set(True)
+            button.configure(text="v")
 
     def toggle_fullscreen(self) -> None:
         current = bool(self.root.attributes("-fullscreen"))
@@ -932,14 +1309,51 @@ class StereoCaptureOnlyApp:
     def _display_frames(self, left: CameraFrame | None, right: CameraFrame | None) -> None:
         self._update_stats(left, right)
         self._update_performance_display()
-        if left is not None:
-            self.left_pane.set_frame(left)
+        self._last_left_frame_obj = left
+        self._last_right_frame_obj = right
+        guide_mode = self._guide_mode_key()
+        focus_roi = clamp_roi_frac(self.config.get("focus_roi"))
+        self.left_pane.set_analysis_overlays(
+            focus_peaking_enabled=self.focus_peaking_var.get(),
+            focus_peaking_overlay=self._last_focus_overlay_left,
+            zebra_enabled=self.zebra_var.get(),
+            guide_mode=guide_mode,
+            focus_roi_frac=focus_roi,
+            magnifier_rect_frac=self._magnifier_roi_frac if self.magnifier_enabled_var.get() else None,
+        )
+        self.right_pane.set_analysis_overlays(
+            focus_peaking_enabled=self.focus_peaking_var.get(),
+            focus_peaking_overlay=self._last_focus_overlay_right,
+            zebra_enabled=self.zebra_var.get(),
+            guide_mode=guide_mode,
+            focus_roi_frac=focus_roi,
+            magnifier_rect_frac=None,
+        )
+        mode = self.stereo_preview_mode_var.get()
+        if mode == "红蓝立体" and left is not None and right is not None:
+            image = make_anaglyph(left.image, right.image)
+            info = f"Anaglyph {image.width}x{image.height}"
+            self.left_pane.set_display_image(image, info)
+            self.right_pane.set_no_signal("红蓝立体模式使用左侧单窗显示")
+        elif mode == "交替闪烁":
+            self._stereo_blink_phase += 1
+            frame = left if self._stereo_blink_phase % 2 == 0 else right
+            side = "L" if self._stereo_blink_phase % 2 == 0 else "R"
+            if frame is not None:
+                self.left_pane.set_display_image(frame.image, f"Blink {side} {frame.width}x{frame.height}")
+            else:
+                self.left_pane.set_no_signal(f"Blink {side}: No Signal")
+            self.right_pane.set_no_signal("交替闪烁模式使用左侧单窗显示")
         else:
-            self.left_pane.set_no_signal()
-        if right is not None:
-            self.right_pane.set_frame(right)
-        else:
-            self.right_pane.set_no_signal()
+            if left is not None:
+                self.left_pane.set_frame(left)
+            else:
+                self.left_pane.set_no_signal()
+            if right is not None:
+                self.right_pane.set_frame(right)
+            else:
+                self.right_pane.set_no_signal()
+        self._update_magnifier()
 
     def _ensure_preview_thread_after_recording(self) -> None:
         if self.camera_system is None or not self.previewing or self.recording or self.interval_capturing:
@@ -1045,6 +1459,9 @@ class StereoCaptureOnlyApp:
 
                 consecutive_timeouts = 0
                 if self.previewing:
+                    self._preview_frame_counter += 1
+                    analysis = self._analyze_preview_frames(left, right, self._preview_frame_counter)
+                    self.ui_queue.put(("quality_metrics", analysis))
                     self.ui_queue.put(("frames", (left, right)))
                 now = time.perf_counter()
                 if now - self._last_preview_status_time >= 1.0:
@@ -1067,6 +1484,11 @@ class StereoCaptureOnlyApp:
     def capture_photo(self) -> None:
         if self.camera_system is None or self.interval_capturing:
             return
+        allow_capture, quality_report = self._capture_quality_gate_allows()
+        self._apply_quality_report(quality_report)
+        if not allow_capture:
+            self.status_var.set("采集已取消：质量检查未通过。")
+            return
         self.photo_button.configure(state=DISABLED)
         if self.recording:
             with self._record_last_frame_lock:
@@ -1082,7 +1504,13 @@ class StereoCaptureOnlyApp:
 
             def record_snapshot_worker() -> None:
                 try:
-                    photo_dir = self._save_photo_pair(left_copy, right_copy, trigger_time, mode="recording_photo")
+                    photo_dir = self._save_photo_pair(
+                        left_copy,
+                        right_copy,
+                        trigger_time,
+                        mode="recording_photo",
+                        quality_report=quality_report,
+                    )
                     self.ui_queue.put(("shutter_flash", None))
                     self.ui_queue.put(("photo_done", photo_dir))
                 except Exception as exc:
@@ -1103,7 +1531,10 @@ class StereoCaptureOnlyApp:
         def worker() -> None:
             try:
                 left, right, trigger_time = self.camera_system.capture_pair()
-                photo_dir = self._save_photo_pair(left, right, trigger_time, mode="photo")
+                metrics = self._quality_metrics_for_pair(left, right)
+                report = self._quality_report_from_metrics(metrics)
+                self.ui_queue.put(("quality_report", report))
+                photo_dir = self._save_photo_pair(left, right, trigger_time, mode="photo", quality_report=report)
                 if self.previewing:
                     self.ui_queue.put(("frames", (left, right)))
                 self.ui_queue.put(("shutter_flash", None))
@@ -1176,9 +1607,14 @@ class StereoCaptureOnlyApp:
             while self.interval_capturing:
                 left, right, trigger_time = self.camera_system.capture_pair()
                 self.interval_count += 1
-                photo_dir = self._save_photo_pair(left, right, trigger_time, mode="interval_photo")
+                metrics = self._quality_metrics_for_pair(left, right)
+                report = self._quality_report_from_metrics(metrics)
+                photo_dir = self._save_photo_pair(left, right, trigger_time, mode="interval_photo", quality_report=report)
                 self.ui_queue.put(("interval_lamp_green", None))
                 if self.previewing:
+                    self._preview_frame_counter += 1
+                    analysis = self._analyze_preview_frames(left, right, self._preview_frame_counter)
+                    self.ui_queue.put(("quality_metrics", analysis))
                     self.ui_queue.put(("frames", (left, right)))
                 self.ui_queue.put(
                     (
@@ -1420,6 +1856,9 @@ class StereoCaptureOnlyApp:
                         self._put_record_item(video_queue, item)
 
                 if self.previewing:
+                    self._preview_frame_counter += 1
+                    analysis = self._analyze_preview_frames(left, right, self._preview_frame_counter)
+                    self.ui_queue.put(("quality_metrics", analysis))
                     self.ui_queue.put(("frames", (left, right)))
                 else:
                     self.ui_queue.put(("record_stats", (left, right)))
@@ -1685,11 +2124,47 @@ class StereoCaptureOnlyApp:
 
     def _set_roi_edit_mode(self, enabled: bool) -> None:
         self.roi_editing = enabled
+        if enabled:
+            self.focus_roi_editing = False
+            if hasattr(self, "focus_roi_button"):
+                self.focus_roi_button.configure(text="框选对焦ROI")
         self.edit_roi_button.configure(text="退出ROI" if enabled else "修改ROI")
         self.left_pane.set_roi_mode(enabled)
         self.right_pane.set_roi_mode(enabled)
 
+    def toggle_focus_roi_edit_mode(self) -> None:
+        self.focus_roi_editing = not self.focus_roi_editing
+        if self.focus_roi_editing:
+            self._set_roi_edit_mode(False)
+            self.left_pane.set_roi_mode(True)
+            self.right_pane.set_roi_mode(True)
+            self.focus_roi_button.configure(text="退出对焦ROI")
+            self.status_var.set("对焦 ROI 框选模式已开启：在任一画面拖拽框选对焦目标区域。")
+        else:
+            self.left_pane.set_roi_mode(False)
+            self.right_pane.set_roi_mode(False)
+            self.focus_roi_button.configure(text="框选对焦ROI")
+            self.status_var.set("对焦 ROI 框选模式已关闭。")
+
     def set_roi_from_preview(self, roi: tuple[int, int, int, int]) -> None:
+        if self.focus_roi_editing:
+            x, y, width, height = roi
+            image_width = self._last_left_frame_obj.width if self._last_left_frame_obj is not None else CAPTURE_WIDTH
+            image_height = self._last_left_frame_obj.height if self._last_left_frame_obj is not None else CAPTURE_HEIGHT
+            focus_roi = roi_from_pixels(x, y, width, height, image_width, image_height)
+            self.config["focus_roi"] = focus_roi
+            self._magnifier_roi_frac = focus_roi
+            save_config(self.config)
+            self.focus_roi_var.set(self._format_focus_roi())
+            self.focus_roi_editing = False
+            self.left_pane.set_roi_mode(False)
+            self.right_pane.set_roi_mode(False)
+            self.focus_roi_button.configure(text="框选对焦ROI")
+            self.status_var.set(
+                f"已设置对焦 ROI：x={focus_roi['x_frac']:.2f}, y={focus_roi['y_frac']:.2f}, "
+                f"w={focus_roi['w_frac']:.2f}, h={focus_roi['h_frac']:.2f}。"
+            )
+            return
         offset_x, offset_y, width, height = roi
         self.roi_width_var.set(str(width))
         self.roi_height_var.set(str(height))
@@ -1907,11 +2382,25 @@ class StereoCaptureOnlyApp:
                     self.status_var.set(
                         f"{mode_text}连接成功。当前 ROI：{self.config.get('roi_width')}x{self.config.get('roi_height')}。"
                     )
+                    self._start_focus_reference_check()
+                    self._schedule_focus_drift_check()
                 elif kind == "connect_failed":
                     self.connect_button.configure(state=NORMAL)
                 elif kind == "frames":
                     left, right = payload
                     self._display_frames(left, right)
+                elif kind == "quality_metrics":
+                    self._apply_quality_metrics(payload)
+                elif kind == "focus_reference_check":
+                    self._handle_focus_reference_check(payload)
+                elif kind == "epipolar_done":
+                    self._handle_epipolar_result(payload)
+                elif kind == "focus_ref_done":
+                    self.status_var.set(str(payload))
+                elif kind == "quality_report":
+                    self._apply_quality_report(payload)
+                elif kind == "calibration_board":
+                    self._apply_calibration_board(payload)
                 elif kind == "record_stats":
                     left, right = payload
                     self._update_stats(left, right)
@@ -2021,6 +2510,476 @@ class StereoCaptureOnlyApp:
         self.apply_wb_button.configure(state=state)
         self.apply_roi_button.configure(state=state)
         self.apply_trigger_button.configure(state=state)
+
+    def _ensure_quality_config_defaults(self) -> None:
+        self.config.setdefault("focus_roi", dict(DEFAULT_FOCUS_ROI))
+        self.config["focus_roi"] = clamp_roi_frac(self.config.get("focus_roi"))
+        self.config.setdefault("focus_method", "laplacian")
+        self.config.setdefault("focus_reference_score", None)
+        self.config.setdefault("focus_drift_check_interval_minutes", 30)
+        self.config.setdefault("focus_drift_warning_threshold", 0.15)
+        exposure_monitor = self.config.setdefault("exposure_monitor", {})
+        exposure_monitor.setdefault("zebra_enabled", False)
+        exposure_monitor.setdefault("histogram_enabled", True)
+        exposure_monitor.setdefault("snr_warning_threshold_db", 30)
+        calibration_check = self.config.setdefault("calibration_check", {})
+        calibration_check.setdefault("board_coverage_enabled", False)
+        calibration_check.setdefault("board_min_area_frac", 0.05)
+        calibration_check.setdefault("board_max_area_frac", 0.40)
+        calibration_check.setdefault("board_grid_rows", 3)
+        calibration_check.setdefault("board_grid_cols", 3)
+        calibration_check.setdefault("board_pattern_cols", 9)
+        calibration_check.setdefault("board_pattern_rows", 6)
+        quality_gate = self.config.setdefault("capture_quality_gate", {})
+        quality_gate.setdefault("enabled", True)
+        quality_gate.setdefault("strict_mode", False)
+        checks = quality_gate.setdefault("checks", {})
+        checks.setdefault("focus", True)
+        checks.setdefault("focus_consistency", True)
+        checks.setdefault("overexposure_max_pct", 5.0)
+        checks.setdefault("underexposure_max_pct", 5.0)
+        checks.setdefault("brightness_min", 40)
+        checks.setdefault("brightness_max", 220)
+
+    def _format_focus_roi(self) -> str:
+        roi = clamp_roi_frac(self.config.get("focus_roi"))
+        return f"ROI {roi['x_frac']:.2f},{roi['y_frac']:.2f},{roi['w_frac']:.2f},{roi['h_frac']:.2f}"
+
+    def _guide_mode_key(self) -> str:
+        value = self.guide_mode_var.get()
+        if value == "中心十字":
+            return "center"
+        if value == "全部网格线":
+            return "full"
+        return "off"
+
+    def _sync_quality_toggles(self) -> None:
+        exposure_monitor = self.config.setdefault("exposure_monitor", {})
+        exposure_monitor["zebra_enabled"] = bool(self.zebra_var.get())
+        exposure_monitor["histogram_enabled"] = bool(self.histogram_enabled_var.get())
+        self._focus_peaking_enabled_setting = bool(self.focus_peaking_var.get())
+        self._histogram_enabled_setting = bool(self.histogram_enabled_var.get())
+        save_config(self.config)
+        if hasattr(self, "left_pane"):
+            self._display_frames(self._last_left_frame_obj, self._last_right_frame_obj)
+
+    def _analyze_preview_frames(self, left: CameraFrame | None, right: CameraFrame | None, frame_index: int) -> dict[str, object]:
+        roi = clamp_roi_frac(self.config.get("focus_roi"))
+        method = str(self.config.get("focus_method", "laplacian"))
+        left_image = left.image if left is not None else None
+        right_image = right.image if right is not None else None
+        metrics: dict[str, object] = {
+            "focus": focus_pair_metrics(left_image, right_image, roi, method),
+            "focus_roi": roi,
+            "timestamp": time.time(),
+        }
+        update_histogram = self._histogram_enabled_setting and frame_index % 4 == 0
+        metrics["left_exposure"] = exposure_metrics(left_image, include_histogram=update_histogram)
+        metrics["right_exposure"] = exposure_metrics(right_image, include_histogram=update_histogram)
+        focus = metrics["focus"]
+        if self._focus_peaking_enabled_setting and isinstance(focus, dict):
+            score = float(focus.get("score") or 0.0)
+            previous = self._last_focus_overlay_score
+            changed = previous is None or previous <= 0 or abs(score - previous) / max(previous, 1.0) >= 0.05
+            if changed:
+                self._last_focus_overlay_left = make_focus_peaking_overlay(left_image) if left_image is not None else None
+                self._last_focus_overlay_right = make_focus_peaking_overlay(right_image) if right_image is not None else None
+                self._last_focus_overlay_score = score
+        elif not self._focus_peaking_enabled_setting:
+            self._last_focus_overlay_left = None
+            self._last_focus_overlay_right = None
+            self._last_focus_overlay_score = None
+        return metrics
+
+    def _apply_quality_metrics(self, metrics: object) -> None:
+        if not isinstance(metrics, dict):
+            return
+        now = time.perf_counter()
+        self._last_quality_metrics = metrics
+        if now - self._last_analysis_time < 0.20:
+            return
+        self._last_analysis_time = now
+        focus = metrics.get("focus")
+        if isinstance(focus, dict):
+            self._update_focus_display(focus)
+        left_exposure = metrics.get("left_exposure") if isinstance(metrics.get("left_exposure"), dict) else None
+        right_exposure = metrics.get("right_exposure") if isinstance(metrics.get("right_exposure"), dict) else None
+        self._update_exposure_display(left_exposure, right_exposure)
+        self._update_capture_gate_preview()
+
+    def _update_focus_display(self, focus: dict[str, object]) -> None:
+        score = float(focus.get("score") or 0.0)
+        left_score = focus.get("left")
+        right_score = focus.get("right")
+        delta = focus.get("delta")
+        reference = self.config.get("focus_reference_score")
+        if reference in (None, "") or float(reference) <= 0:
+            pct = 0.0
+            status = "未标定"
+            style = "Yellow.Horizontal.TProgressbar"
+            label_style = "Warn.TLabel"
+        else:
+            pct = min(max(score / max(float(reference), 1e-9) * 100.0, 0.0), 150.0)
+            if pct >= 80:
+                status = "对焦良好"
+                style = "Green.Horizontal.TProgressbar"
+                label_style = "Good.TLabel"
+            elif pct >= 40:
+                status = "对焦一般，建议微调"
+                style = "Yellow.Horizontal.TProgressbar"
+                label_style = "Warn.TLabel"
+            else:
+                status = "对焦不足，需重新对焦"
+                style = "Red.Horizontal.TProgressbar"
+                label_style = "Bad.TLabel"
+        self.focus_score_var.set(f"Focus {score:.1f}")
+        self.focus_progress.configure(value=min(pct, 100.0), style=style)
+        self.focus_status_var.set(status)
+        self.focus_status_label.configure(style=label_style)
+        l_text = "--" if left_score is None else f"{float(left_score):.1f}"
+        r_text = "--" if right_score is None else f"{float(right_score):.1f}"
+        d_text = "--" if delta is None else f"{float(delta):.1f}"
+        self.focus_detail_var.set(f"L: {l_text} | R: {r_text} | Δ: {d_text}")
+        consistency_warning = bool(focus.get("consistency_warning"))
+        self.focus_detail_label.configure(style="PanelBad.TLabel" if consistency_warning else "Panel.TLabel")
+        if consistency_warning:
+            self.focus_status_var.set("左右对焦不一致")
+            self.focus_status_label.configure(style="Bad.TLabel")
+
+    def _update_exposure_display(self, left_exposure: dict[str, object] | None, right_exposure: dict[str, object] | None) -> None:
+        exposures = [item for item in (left_exposure, right_exposure) if item]
+        if not exposures:
+            self.exposure_status_var.set("过曝: -- | 欠曝: -- | SNR: --")
+            return
+        over_pct = max(float(item.get("over_pct") or 0.0) for item in exposures)
+        under_pct = max(float(item.get("under_pct") or 0.0) for item in exposures)
+        snr_values = [float(item["snr_db"]) for item in exposures if item.get("snr_db") is not None]
+        snr_text = "无法估算"
+        snr_style = "PanelBad.TLabel"
+        if snr_values:
+            snr = min(snr_values)
+            snr_text = f"{snr:.1f}dB"
+            if snr > 40:
+                snr_style = "PanelGood.TLabel"
+            elif snr >= float(self.config.get("exposure_monitor", {}).get("snr_warning_threshold_db", 30)):
+                snr_style = "PanelWarn.TLabel"
+            else:
+                snr_style = "PanelBad.TLabel"
+        self.exposure_status_var.set(f"过曝: {over_pct:.1f}% | 欠曝: {under_pct:.1f}% | SNR: {snr_text}")
+        self.exposure_status_label.configure(style=snr_style)
+        advice = left_exposure.get("advice") if left_exposure else None
+        if not advice and right_exposure:
+            advice = right_exposure.get("advice")
+        gain_limit = config_float(self.config, "auto_gain_upper_limit", config_float(self.config, "gain", 0.0))
+        current_gain = config_float(self.config, "gain", 0.0)
+        if snr_values and current_gain > min(gain_limit, 6.0) and min(snr_values) < 30.0:
+            advice = "建议降低增益或增加光照"
+        self.exposure_advice_var.set(f"曝光建议: {advice or '--'}")
+        if self.histogram_enabled_var.get():
+            if left_exposure and left_exposure.get("histogram"):
+                self.left_hist_canvas.set_histogram(left_exposure.get("histogram"))
+            if right_exposure and right_exposure.get("histogram"):
+                self.right_hist_canvas.set_histogram(right_exposure.get("histogram"))
+
+    def _quality_report_from_metrics(self, metrics: dict[str, object] | None = None) -> dict[str, object]:
+        metrics = metrics or self._last_quality_metrics
+        gate = self.config.get("capture_quality_gate", {})
+        checks = gate.get("checks", {})
+        focus = metrics.get("focus") if isinstance(metrics, dict) else None
+        left_exposure = metrics.get("left_exposure") if isinstance(metrics, dict) else None
+        right_exposure = metrics.get("right_exposure") if isinstance(metrics, dict) else None
+        results: list[dict[str, object]] = []
+        if checks.get("focus", True):
+            reference = self.config.get("focus_reference_score")
+            score = float(focus.get("score") or 0.0) if isinstance(focus, dict) else 0.0
+            ok = True if reference in (None, "") or float(reference) <= 0 else score >= float(reference) * 0.40
+            results.append({"name": "对焦", "ok": ok, "detail": f"{score:.1f}"})
+        if checks.get("focus_consistency", True):
+            warning = bool(focus.get("consistency_warning")) if isinstance(focus, dict) else False
+            results.append({"name": "左右一致", "ok": not warning, "detail": ""})
+        exposures = [item for item in (left_exposure, right_exposure) if isinstance(item, dict)]
+        if exposures:
+            over_pct = max(float(item.get("over_pct") or 0.0) for item in exposures)
+            under_pct = max(float(item.get("under_pct") or 0.0) for item in exposures)
+            mean = float(np.mean([float(item.get("mean") or 0.0) for item in exposures]))
+        else:
+            over_pct = under_pct = mean = 0.0
+        results.append(
+            {
+                "name": "过曝",
+                "ok": over_pct <= float(checks.get("overexposure_max_pct", 5.0)),
+                "detail": f"{over_pct:.1f}%",
+            }
+        )
+        results.append(
+            {
+                "name": "欠曝",
+                "ok": under_pct <= float(checks.get("underexposure_max_pct", 5.0)),
+                "detail": f"{under_pct:.1f}%",
+            }
+        )
+        brightness_ok = float(checks.get("brightness_min", 40)) <= mean <= float(checks.get("brightness_max", 220))
+        results.append({"name": "亮度", "ok": brightness_ok, "detail": f"{mean:.1f}"})
+        results.append({"name": "相机连接", "ok": self.camera_system is not None and self._connected_camera_count() > 0, "detail": ""})
+        passed = sum(1 for item in results if item["ok"])
+        failed = len(results) - passed
+        text_parts = [f"{'✓' if item['ok'] else '✗'} {item['name']}{item['detail'] if item['detail'] else ''}" for item in results]
+        return {
+            "results": results,
+            "passed": passed,
+            "failed": failed,
+            "ok": failed == 0,
+            "text": " | ".join(text_parts) + f" | {passed}/{len(results)} 通过",
+        }
+
+    def _update_capture_gate_preview(self) -> None:
+        report = self._quality_report_from_metrics()
+        self._apply_quality_report(report)
+
+    def _apply_quality_report(self, report: object) -> None:
+        if not isinstance(report, dict):
+            return
+        self.capture_gate_var.set(f"采集检查: {report.get('text', '--')}")
+
+    def _apply_calibration_board(self, board: object) -> None:
+        if not isinstance(board, dict):
+            return
+        area = float(board.get("area_frac") or 0.0) * 100.0
+        grid_icon = str(board.get("grid_icon") or "")
+        suffix = f" | {grid_icon.replace(chr(10), '/')}" if grid_icon else ""
+        self.calibration_status_var.set(
+            f"标定板覆盖: {area:.1f}% | 位置: {board.get('position', '--')} | {board.get('suggestion', '--')}{suffix}"
+        )
+
+    def set_focus_reference(self) -> None:
+        focus = self._last_quality_metrics.get("focus") if isinstance(self._last_quality_metrics, dict) else None
+        if not isinstance(focus, dict) or float(focus.get("score") or 0.0) <= 0:
+            self.status_var.set("暂无可用对焦分数，请先开启预览并对准目标。")
+            return
+        score = float(focus.get("score") or 0.0)
+        self.config["focus_reference_score"] = score
+        save_config(self.config)
+        self.status_var.set(f"已设为对焦目标：{score:.1f}")
+        self._update_focus_display(focus)
+
+    def save_focus_reference_snapshot(self) -> None:
+        left = self._last_left_frame_obj
+        right = self._last_right_frame_obj
+        if left is None and right is None:
+            self.status_var.set("暂无可保存的对焦基准帧，请先开启预览。")
+            return
+        focus = focus_pair_metrics(
+            left.image if left is not None else None,
+            right.image if right is not None else None,
+            self.config.get("focus_roi"),
+            str(self.config.get("focus_method", "laplacian")),
+        )
+        score = float(focus.get("score") or 0.0)
+        self.config["focus_reference_score"] = score
+        save_config(self.config)
+        root = resolve_output_root(self.config) / "focus_refs"
+        root.mkdir(parents=True, exist_ok=True)
+        capture_id = timestamp_ms()
+        ext = image_extension(self.config)
+        if left is not None:
+            self._save_image(left.image, root / f"focus_ref_{capture_id}_left.{ext}")
+        if right is not None:
+            self._save_image(right.image, root / f"focus_ref_{capture_id}_right.{ext}")
+        self._update_focus_display(focus)
+        self.status_var.set(f"已保存对焦基准：{score:.1f}")
+
+    def _start_focus_reference_check(self) -> None:
+        reference = self.config.get("focus_reference_score")
+        if reference in (None, "") or float(reference) <= 0 or self.camera_system is None:
+            return
+
+        def worker() -> None:
+            try:
+                assert self.camera_system is not None
+                left, right, _trigger_time = self.camera_system.capture_pair()
+                focus = focus_pair_metrics(
+                    left.image if left is not None else None,
+                    right.image if right is not None else None,
+                    self.config.get("focus_roi"),
+                    str(self.config.get("focus_method", "laplacian")),
+                )
+                self.ui_queue.put(("focus_reference_check", focus))
+            except Exception as exc:
+                self.ui_queue.put(("status", f"对焦启动检查未完成：{exc}"))
+
+        threading.Thread(target=worker, daemon=True).start()
+
+    def _handle_focus_reference_check(self, focus: object) -> None:
+        if not isinstance(focus, dict):
+            return
+        reference = self.config.get("focus_reference_score")
+        if reference in (None, "") or float(reference) <= 0:
+            return
+        score = float(focus.get("score") or 0.0)
+        deviation = abs(score - float(reference)) / max(float(reference), 1e-9)
+        if deviation > 0.20 and score != self._last_reference_warning_score:
+            self._last_reference_warning_score = score
+            messagebox.showwarning("对焦偏移提醒", "检测到对焦可能偏移，建议重新对焦并更新基准")
+
+    def _schedule_focus_drift_check(self) -> None:
+        if self._focus_drift_timer is not None:
+            self._focus_drift_timer.cancel()
+            self._focus_drift_timer = None
+        minutes = max(config_float(self.config, "focus_drift_check_interval_minutes", 30.0), 1.0)
+        self._focus_drift_timer = threading.Timer(minutes * 60.0, self._focus_drift_timer_worker)
+        self._focus_drift_timer.daemon = True
+        self._focus_drift_timer.start()
+
+    def _focus_drift_timer_worker(self) -> None:
+        try:
+            reference = self.config.get("focus_reference_score")
+            if reference not in (None, "") and float(reference) > 0 and self.camera_system is not None and not self.recording:
+                left, right, _trigger_time = self.camera_system.capture_pair()
+                focus = focus_pair_metrics(
+                    left.image if left is not None else None,
+                    right.image if right is not None else None,
+                    self.config.get("focus_roi"),
+                    str(self.config.get("focus_method", "laplacian")),
+                )
+                score = float(focus.get("score") or 0.0)
+                threshold = config_float(self.config, "focus_drift_warning_threshold", 0.15)
+                deviation = abs(score - float(reference)) / max(float(reference), 1e-9)
+                if deviation > threshold:
+                    self._focus_drift_warning_text = f"对焦漂移 {deviation * 100:.0f}%：建议重新对焦"
+                    self.ui_queue.put(("status", self._focus_drift_warning_text))
+        except Exception as exc:
+            self.ui_queue.put(("status", f"对焦漂移检查未完成：{exc}"))
+        finally:
+            if self.camera_system is not None:
+                self._schedule_focus_drift_check()
+
+    def run_epipolar_check(self) -> None:
+        left = self._clone_frame(self._last_left_frame_obj)
+        right = self._clone_frame(self._last_right_frame_obj)
+        if left is None or right is None:
+            self.status_var.set("需要左右两路预览帧才能执行极线对准检查。")
+            return
+        self.epipolar_status_var.set("极线偏差: 正在检查...")
+
+        def worker() -> None:
+            result = epipolar_alignment(left.image, right.image)
+            self.ui_queue.put(("epipolar_done", result))
+
+        threading.Thread(target=worker, daemon=True).start()
+
+    def _handle_epipolar_result(self, result: object) -> None:
+        if not isinstance(result, dict):
+            return
+        message = str(result.get("message", "极线偏差: --"))
+        if result.get("ok") and result.get("match_count"):
+            message += f" | 匹配点 {result.get('match_count')}"
+        self.epipolar_status_var.set(message)
+        self.epipolar_label.configure(style="PanelBad.TLabel" if result.get("warning") else "PanelGood.TLabel")
+        if result.get("warning"):
+            self.status_var.set("相机可能存在旋转偏差，请调整后重新采图")
+
+    def _on_magnifier_motion(self, event) -> None:
+        if not self.magnifier_enabled_var.get() or self._magnifier_locked:
+            return
+        roi = self._canvas_point_to_magnifier_roi(event.x, event.y)
+        if roi is not None:
+            self._magnifier_roi_frac = roi
+            self.config["focus_roi"] = roi
+            self.focus_roi_var.set(self._format_focus_roi())
+            self._update_magnifier()
+
+    def _on_magnifier_click(self, event) -> None:
+        if not self.magnifier_enabled_var.get() or self.roi_editing:
+            return
+        roi = self._canvas_point_to_magnifier_roi(event.x, event.y)
+        if roi is not None:
+            self._magnifier_roi_frac = roi
+            self.config["focus_roi"] = roi
+            save_config(self.config)
+            self.focus_roi_var.set(self._format_focus_roi())
+            self._magnifier_locked = not self._magnifier_locked
+            self._update_magnifier()
+
+    def _on_magnifier_wheel(self, event) -> None:
+        if not self.magnifier_enabled_var.get():
+            return
+        values = [1, 2, 4]
+        index = values.index(self._magnifier_zoom) if self._magnifier_zoom in values else 0
+        if event.delta > 0:
+            index = min(index + 1, len(values) - 1)
+        else:
+            index = max(index - 1, 0)
+        self._magnifier_zoom = values[index]
+        self._update_magnifier()
+
+    def _canvas_point_to_magnifier_roi(self, x: int, y: int) -> dict[str, float] | None:
+        pane = self.left_pane
+        if pane._last_image is None or pane._render_bounds is None or not pane._point_inside_rendered_image(x, y):
+            return None
+        left, top, display_width, display_height = pane._render_bounds
+        image_width, image_height = pane._last_image.size
+        image_x = int(round((x - left) * image_width / display_width))
+        image_y = int(round((y - top) * image_height / display_height))
+        box_w = min(200, image_width)
+        box_h = min(200, image_height)
+        x0 = min(max(image_x - box_w // 2, 0), max(image_width - box_w, 0))
+        y0 = min(max(image_y - box_h // 2, 0), max(image_height - box_h, 0))
+        return roi_from_pixels(x0, y0, box_w, box_h, image_width, image_height)
+
+    def _update_magnifier(self) -> None:
+        if not hasattr(self, "magnifier_canvas"):
+            return
+        self.magnifier_canvas.delete("all")
+        if not self.magnifier_enabled_var.get() or self._last_left_frame_obj is None:
+            self.magnifier_canvas.create_text(120, 90, text="未开启", fill="#777777", anchor="center")
+            return
+        image = self._last_left_frame_obj.image
+        roi = clamp_roi_frac(self._magnifier_roi_frac)
+        x = int(roi["x_frac"] * image.width)
+        y = int(roi["y_frac"] * image.height)
+        w = max(1, int(roi["w_frac"] * image.width))
+        h = max(1, int(roi["h_frac"] * image.height))
+        crop = image.crop((x, y, min(x + w, image.width), min(y + h, image.height))).convert("RGB")
+        if self._magnifier_zoom > 1:
+            crop = crop.resize((crop.width * self._magnifier_zoom, crop.height * self._magnifier_zoom), Image.Resampling.NEAREST)
+        canvas_w = max(self.magnifier_canvas.winfo_width(), 120)
+        canvas_h = max(self.magnifier_canvas.winfo_height(), 80)
+        preview = crop.copy()
+        preview.thumbnail((canvas_w, canvas_h), Image.Resampling.NEAREST)
+        self._magnifier_image_ref = ImageTk.PhotoImage(preview)
+        self.magnifier_canvas.create_image(canvas_w // 2, canvas_h // 2, image=self._magnifier_image_ref, anchor="center")
+        lock_text = "锁定" if self._magnifier_locked else "跟随"
+        self.magnifier_info_var.set(f"倍率 {self._magnifier_zoom * 100}% | {lock_text}")
+
+    def _capture_quality_gate_allows(self, metrics: dict[str, object] | None = None) -> tuple[bool, dict[str, object]]:
+        gate = self.config.get("capture_quality_gate", {})
+        if not bool(gate.get("enabled", True)):
+            return True, {"ok": True, "text": "采集检查已关闭"}
+        report = self._quality_report_from_metrics(metrics)
+        strict = bool(gate.get("strict_mode", False))
+        if report["ok"] or not strict:
+            return True, report
+        failed_names = [str(item["name"]) for item in report["results"] if not item["ok"]]
+        allow = messagebox.askyesno("采集质量检查", f"{'、'.join(failed_names)} 未通过，是否仍要采集？")
+        return allow, report
+
+    def _quality_metrics_for_pair(self, left: CameraFrame | None, right: CameraFrame | None) -> dict[str, object]:
+        metrics = self._analyze_preview_frames(left, right, self._preview_frame_counter + 1)
+        self._last_quality_metrics = metrics
+        calibration_cfg = self.config.get("calibration_check", {})
+        if bool(calibration_cfg.get("board_coverage_enabled", False)):
+            board = calibration_board_coverage(left.image if left is not None else None, calibration_cfg)
+            metrics["calibration_board"] = board
+            if board is not None:
+                self.ui_queue.put(("calibration_board", board))
+                area = float(board.get("area_frac") or 0.0) * 100.0
+                self.ui_queue.put(
+                    (
+                        "status",
+                        f"标定板覆盖: {area:.1f}% | 位置: {board.get('position')} | {board.get('suggestion')}",
+                    )
+                )
+        return metrics
 
     def _current_parameter_config(self) -> dict:
         width = optional_int_text(self.roi_width_var.get()) or CAPTURE_WIDTH
@@ -2432,6 +3391,7 @@ class StereoCaptureOnlyApp:
         right: CameraFrame | None,
         trigger_time: float,
         mode: str,
+        quality_report: dict[str, object] | None = None,
     ) -> Path:
         capture_id = timestamp_ms()
         photo_root = resolve_output_root(self.config) / "photos"
@@ -2454,6 +3414,11 @@ class StereoCaptureOnlyApp:
             right_dir.mkdir(parents=True, exist_ok=True)
             self._save_image(right.image, group_right)
             self._save_image(right.image, right_path)
+        quality_metrics = self._quality_metrics_for_pair(left, right)
+        focus = quality_metrics.get("focus") if isinstance(quality_metrics.get("focus"), dict) else {}
+        left_exposure = quality_metrics.get("left_exposure") if isinstance(quality_metrics.get("left_exposure"), dict) else None
+        right_exposure = quality_metrics.get("right_exposure") if isinstance(quality_metrics.get("right_exposure"), dict) else None
+        calibration_board = quality_metrics.get("calibration_board")
         self._write_meta(
             group_dir / "meta.json",
             mode=mode,
@@ -2465,6 +3430,14 @@ class StereoCaptureOnlyApp:
             right_path=str(right_path) if right is not None else None,
             group_left_path=str(group_left) if left is not None else None,
             group_right_path=str(group_right) if right is not None else None,
+            focus_left=focus.get("left"),
+            focus_right=focus.get("right"),
+            focus_score=focus.get("score"),
+            focus_consistency_warning=bool(focus.get("consistency_warning")),
+            exposure_left=self._meta_exposure(left_exposure),
+            exposure_right=self._meta_exposure(right_exposure),
+            calibration_board=calibration_board,
+            capture_quality_report=quality_report or self._quality_report_from_metrics(quality_metrics),
         )
         return group_dir
 
@@ -2479,6 +3452,17 @@ class StereoCaptureOnlyApp:
             image.save(path, format="PNG")
         else:
             image.save(path, format="BMP")
+
+    def _meta_exposure(self, exposure: dict[str, object] | None) -> dict[str, object] | None:
+        if exposure is None:
+            return None
+        return {
+            "mean": exposure.get("mean"),
+            "over_pct": exposure.get("over_pct"),
+            "under_pct": exposure.get("under_pct"),
+            "snr_db": exposure.get("snr_db"),
+            "advice": exposure.get("advice"),
+        }
 
     def _write_meta(self, path: Path, **data) -> None:
         payload = dict(data)
@@ -2512,6 +3496,9 @@ class StereoCaptureOnlyApp:
         self.recording = False
         self.interval_capturing = False
         self.interval_stop_event.set()
+        if self._focus_drift_timer is not None:
+            self._focus_drift_timer.cancel()
+            self._focus_drift_timer = None
         if hasattr(self, "left_pane") and hasattr(self, "right_pane"):
             self._set_recording_indicator(False)
         if self.preview_thread and self.preview_thread.is_alive():

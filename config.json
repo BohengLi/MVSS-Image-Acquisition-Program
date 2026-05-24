@@ -79,5 +79,39 @@
       "roi_offset_x": 0,
       "roi_offset_y": 0
     }
+  },
+  "focus_roi": {
+    "x_frac": 0.3,
+    "y_frac": 0.3,
+    "w_frac": 0.4,
+    "h_frac": 0.4
+  },
+  "focus_method": "laplacian",
+  "focus_reference_score": null,
+  "focus_drift_check_interval_minutes": 30,
+  "focus_drift_warning_threshold": 0.15,
+  "exposure_monitor": {
+    "zebra_enabled": false,
+    "histogram_enabled": true,
+    "snr_warning_threshold_db": 30
+  },
+  "calibration_check": {
+    "board_coverage_enabled": false,
+    "board_min_area_frac": 0.05,
+    "board_max_area_frac": 0.4,
+    "board_grid_rows": 3,
+    "board_grid_cols": 3
+  },
+  "capture_quality_gate": {
+    "enabled": true,
+    "strict_mode": false,
+    "checks": {
+      "focus": true,
+      "focus_consistency": true,
+      "overexposure_max_pct": 5.0,
+      "underexposure_max_pct": 5.0,
+      "brightness_min": 40,
+      "brightness_max": 220
+    }
   }
 }
