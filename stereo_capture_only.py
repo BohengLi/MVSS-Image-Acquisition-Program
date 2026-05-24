@@ -806,7 +806,7 @@ class StereoCaptureOnlyApp:
         self.focus_roi_editing = False
         self._last_device_status = "尚未刷新设备。"
         self._last_video_sides: list[str] = []
-        self._last_quality_metrics: dict[str, object] = {}
+        self._last_quality_metrics: dict[str, object] | None = None
         self._last_left_frame_obj: CameraFrame | None = None
         self._last_right_frame_obj: CameraFrame | None = None
         self._last_analysis_time = 0.0
@@ -1417,6 +1417,7 @@ class StereoCaptureOnlyApp:
         if self.camera_system is None:
             return
         self._reset_stats()
+        self._last_quality_metrics = None
         self.previewing = True
         self.preview_button.configure(text="停止采集")
         self.status_var.set("实时采集中。鼠标左键拖动画面平移，滚轮缩放；需要框选 ROI 时点击“修改ROI”。")
@@ -1426,6 +1427,7 @@ class StereoCaptureOnlyApp:
         self._start_preview_thread()
 
     def stop_preview(self) -> None:
+        self._last_quality_metrics = None
         if self.recording or self.interval_capturing:
             self.previewing = False
             self.preview_button.configure(text="开始采集")
@@ -1484,11 +1486,6 @@ class StereoCaptureOnlyApp:
     def capture_photo(self) -> None:
         if self.camera_system is None or self.interval_capturing:
             return
-        allow_capture, quality_report = self._capture_quality_gate_allows()
-        self._apply_quality_report(quality_report)
-        if not allow_capture:
-            self.status_var.set("采集已取消：质量检查未通过。")
-            return
         self.photo_button.configure(state=DISABLED)
         if self.recording:
             with self._record_last_frame_lock:
@@ -1500,6 +1497,13 @@ class StereoCaptureOnlyApp:
             left, right, trigger_time = latest
             left_copy = self._clone_frame(left)
             right_copy = self._clone_frame(right)
+            metrics = self._quality_metrics_for_pair(left_copy, right_copy)
+            allow_capture, quality_report = self._capture_quality_gate_allows(metrics)
+            self._apply_quality_report(quality_report)
+            if not allow_capture:
+                self.status_var.set("采集已取消：质量检查未通过。")
+                self.photo_button.configure(state=NORMAL)
+                return
             self.status_var.set("正在从录像原始帧保存同步快照...")
 
             def record_snapshot_worker() -> None:
@@ -1528,13 +1532,36 @@ class StereoCaptureOnlyApp:
         else:
             self.status_var.set("正在同步拍照...")
 
+        metrics = self._last_quality_metrics if isinstance(self._last_quality_metrics, dict) else None
+        if not metrics:
+            self.status_var.set("正在获取现场质量检查帧...")
+
+            def precheck_worker() -> None:
+                try:
+                    left, right, trigger_time = self.camera_system.capture_pair()
+                    metrics = self._quality_metrics_for_pair(left, right)
+                    self.ui_queue.put(("photo_quality_prefetched", (left, right, trigger_time, metrics)))
+                except Exception as exc:
+                    self.ui_queue.put(("error", exc))
+                    self.ui_queue.put(("capture_idle", None))
+
+            threading.Thread(target=precheck_worker, daemon=True).start()
+            return
+
+        allow_capture, quality_report = self._capture_quality_gate_allows(metrics)
+        self._apply_quality_report(quality_report)
+        if not allow_capture:
+            self.status_var.set("采集已取消：质量检查未通过。")
+            self._set_capture_buttons(NORMAL)
+            return
+
         def worker() -> None:
             try:
                 left, right, trigger_time = self.camera_system.capture_pair()
-                metrics = self._quality_metrics_for_pair(left, right)
-                report = self._quality_report_from_metrics(metrics)
-                self.ui_queue.put(("quality_report", report))
-                photo_dir = self._save_photo_pair(left, right, trigger_time, mode="photo", quality_report=report)
+                fresh_metrics = self._quality_metrics_for_pair(left, right)
+                fresh_report = self._quality_report_from_metrics(fresh_metrics)
+                self.ui_queue.put(("quality_report", fresh_report))
+                photo_dir = self._save_photo_pair(left, right, trigger_time, mode="photo", quality_report=fresh_report)
                 if self.previewing:
                     self.ui_queue.put(("frames", (left, right)))
                 self.ui_queue.put(("shutter_flash", None))
@@ -1706,72 +1733,8 @@ class StereoCaptureOnlyApp:
         self.status_var.set("正在停止录像并整理文件...")
 
     def _record_loop(self) -> None:
+        """录制主循环（转入 V2 录制引擎）。"""
         self._record_loop_v2()
-        return
-        assert self.camera_system is not None
-        assert self.record_dir is not None
-        fps = max(float(self.config.get("record_fps", 5.0)), 0.1)
-        interval = 1.0 / fps
-        meta_frames = []
-        next_time = time.perf_counter()
-        writers: dict[str, cv2.VideoWriter] = {}
-        video_paths = {
-            "left": self.record_dir / "left.mp4",
-            "right": self.record_dir / "right.mp4",
-        }
-
-        try:
-            while self.recording:
-                loop_start = time.perf_counter()
-                left, right, trigger_time = self.camera_system.capture_pair()
-                self.record_count += 1
-                for side, frame in (("left", left), ("right", right)):
-                    if frame is None:
-                        continue
-                    if side not in writers:
-                        writers[side] = self._create_video_writer(video_paths[side], fps, frame.image)
-                    writers[side].write(self._image_to_video_frame(frame.image))
-                meta_frames.append(
-                    {
-                        "index": self.record_count,
-                        "trigger_time": trigger_time,
-                        "left_frame": self._frame_meta(left) if left is not None else None,
-                        "right_frame": self._frame_meta(right) if right is not None else None,
-                    }
-                )
-                if self.previewing:
-                    self.ui_queue.put(("frames", (left, right)))
-                self.ui_queue.put(("status", self._status_with_stats(f"录像中：已保存 {self.record_count} 组，目标 {fps:g} fps")))
-
-                next_time += interval
-                sleep_s = next_time - time.perf_counter()
-                if sleep_s > 0:
-                    time.sleep(sleep_s)
-                elif time.perf_counter() - loop_start > interval * 2:
-                    next_time = time.perf_counter()
-        except Exception as exc:
-            self.ui_queue.put(("error", exc))
-        finally:
-            for writer in writers.values():
-                writer.release()
-            record_dir = self.record_dir
-            if record_dir is not None:
-                generated_video_names = [video_paths[side].name for side in ("left", "right") if side in writers]
-                meta = {
-                    "mode": "video",
-                    "fps": fps,
-                    "frame_count": self.record_count,
-                    "video_format": "mp4",
-                    "left_video": str(video_paths["left"]) if "left" in writers else None,
-                    "right_video": str(video_paths["right"]) if "right" in writers else None,
-                    "pixel_format": self.config.get("pixel_format", "Mono8"),
-                    "left_camera": asdict(self.camera_system.left_info) if self.camera_system.left_info else None,
-                    "right_camera": asdict(self.camera_system.right_info) if self.camera_system.right_info else None,
-                    "frames": meta_frames,
-                }
-                with (record_dir / "meta.json").open("w", encoding="utf-8") as fh:
-                    json.dump(meta, fh, ensure_ascii=False, indent=2)
-                self.ui_queue.put(("record_done", (record_dir, generated_video_names)))
 
     def _create_video_writer(self, path: Path, fps: float, image: Image.Image) -> cv2.VideoWriter:
         width, height = image.size
@@ -2401,6 +2364,8 @@ class StereoCaptureOnlyApp:
                     self._apply_quality_report(payload)
                 elif kind == "calibration_board":
                     self._apply_calibration_board(payload)
+                elif kind == "photo_quality_prefetched":
+                    self._handle_photo_quality_prefetched(payload)
                 elif kind == "record_stats":
                     left, right = payload
                     self._update_stats(left, right)
@@ -2682,7 +2647,16 @@ class StereoCaptureOnlyApp:
                 self.right_hist_canvas.set_histogram(right_exposure.get("histogram"))
 
     def _quality_report_from_metrics(self, metrics: dict[str, object] | None = None) -> dict[str, object]:
-        metrics = metrics or self._last_quality_metrics
+        if metrics is None:
+            metrics = self._last_quality_metrics
+        if not isinstance(metrics, dict) or not metrics:
+            return {
+                "results": [],
+                "passed": 0,
+                "failed": 0,
+                "ok": True,
+                "text": "暂无实时质量数据",
+            }
         gate = self.config.get("capture_quality_gate", {})
         checks = gate.get("checks", {})
         focus = metrics.get("focus") if isinstance(metrics, dict) else None
@@ -2750,6 +2724,36 @@ class StereoCaptureOnlyApp:
         self.calibration_status_var.set(
             f"标定板覆盖: {area:.1f}% | 位置: {board.get('position', '--')} | {board.get('suggestion', '--')}{suffix}"
         )
+
+    def _handle_photo_quality_prefetched(self, payload: object) -> None:
+        if not isinstance(payload, tuple) or len(payload) != 4:
+            self._set_capture_buttons(NORMAL)
+            return
+        left, right, trigger_time, metrics = payload
+        if not isinstance(metrics, dict):
+            self._set_capture_buttons(NORMAL)
+            return
+        allow_capture, quality_report = self._capture_quality_gate_allows(metrics)
+        self._apply_quality_report(quality_report)
+        if not allow_capture:
+            self.status_var.set("采集已取消：质量检查未通过。")
+            self._set_capture_buttons(NORMAL)
+            return
+        self.status_var.set("质量检查通过，正在保存现场采样帧...")
+
+        def worker() -> None:
+            try:
+                photo_dir = self._save_photo_pair(left, right, trigger_time, mode="photo", quality_report=quality_report)
+                if self.previewing:
+                    self.ui_queue.put(("frames", (left, right)))
+                self.ui_queue.put(("shutter_flash", None))
+                self.ui_queue.put(("photo_done", photo_dir))
+            except Exception as exc:
+                self.ui_queue.put(("error", exc))
+            finally:
+                self.ui_queue.put(("capture_idle", None))
+
+        threading.Thread(target=worker, daemon=True).start()
 
     def set_focus_reference(self) -> None:
         focus = self._last_quality_metrics.get("focus") if isinstance(self._last_quality_metrics, dict) else None
