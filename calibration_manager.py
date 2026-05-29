@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import logging
 from collections import OrderedDict
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -10,6 +11,8 @@ import cv2
 import numpy as np
 from PIL import Image, ImageDraw
 
+
+LOGGER = logging.getLogger("mvss_capture")
 
 MATRIX_KEYS = (
     "K",
@@ -76,17 +79,18 @@ def _read_cv_node_matrix(fs: cv2.FileStorage, key: str) -> np.ndarray | None:
         mat = node.mat()
         if mat is not None:
             return np.asarray(mat, dtype=float)
-    except Exception:
-        pass
+    except Exception as exc:
+        LOGGER.debug("Failed to read calibration matrix node %s via mat(): %s", key, exc, exc_info=True)
     try:
         if node.isSeq():
             values = [node.at(i).real() for i in range(node.size())]
             return np.asarray(values, dtype=float)
-    except Exception:
-        pass
+    except Exception as exc:
+        LOGGER.debug("Failed to read calibration matrix node %s via sequence: %s", key, exc, exc_info=True)
     try:
         return np.asarray([node.real()], dtype=float)
-    except Exception:
+    except Exception as exc:
+        LOGGER.debug("Failed to read calibration matrix node %s via scalar fallback: %s", key, exc, exc_info=True)
         return None
 
 
@@ -96,7 +100,8 @@ def _read_cv_node_scalar(fs: cv2.FileStorage, key: str) -> float | None:
         return None
     try:
         return float(node.real())
-    except Exception:
+    except Exception as exc:
+        LOGGER.debug("Failed to read calibration scalar node %s: %s", key, exc, exc_info=True)
         return None
 
 
@@ -356,6 +361,7 @@ def load_stereo_calibration(config: dict[str, Any], base_dir: Path) -> StereoCal
             loaded[name] = _load_calibration_file(path)
         except Exception as exc:
             calibration.warnings.append(f"{name} load failed: {exc}")
+            LOGGER.warning("Calibration file %s failed to load from %s: %s", name, path, exc, exc_info=True)
 
     left = loaded.get("left_intrinsics", {})
     right = loaded.get("right_intrinsics", {})

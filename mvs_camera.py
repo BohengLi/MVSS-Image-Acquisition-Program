@@ -20,6 +20,7 @@ _DLL_DIRECTORIES: list[Any] = []
 LOGGER = logging.getLogger("mvss_capture")
 _MVS_IMPORT_ATTEMPTS = 3
 _MVS_IMPORT_RETRY_DELAY_SECONDS = 0.4
+_SDK_LOCK = threading.Lock()
 
 
 class MvsError(RuntimeError):
@@ -159,7 +160,8 @@ def _load_mvs_imports():
             last_exc = exc
             if attempt < _MVS_IMPORT_ATTEMPTS:
                 time.sleep(_MVS_IMPORT_RETRY_DELAY_SECONDS)
-    assert last_exc is not None
+    if last_exc is None:
+        last_exc = RuntimeError("unknown MVS SDK import failure")
     raise MvsError(_mvs_import_error_message(last_exc)) from last_exc
 
 
@@ -168,8 +170,9 @@ SDK: dict[str, Any] | None = None
 
 def sdk() -> dict[str, Any]:
     global SDK
-    if SDK is None:
-        SDK = _load_mvs_imports()
+    with _SDK_LOCK:
+        if SDK is None:
+            SDK = _load_mvs_imports()
     return SDK
 
 
@@ -363,10 +366,12 @@ class MvsCamera:
         self._device_info = cast(device_list.pDeviceInfo[info.index], POINTER(s["MV_CC_DEVICE_INFO"])).contents
         self._cam = s["MvCamera"]()
         self._payload_size = 0
+        self._payload_lock = threading.Lock()
         self._grab_lock = threading.Lock()
         self._opened = False
         self._grabbing = False
         self._float_node_cache: dict[tuple[str, ...], str] = {}
+        self._float_node_cache_lock = threading.Lock()
 
     def open(self) -> None:
         s = sdk()
@@ -422,7 +427,7 @@ class MvsCamera:
             balance_ratio_blue,
         )
 
-        self._payload_size = self._get_int("PayloadSize")
+        self._set_payload_size(self._get_int("PayloadSize"))
 
     def apply_trigger_settings(self, trigger_source: str) -> list[str]:
         source = self._normalize_trigger_source(trigger_source)
@@ -565,9 +570,9 @@ class MvsCamera:
             if offset_y >= 0 and not self._try_set_int("OffsetY", offset_y):
                 warnings.append(f"{self.info.label}: OffsetY={offset_y} 设置失败")
             try:
-                self._payload_size = self._get_int("PayloadSize")
-            except MvsError:
-                pass
+                self._set_payload_size(self._get_int("PayloadSize"))
+            except MvsError as exc:
+                LOGGER.debug("%s: failed to refresh PayloadSize after ROI update: %s", self.info.label, exc, exc_info=True)
         except BaseException:
             roi_failed = True
             raise
@@ -702,15 +707,26 @@ class MvsCamera:
             )
         )
 
+    def _set_payload_size(self, payload_size: int) -> None:
+        with self._payload_lock:
+            self._payload_size = int(payload_size)
+
+    def _payload_size_snapshot(self) -> int:
+        with self._payload_lock:
+            payload_size = self._payload_size
+            if payload_size <= 0:
+                payload_size = self._get_int("PayloadSize")
+                self._payload_size = payload_size
+            return payload_size
+
     def grab_frame(self, timeout_ms: int) -> Frame:
         s = sdk()
         with self._grab_lock:
-            if self._payload_size <= 0:
-                self._payload_size = self._get_int("PayloadSize")
-            raw_buffer = (c_ubyte * self._payload_size)()
+            payload_size = self._payload_size_snapshot()
+            raw_buffer = (c_ubyte * payload_size)()
             frame_info = s["MV_FRAME_OUT_INFO_EX"]()
             memset(byref(frame_info), 0, sizeof(frame_info))
-            ret = self._cam.MV_CC_GetOneFrameTimeout(raw_buffer, self._payload_size, frame_info, timeout_ms)
+            ret = self._cam.MV_CC_GetOneFrameTimeout(raw_buffer, payload_size, frame_info, timeout_ms)
             if ret != 0:
                 if ret == 0x80000007:
                     raise FrameTimeoutError(f"{self.info.label} 等待图像超时: 0x{ret:08x}")
@@ -806,14 +822,16 @@ class MvsCamera:
     def _try_set_enum(self, key: str, value: int) -> bool:
         try:
             return self._cam.MV_CC_SetEnumValue(key, int(value)) == 0
-        except Exception:
+        except Exception as exc:
+            LOGGER.debug("%s: exception while probing enum node %s=%s: %s", self.info.label, key, value, exc, exc_info=True)
             return False
 
     def _try_set_enum_by_string(self, key: str, value: str) -> bool:
         try:
             ret = self._cam.MV_CC_SetEnumValueByString(key, value)
             return ret == 0
-        except Exception:
+        except Exception as exc:
+            LOGGER.debug("%s: exception while probing enum node %s=%s: %s", self.info.label, key, value, exc, exc_info=True)
             return False
 
     def _set_float(self, key: str, value: float) -> None:
@@ -824,19 +842,24 @@ class MvsCamera:
     def _try_set_float(self, key: str, value: float) -> bool:
         try:
             return self._cam.MV_CC_SetFloatValue(key, float(value)) == 0
-        except Exception:
+        except Exception as exc:
+            LOGGER.debug("%s: exception while probing float node %s=%s: %s", self.info.label, key, value, exc, exc_info=True)
             return False
 
     def _try_set_float_any(self, keys: tuple[str, ...], value: float) -> bool:
-        cached_key = self._float_node_cache.get(keys)
+        with self._float_node_cache_lock:
+            cached_key = self._float_node_cache.get(keys)
         if cached_key is not None:
             if self._try_set_float(cached_key, value):
                 return True
-            self._float_node_cache.pop(keys, None)
+            with self._float_node_cache_lock:
+                if self._float_node_cache.get(keys) == cached_key:
+                    self._float_node_cache.pop(keys, None)
 
         for key in keys:
             if self._try_set_float(key, value):
-                self._float_node_cache[keys] = key
+                with self._float_node_cache_lock:
+                    self._float_node_cache[keys] = key
                 return True
         return False
 
@@ -849,8 +872,8 @@ class MvsCamera:
                 ret = self._cam.MV_CC_GetFloatValue(key, value)
                 if ret == 0 and hasattr(value, "fCurValue"):
                     return float(value.fCurValue)
-            except Exception:
-                pass
+            except Exception as exc:
+                LOGGER.debug("%s: exception while reading float node %s using struct API: %s", self.info.label, key, exc, exc_info=True)
         try:
             value = self._cam.MV_CC_GetFloatValue(key)
             if isinstance(value, tuple) and value:
@@ -863,11 +886,12 @@ class MvsCamera:
                 return float(value.fCurValue)
             if isinstance(value, (int, float)):
                 return float(value)
-        except Exception:
-            pass
+        except Exception as exc:
+            LOGGER.debug("%s: exception while reading float node %s using direct API: %s", self.info.label, key, exc, exc_info=True)
         try:
             return float(self._get_int(key))
-        except Exception:
+        except Exception as exc:
+            LOGGER.debug("%s: exception while reading float node %s as int fallback: %s", self.info.label, key, exc, exc_info=True)
             return None
 
     def _try_get_float_any(self, keys: tuple[str, ...]) -> float | None:
@@ -888,8 +912,8 @@ class MvsCamera:
                     text = self._string_from_sdk_value(value)
                     if text:
                         return text
-            except Exception:
-                pass
+            except Exception as exc:
+                LOGGER.debug("%s: exception while reading string node %s using struct API: %s", self.info.label, key, exc, exc_info=True)
         try:
             value = self._cam.MV_CC_GetStringValue(key)
             if isinstance(value, tuple):
@@ -900,14 +924,15 @@ class MvsCamera:
             text = self._string_from_sdk_value(value)
             if text:
                 return text
-        except Exception:
-            pass
+        except Exception as exc:
+            LOGGER.debug("%s: exception while reading string node %s using direct API: %s", self.info.label, key, exc, exc_info=True)
         try:
             buffer = create_string_buffer(256)
             ret = self._cam.MV_CC_GetStringValue(key, buffer, sizeof(buffer))
             if ret == 0:
                 return buffer.value.decode("utf-8", errors="ignore").strip()
-        except Exception:
+        except Exception as exc:
+            LOGGER.debug("%s: exception while reading string node %s using buffer API: %s", self.info.label, key, exc, exc_info=True)
             return None
         return None
 
@@ -934,7 +959,8 @@ class MvsCamera:
                     return raw.strip()
                 try:
                     return _decode_c_ubyte_array(raw)
-                except Exception:
+                except Exception as exc:
+                    LOGGER.debug("failed to decode SDK string value attribute %s: %s", attr, exc, exc_info=True)
                     return None
         return None
 
@@ -945,7 +971,8 @@ class MvsCamera:
     def _try_set_int(self, key: str, value: int) -> bool:
         try:
             return self._cam.MV_CC_SetIntValue(key, int(value)) == 0
-        except Exception:
+        except Exception as exc:
+            LOGGER.debug("%s: exception while probing int node %s=%s: %s", self.info.label, key, value, exc, exc_info=True)
             return False
 
 
@@ -968,6 +995,7 @@ class StereoCameraSystem:
         self._capture_lock = threading.Lock()
 
     def connect(self) -> tuple[CameraInfo | None, CameraInfo | None]:
+        self._camera_timestamp_offset = None
         left_info, right_info, dev_list = select_capture_devices(
             str(self.config.get("left_serial", "")).strip(),
             str(self.config.get("right_serial", "")).strip(),
@@ -1006,7 +1034,10 @@ class StereoCameraSystem:
                 cam.start()
         except Exception:
             for cam in opened:
-                cam.close()
+                try:
+                    cam.close()
+                except Exception as close_exc:
+                    LOGGER.warning("Failed to close %s after connection failure: %s", cam.info.label, close_exc, exc_info=True)
             raise
 
         self.left = left
