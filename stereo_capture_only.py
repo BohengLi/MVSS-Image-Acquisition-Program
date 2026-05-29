@@ -88,18 +88,42 @@ LOG_DIR = BASE_DIR / "logs"
 CAPTURE_WIDTH = 5472
 CAPTURE_HEIGHT = 3648
 
-BG_COLOR = "#262626"
-PANEL_COLOR = "#3a3a3a"
-CANVAS_COLOR = "#101010"
-BORDER_COLOR = "#4b4b4b"
-ACCENT_COLOR = "#2f80ed"
-TEXT_COLOR = "#f0f0f0"
-MUTED_TEXT_COLOR = "#b8b8b8"
+BG_COLOR = "#0e1116"
+SURFACE_COLOR = "#141a21"
+PANEL_COLOR = "#1b232c"
+PANEL_ELEVATED_COLOR = "#222c35"
+CANVAS_COLOR = "#05070a"
+CHART_COLOR = "#0c1117"
+BORDER_COLOR = "#34414c"
+BORDER_STRONG_COLOR = "#4d5e6b"
+ACCENT_COLOR = "#12a8e8"
+ACCENT_ACTIVE_COLOR = "#35c0ff"
+SUCCESS_COLOR = "#31c784"
+WARNING_COLOR = "#ffd166"
+DANGER_COLOR = "#ff6b6b"
+TEXT_COLOR = "#f2f6f9"
+MUTED_TEXT_COLOR = "#aab6c0"
+SUBTLE_TEXT_COLOR = "#71808d"
 FONT_FAMILY = "Microsoft YaHei UI"
+MONO_FONT_FAMILY = "Cascadia Mono"
 BASE_FONT_SIZE = 10
-TITLE_FONT_SIZE = 14
-INFO_FONT_SIZE = 10
-OVERLAY_FONT_SIZE = 11
+TITLE_FONT_SIZE = 12
+APP_TITLE_FONT_SIZE = 15
+INFO_FONT_SIZE = 9
+OVERLAY_FONT_SIZE = 10
+WINDOW_ASPECT_RATIO = 16 / 10
+TARGET_WINDOW_WIDTH = 1920
+TARGET_WINDOW_HEIGHT = 1200
+HIGH_RES_WINDOW_WIDTH = 2560
+HIGH_RES_WINDOW_HEIGHT = 1600
+MIN_WINDOW_WIDTH = 1440
+MIN_WINDOW_HEIGHT = 900
+CAMERA_ASPECT_RATIO = CAPTURE_WIDTH / CAPTURE_HEIGHT
+CAMERA_GAP = 18
+CAMERA_VERTICAL_PADDING = 0
+PARAM_SIDEBAR_WIDTH = 400
+QUALITY_MONITOR_MIN_HEIGHT = 300
+QUALITY_MONITOR_HIGH_RES_MIN_HEIGHT = 380
 
 FramePair = tuple[CameraFrame | None, CameraFrame | None]
 LOGGER = logging.getLogger("mvss_capture")
@@ -368,6 +392,132 @@ def configure_tk_dpi_scaling(root: Tk) -> None:
         pass
 
 
+def apply_responsive_window_geometry(root: Tk) -> None:
+    try:
+        screen_width = max(int(root.winfo_screenwidth()), 1)
+        screen_height = max(int(root.winfo_screenheight()), 1)
+        use_high_res = screen_width >= 2400 and screen_height >= 1500
+        desired_width = HIGH_RES_WINDOW_WIDTH if use_high_res else TARGET_WINDOW_WIDTH
+        desired_height = HIGH_RES_WINDOW_HEIGHT if use_high_res else TARGET_WINDOW_HEIGHT
+        side_margin = 80 if use_high_res else 32
+        bottom_margin = 80 if use_high_res else 56
+        available_width = max(1280, screen_width - side_margin)
+        available_height = max(820, screen_height - bottom_margin)
+        window_width = min(desired_width, available_width)
+        window_height = min(desired_height, available_height)
+        if window_width / max(window_height, 1) > WINDOW_ASPECT_RATIO:
+            window_width = max(1280, int(window_height * WINDOW_ASPECT_RATIO))
+        else:
+            window_height = max(800, int(window_width / WINDOW_ASPECT_RATIO))
+        x = max((screen_width - window_width) // 2, 0)
+        y = max((screen_height - window_height) // 2, 0)
+        min_width = min(MIN_WINDOW_WIDTH, max(1280, screen_width - side_margin))
+        min_height = min(MIN_WINDOW_HEIGHT, max(820, screen_height - bottom_margin))
+        root.geometry(f"{window_width}x{window_height}+{x}+{y}")
+        root.minsize(min_width, min_height)
+        root.after_idle(lambda: maximize_window(root))
+    except Exception:
+        root.geometry(f"{TARGET_WINDOW_WIDTH}x{TARGET_WINDOW_HEIGHT}")
+        root.minsize(MIN_WINDOW_WIDTH, MIN_WINDOW_HEIGHT)
+        root.after_idle(lambda: maximize_window(root))
+
+
+def maximize_window(root: Tk) -> None:
+    try:
+        root.state("zoomed")
+    except Exception:
+        try:
+            screen_width = max(int(root.winfo_screenwidth()), TARGET_WINDOW_WIDTH)
+            screen_height = max(int(root.winfo_screenheight()), TARGET_WINDOW_HEIGHT)
+            root.geometry(f"{screen_width}x{screen_height}+0+0")
+        except Exception:
+            pass
+
+
+def camera_row_height(root: Tk) -> int:
+    try:
+        width = int(root.winfo_width())
+        if width <= 1:
+            width = int(root.winfo_screenwidth())
+    except Exception:
+        width = TARGET_WINDOW_WIDTH
+    camera_width = max(width - PARAM_SIDEBAR_WIDTH - CAMERA_GAP * 2, 2)
+    pane_width = max(camera_width / 2.0, 1.0)
+    return int(pane_width / CAMERA_ASPECT_RATIO) + CAMERA_VERTICAL_PADDING * 2
+
+
+class AspectRatioFrame(Frame):
+    def __init__(self, master: Tk | Frame, aspect_ratio: float, **kwargs):
+        super().__init__(master, **kwargs)
+        self.aspect_ratio = max(float(aspect_ratio), 0.1)
+        self._child: Frame | None = None
+        self.bind("<Configure>", self._layout_child)
+
+    def set_child(self, child: Frame) -> None:
+        self._child = child
+        child.place(in_=self, x=0, y=0)
+        self._layout_child()
+
+    def _layout_child(self, _event=None) -> None:
+        if self._child is None:
+            return
+        width = max(self.winfo_width(), 1)
+        height = max(self.winfo_height(), 1)
+        child_width = min(width, int(height * self.aspect_ratio))
+        child_height = min(height, int(child_width / self.aspect_ratio))
+        x = max((width - child_width) // 2, 0)
+        y = max((height - child_height) // 2, 0)
+        self._child.place_configure(x=x, y=y, width=child_width, height=child_height)
+
+
+class DualCameraStrip(Frame):
+    def __init__(self, master: Tk | Frame, aspect_ratio: float, gap: int, vertical_padding: int, **kwargs):
+        super().__init__(master, **kwargs)
+        self.aspect_ratio = max(float(aspect_ratio), 0.1)
+        self.gap = max(int(gap), 0)
+        self.vertical_padding = max(int(vertical_padding), 0)
+        self._left: Frame | None = None
+        self._right: Frame | None = None
+        self._sidebar: Frame | None = None
+        self.bind("<Configure>", self._layout_children)
+
+    def set_children(self, left: Frame, right: Frame) -> None:
+        self._left = left
+        self._right = right
+        left.place(in_=self, x=0, y=0)
+        right.place(in_=self, x=0, y=0)
+        self._layout_children()
+
+    def set_sidebar(self, sidebar: Frame) -> None:
+        self._sidebar = sidebar
+        sidebar.place(in_=self, x=0, y=0)
+        self._layout_children()
+
+    def _layout_children(self, _event=None) -> None:
+        if self._left is None or self._right is None:
+            return
+        width = max(self.winfo_width(), 2 + self.gap)
+        sidebar_width = 0
+        camera_gap_count = 1
+        if self._sidebar is not None:
+            sidebar_width = PARAM_SIDEBAR_WIDTH
+            camera_gap_count = 2
+        camera_width = max(width - sidebar_width - self.gap * camera_gap_count, 2)
+        left_width = max(camera_width // 2, 1)
+        right_width = max(camera_width - left_width, 1)
+        pane_height = max(int(min(left_width, right_width) / self.aspect_ratio), 1)
+        sidebar_height = pane_height if self._sidebar is not None else 0
+        strip_height = pane_height + self.vertical_padding * 2
+        if abs(self.winfo_reqheight() - strip_height) > 1:
+            self.configure(height=strip_height)
+        y = self.vertical_padding
+        self._left.place_configure(x=0, y=y, width=left_width, height=pane_height)
+        self._right.place_configure(x=left_width + self.gap, y=y, width=right_width, height=pane_height)
+        if self._sidebar is not None:
+            sidebar_x = left_width + self.gap + right_width + self.gap
+            self._sidebar.place_configure(x=sidebar_x, y=y, width=sidebar_width, height=sidebar_height)
+
+
 class ZoomImagePane(Frame):
     def __init__(self, master: Tk | Frame, title: str, reset_command=None, roi_callback=None):
         super().__init__(master, bg=BORDER_COLOR)
@@ -388,6 +538,7 @@ class ZoomImagePane(Frame):
         self._performance_text_id: int | None = None
         self._performance_status = "good"
         self._performance_text = "FPS -- | Drop -- | Delta --"
+        self.performance_var = StringVar(value=self._performance_text)
         self._focus_peaking_enabled = False
         self._focus_peaking_overlay: Image.Image | None = None
         self._zebra_enabled = False
@@ -408,19 +559,32 @@ class ZoomImagePane(Frame):
         self._pan_origin: tuple[float, float] = (0.0, 0.0)
 
         container = Frame(self, bg=CANVAS_COLOR, bd=0)
-        container.pack(fill=BOTH, expand=True, padx=2, pady=2)
+        container.pack(fill=BOTH, expand=True, padx=1, pady=1)
 
         header = ttk.Frame(container, style="PaneHeader.TFrame")
         header.pack(side=TOP, fill=X)
-        ttk.Label(header, textvariable=self.title_var, style="PaneTitle.TLabel", padding=(12, 6), anchor="w").pack(
+        ttk.Label(header, textvariable=self.title_var, style="PaneTitle.TLabel", padding=(12, 5), anchor="w").pack(
             side=LEFT, fill=X, expand=True
         )
-        ttk.Button(header, text="还原", command=reset_command or self.reset_zoom, width=6).pack(
-            side=RIGHT, padx=(4, 8), pady=4
+        ttk.Button(header, text="还原", command=reset_command or self.reset_zoom, style="Pane.TButton", width=7).pack(
+            side=RIGHT, padx=(4, 6), pady=3
         )
-        ttk.Label(header, textvariable=self.zoom_var, style="PaneTitle.TLabel", padding=(8, 6), anchor="e").pack(
+        ttk.Label(header, textvariable=self.zoom_var, style="PaneMeta.TLabel", padding=(7, 5), anchor="e").pack(
             side=RIGHT
         )
+
+        footer = ttk.Frame(container, style="PaneHeader.TFrame")
+        footer.pack(side=BOTTOM, fill=X)
+        ttk.Label(footer, textvariable=self.info_var, style="PaneInfo.TLabel", padding=(10, 4), anchor="w").pack(
+            side=LEFT, fill=X, expand=True
+        )
+        ttk.Label(
+            footer,
+            textvariable=self.performance_var,
+            style="Performance.TLabel",
+            padding=(10, 4),
+            anchor="e",
+        ).pack(side=RIGHT)
 
         self.canvas = Canvas(container, bg=CANVAS_COLOR, highlightthickness=0, bd=0)
         self.canvas.pack(side=TOP, fill=BOTH, expand=True)
@@ -429,13 +593,9 @@ class ZoomImagePane(Frame):
             0,
             0,
             text="无图像",
-            fill="#777777",
+            fill=SUBTLE_TEXT_COLOR,
             font=(FONT_FAMILY, 18),
             anchor="center",
-        )
-
-        ttk.Label(container, textvariable=self.info_var, style="PaneInfo.TLabel", padding=(10, 4), anchor="w").pack(
-            side=BOTTOM, fill=X
         )
 
         self.canvas.bind("<Configure>", self._on_configure)
@@ -472,7 +632,7 @@ class ZoomImagePane(Frame):
 
     def set_display_image(self, image: Image.Image | None, info: str = "") -> None:
         self._last_image = image
-        self.info_var.set(info or (f"{image.width}x{image.height}" if image is not None else "No Signal"))
+        self.info_var.set(info or (f"{image.width}x{image.height}" if image is not None else "无信号"))
         self._render()
 
     def set_analysis_overlays(
@@ -497,7 +657,7 @@ class ZoomImagePane(Frame):
             self._focus_roi_frac = clamp_roi_frac(focus_roi_frac)
         self._magnifier_rect_frac = clamp_roi_frac(magnifier_rect_frac) if magnifier_rect_frac is not None else None
 
-    def set_no_signal(self, reason: str = "No Signal") -> None:
+    def set_no_signal(self, reason: str = "无信号") -> None:
         self._last_image = None
         self.info_var.set(reason)
         if self._canvas_image_id is not None:
@@ -545,7 +705,7 @@ class ZoomImagePane(Frame):
                 self.canvas.delete(self._magnifier_rect_id)
                 self._magnifier_rect_id = None
             self.canvas.coords(self._canvas_text_id, width // 2, height // 2)
-            self.canvas.itemconfigure(self._canvas_text_id, text="No Signal", state="normal")
+            self.canvas.itemconfigure(self._canvas_text_id, text="无信号", state="normal")
             self._place_performance_overlay()
             return
 
@@ -616,7 +776,7 @@ class ZoomImagePane(Frame):
         left, top, width, height = self._render_bounds
         center_x = left + width / 2
         center_y = top + height / 2
-        color = "#48e07b"
+        color = SUCCESS_COLOR
         self.canvas.create_line(left, center_y, left + width, center_y, fill=color, width=1, tags=("guide",), stipple="gray50")
         self.canvas.create_line(center_x, top, center_x, top + height, fill=color, width=1, tags=("guide",), stipple="gray50")
         if self._guide_mode == "full":
@@ -645,9 +805,13 @@ class ZoomImagePane(Frame):
         if self._last_image is None or self._render_bounds is None:
             return
         if self._focus_roi_frac is not None:
-            self._focus_roi_rect_id = self._create_fraction_rect(self._focus_roi_frac, "#ffd166", (5, 4), "focus_roi")
+            self._focus_roi_rect_id = self._create_fraction_rect(
+                self._focus_roi_frac, WARNING_COLOR, (5, 4), "focus_roi"
+            )
         if self._magnifier_rect_frac is not None:
-            self._magnifier_rect_id = self._create_fraction_rect(self._magnifier_rect_frac, "#00d4ff", (3, 3), "magnifier")
+            self._magnifier_rect_id = self._create_fraction_rect(
+                self._magnifier_rect_frac, ACCENT_ACTIVE_COLOR, (3, 3), "magnifier"
+            )
 
     def _create_fraction_rect(self, roi: dict[str, float], color: str, dash: tuple[int, int], tag: str) -> int | None:
         if self._render_bounds is None:
@@ -673,7 +837,7 @@ class ZoomImagePane(Frame):
             0,
             width,
             height,
-            fill="#ffffff",
+            fill=TEXT_COLOR,
             outline="",
             stipple="gray50",
             tags=("flash",),
@@ -700,8 +864,9 @@ class ZoomImagePane(Frame):
     def set_performance_overlay(self, text: str, status: str) -> None:
         self._performance_text = text
         self._performance_status = status
+        self.performance_var.set(text)
         if self._performance_text_id is not None:
-            color = {"good": "#7bd88f", "warn": "#ffd166", "bad": "#ff6b6b"}.get(status, "#7bd88f")
+            color = {"good": SUCCESS_COLOR, "warn": WARNING_COLOR, "bad": DANGER_COLOR}.get(status, SUCCESS_COLOR)
             self.canvas.itemconfigure(self._performance_text_id, text=text, fill=color)
         self._place_performance_overlay()
 
@@ -734,7 +899,7 @@ class ZoomImagePane(Frame):
                 14,
                 30,
                 30,
-                fill="#e53935",
+                fill=DANGER_COLOR,
                 outline="#ffb3b3",
                 width=2,
                 tags=("recording",),
@@ -742,9 +907,9 @@ class ZoomImagePane(Frame):
             self._recording_text_id = self.canvas.create_text(
                 38,
                 22,
-                text="Recording",
-                fill="#ffffff",
-                font=("Arial", 12, "bold"),
+                text="录像中",
+                fill=TEXT_COLOR,
+                font=(FONT_FAMILY, 12, "bold"),
                 anchor="w",
                 tags=("recording",),
             )
@@ -754,6 +919,16 @@ class ZoomImagePane(Frame):
         self._raise_overlays()
 
     def _place_performance_overlay(self) -> None:
+        self.performance_var.set(self._performance_text)
+        for item_id in (self._performance_bg_id, self._performance_text_id):
+            if item_id is not None:
+                try:
+                    self.canvas.delete(item_id)
+                except Exception:
+                    pass
+        self._performance_bg_id = None
+        self._performance_text_id = None
+        return
         canvas_width = max(self.canvas.winfo_width(), 1)
         canvas_height = max(self.canvas.winfo_height(), 1)
         x = 10
@@ -766,8 +941,8 @@ class ZoomImagePane(Frame):
                 y,
                 x + text_width,
                 y + text_height,
-                fill="#000000",
-                outline="#1f1f1f",
+                fill=CANVAS_COLOR,
+                outline=BORDER_COLOR,
                 stipple="gray25",
                 tags=("performance",),
             )
@@ -775,8 +950,8 @@ class ZoomImagePane(Frame):
                 x + 7,
                 y + 5,
                 text=self._performance_text,
-                fill="#7bd88f",
-                font=("Consolas", max(8, OVERLAY_FONT_SIZE - 2), "bold"),
+                fill=SUCCESS_COLOR,
+                font=(MONO_FONT_FAMILY, max(8, OVERLAY_FONT_SIZE - 2), "bold"),
                 anchor="nw",
                 tags=("performance",),
             )
@@ -826,7 +1001,7 @@ class ZoomImagePane(Frame):
             event.y,
             event.x,
             event.y,
-            outline="#00d4ff",
+            outline=ACCENT_ACTIVE_COLOR,
             width=2,
             dash=(5, 3),
             tags=("roi",),
@@ -955,11 +1130,13 @@ class ToolTip:
 
 class HistogramCanvas(ttk.Frame):
     def __init__(self, master: Tk | Frame, title: str):
-        super().__init__(master, style="Panel.TFrame", padding=(6, 4))
+        super().__init__(master, style="Panel.TFrame", padding=(7, 5))
         self.title = title
         self.histogram: list[float] | None = None
         ttk.Label(self, text=title, style="Panel.TLabel").pack(side=TOP, anchor="w")
-        self.canvas = Canvas(self, width=280, height=130, bg="#151515", highlightthickness=1, highlightbackground="#555555")
+        self.canvas = Canvas(
+            self, width=260, height=90, bg=CHART_COLOR, highlightthickness=1, highlightbackground=BORDER_COLOR
+        )
         self.canvas.pack(side=TOP, fill=BOTH, expand=True)
         self.canvas.bind("<Configure>", self._on_configure)
 
@@ -991,17 +1168,24 @@ class HistogramCanvas(ttk.Frame):
         x1 = margin_left + plot_w
         y1 = margin_top + plot_h
 
-        self.canvas.create_rectangle(x0, y0, x1, y1, fill="#1f1f1f", outline="#555555")
-        self.canvas.create_rectangle(x0, y0, x0 + plot_w * 15 / 255, y1, fill="#20334d", outline="")
-        self.canvas.create_rectangle(x0 + plot_w * 240 / 255, y0, x1, y1, fill="#4a2525", outline="")
-        for value, color, dash in ((5, "#4c8dff", (2, 3)), (128, "#a8a8a8", (3, 3)), (250, "#ff6b6b", (2, 3))):
+        self.canvas.create_rectangle(x0, y0, x1, y1, fill=CANVAS_COLOR, outline=BORDER_COLOR)
+        self.canvas.create_rectangle(x0, y0, x0 + plot_w * 15 / 255, y1, fill="#102438", outline="")
+        self.canvas.create_rectangle(x0 + plot_w * 240 / 255, y0, x1, y1, fill="#3b1f24", outline="")
+        for value, color, dash in (
+            (5, ACCENT_ACTIVE_COLOR, (2, 3)),
+            (128, MUTED_TEXT_COLOR, (3, 3)),
+            (250, DANGER_COLOR, (2, 3)),
+        ):
             x = x0 + plot_w * value / 255
             self.canvas.create_line(x, y0, x, y1, fill=color, dash=dash)
-        self.canvas.create_text(x0, y1 + 3, text="0", fill="#a8a8a8", anchor="nw", font=("Consolas", 8))
-        self.canvas.create_text(x0 + plot_w / 2, y1 + 3, text="128", fill="#a8a8a8", anchor="n", font=("Consolas", 8))
-        self.canvas.create_text(x1, y1 + 3, text="255", fill="#a8a8a8", anchor="ne", font=("Consolas", 8))
+        axis_font = (MONO_FONT_FAMILY, 8)
+        self.canvas.create_text(x0, y1 + 3, text="0", fill=MUTED_TEXT_COLOR, anchor="nw", font=axis_font)
+        self.canvas.create_text(x0 + plot_w / 2, y1 + 3, text="128", fill=MUTED_TEXT_COLOR, anchor="n", font=axis_font)
+        self.canvas.create_text(x1, y1 + 3, text="255", fill=MUTED_TEXT_COLOR, anchor="ne", font=axis_font)
         if not self.histogram:
-            self.canvas.create_text((x0 + x1) / 2, (y0 + y1) / 2, text="No Data", fill="#777777", anchor="center")
+            self.canvas.create_text(
+                (x0 + x1) / 2, (y0 + y1) / 2, text="暂无数据", fill=SUBTLE_TEXT_COLOR, anchor="center"
+            )
             return
         values = np.asarray(self.histogram, dtype=np.float32)
         if values.size != 256:
@@ -1014,7 +1198,7 @@ class HistogramCanvas(ttk.Frame):
         for index, value in enumerate(values):
             bar_h = float(value) * plot_h
             x = x0 + index * plot_w / 256
-            color = "#c7d7ff" if 15 <= index <= 240 else "#ffb0a6" if index > 240 else "#94bdff"
+            color = "#c7ecff" if 15 <= index <= 240 else "#ffaaa0" if index > 240 else "#82d8ff"
             self.canvas.create_rectangle(x, y1 - bar_h, x + bar_w, y1, fill=color, outline=color)
 
 
@@ -1080,8 +1264,8 @@ class StereoCaptureOnlyApp:
         self.root = root
         self.root.title("双目同步采集")
         self.root.configure(bg=BG_COLOR)
-        self.root.geometry("1660x980")
-        self.root.minsize(1280, 820)
+        apply_responsive_window_geometry(self.root)
+        self.root.option_add("*tearOff", False)
         self.root.protocol("WM_DELETE_WINDOW", self.close)
         self.root.bind("<F11>", self._on_fullscreen_key)
         self.root.bind("<Escape>", self._on_escape_key)
@@ -1247,6 +1431,7 @@ class StereoCaptureOnlyApp:
         self.focus_peaking_var = BooleanVar(value=False)
         self.zebra_var = BooleanVar(value=bool(exposure_monitor.get("zebra_enabled", False)))
         self.histogram_enabled_var = BooleanVar(value=bool(exposure_monitor.get("histogram_enabled", True)))
+        self.param_panel_open_var = BooleanVar(value=True)
         self.focus_panel_open_var = BooleanVar(value=True)
         self.exposure_panel_open_var = BooleanVar(value=True)
         self.validation_panel_open_var = BooleanVar(value=True)
@@ -1254,7 +1439,7 @@ class StereoCaptureOnlyApp:
         self.project_id_var = StringVar(value=self.project_manager.current_project_id or "--")
         self.calibration_summary_var = StringVar(value=self.calibration.status_text())
         self.temperature_status_var = StringVar(value="Temp --")
-        self.focus_peak_var = StringVar(value="Peak -- | 0%")
+        self.focus_peak_var = StringVar(value="峰值 -- | 0%")
         hdr = self._ensure_config_section("hdr_bracketing")
         hdr_ev_offsets = hdr.get("ev_offsets", [-2, -1, 0, 1, 2])
         if not isinstance(hdr_ev_offsets, (list, tuple)):
@@ -1263,7 +1448,7 @@ class StereoCaptureOnlyApp:
         self.hdr_sequence_var = StringVar(
             value=", ".join(str(v) for v in hdr_ev_offsets)
         )
-        self.focus_score_var = StringVar(value="Focus --")
+        self.focus_score_var = StringVar(value="对焦 --")
         self.focus_detail_var = StringVar(value="L: -- | R: -- | Δ: --")
         self.focus_status_var = StringVar(value="未标定")
         self.focus_roi_var = StringVar(value=self._format_focus_roi())
@@ -1278,21 +1463,42 @@ class StereoCaptureOnlyApp:
         self._histogram_enabled_setting = bool(self.histogram_enabled_var.get())
 
     def _build_ui(self) -> None:
-        toolbar = ttk.Frame(self.root, padding=(10, 8))
+        toolbar = ttk.Frame(self.root, style="Toolbar.TFrame", padding=(12, 6, 12, 5))
         toolbar.pack(side=TOP, fill=X)
 
-        actions = ttk.Frame(toolbar)
-        actions.pack(side=TOP, fill=X)
+        header = ttk.Frame(toolbar, style="Toolbar.TFrame")
+        header.pack(side=TOP, fill=X)
+        title_group = ttk.Frame(header, style="Toolbar.TFrame")
+        title_group.pack(side=LEFT, fill=X, expand=True)
+        ttk.Label(title_group, text="MVSS Capture", style="AppTitle.TLabel").pack(side=LEFT)
+        ttk.Label(title_group, text="双目同步采集控制台", style="AppSubtitle.TLabel").pack(
+            side=LEFT, padx=(12, 0)
+        )
+        ttk.Label(header, text=f"{CAPTURE_WIDTH} x {CAPTURE_HEIGHT}", style="HeaderValue.TLabel").pack(
+            side=RIGHT
+        )
+        ttk.Label(header, text="默认采集尺寸", style="HeaderMeta.TLabel").pack(side=RIGHT, padx=(0, 8))
+
+        actions = ttk.Frame(toolbar, style="Toolbar.TFrame")
+        actions.pack(side=TOP, fill=X, pady=(5, 0))
         self.connect_button = ttk.Button(actions, text="连接相机", command=self.connect_cameras, style="Accent.TButton")
-        self.preview_button = ttk.Button(actions, text="开始采集", command=self.toggle_preview, state=DISABLED)
+        self.preview_button = ttk.Button(
+            actions, text="开始采集", command=self.toggle_preview, state=DISABLED, style="Capture.TButton"
+        )
         self.photo_button = ttk.Button(actions, text="同步拍照", command=self.capture_photo, state=DISABLED)
         self.hdr_button = ttk.Button(actions, text="HDR包围", command=self.capture_hdr_bracket, state=DISABLED)
         self.interval_button = ttk.Button(actions, text="定时拍照", command=self.toggle_interval_capture, state=DISABLED)
-        self.record_button = ttk.Button(actions, text="开始录像", command=self.toggle_recording, state=DISABLED)
-        self.new_project_button = ttk.Button(actions, text="新建项目", command=self.create_new_project)
-        self.refresh_button = ttk.Button(actions, text="刷新设备", command=self.refresh_devices)
-        self.choose_save_dir_button = ttk.Button(actions, text="保存路径", command=self.choose_save_dir)
-        self.exit_button = ttk.Button(actions, text="退出", command=self.close)
+        self.record_button = ttk.Button(
+            actions, text="开始录像", command=self.toggle_recording, state=DISABLED, style="Record.TButton"
+        )
+        self.refresh_button = ttk.Button(actions, text="刷新设备", command=self.refresh_devices, style="Utility.TButton")
+        self.choose_save_dir_button = ttk.Button(
+            actions, text="保存路径", command=self.choose_save_dir, style="Utility.TButton"
+        )
+        self.project_export_button = ttk.Button(
+            actions, text="项目/导出", command=self.show_project_export_popup, style="Utility.TButton"
+        )
+        self.exit_button = ttk.Button(actions, text="退出", command=self.close, style="Danger.TButton")
 
         for button in (
             self.connect_button,
@@ -1301,19 +1507,19 @@ class StereoCaptureOnlyApp:
             self.hdr_button,
             self.interval_button,
             self.record_button,
-            self.new_project_button,
             self.refresh_button,
             self.choose_save_dir_button,
+            self.project_export_button,
         ):
-            button.pack(side=LEFT, padx=(0, 8))
-        self.exit_button.pack(side=RIGHT)
+            button.pack(side=LEFT, padx=(0, 5), pady=0)
+        self.exit_button.pack(side=RIGHT, pady=0)
         self.refresh_tooltip = ToolTip(self.refresh_button, self._device_tooltip_text)
 
-        settings = ttk.Frame(toolbar)
-        settings.pack(side=TOP, fill=X, pady=(8, 0))
+        settings = ttk.Frame(toolbar, style="Toolbar.TFrame")
+        settings.pack(side=TOP, fill=X, pady=(5, 0))
 
-        trigger_panel = ttk.Frame(settings, style="Panel.TFrame", padding=(8, 6))
-        trigger_panel.pack(side=LEFT, padx=(0, 8))
+        trigger_panel = ttk.Frame(settings, style="Panel.TFrame", padding=(6, 4))
+        trigger_panel.pack(side=LEFT, fill="y", padx=(0, 8))
         ttk.Label(trigger_panel, text="触发", style="Panel.TLabel").grid(row=0, column=0, padx=(0, 4), pady=2)
         ttk.OptionMenu(
             trigger_panel,
@@ -1327,7 +1533,7 @@ class StereoCaptureOnlyApp:
         )
         self.apply_trigger_button.grid(row=0, column=2, padx=(6, 0), pady=2)
 
-        preset_panel = ttk.Frame(settings, style="Panel.TFrame", padding=(8, 6))
+        preset_panel = ttk.Frame(settings, style="Panel.TFrame", padding=(6, 4))
         preset_panel.pack(side=LEFT, padx=(0, 8))
         ttk.Label(preset_panel, text="预设", style="Panel.TLabel").grid(row=0, column=0, padx=(0, 4), pady=2)
         preset_names = list(self.config.get("presets", {}).keys()) or [self.preset_var.get()]
@@ -1337,52 +1543,77 @@ class StereoCaptureOnlyApp:
         ttk.Button(preset_panel, text="加载", command=self.load_preset).grid(row=0, column=2, padx=3, pady=2)
         ttk.Button(preset_panel, text="保存", command=self.save_preset).grid(row=0, column=3, padx=3, pady=2)
 
-        interval_panel = ttk.Frame(settings, style="Panel.TFrame", padding=(8, 6))
+        interval_panel = ttk.Frame(settings, style="Panel.TFrame", padding=(6, 4))
         interval_panel.pack(side=LEFT, fill=X, expand=True)
         ttk.Label(interval_panel, text="定时拍照", style="Panel.TLabel").grid(row=0, column=0, padx=(0, 4), pady=2)
         self.interval_lamp = Canvas(interval_panel, width=18, height=18, bg=PANEL_COLOR, highlightthickness=0, bd=0)
         self.interval_lamp.grid(row=0, column=1, padx=(0, 8), pady=2)
-        self.interval_lamp_id = self.interval_lamp.create_oval(3, 3, 15, 15, fill="#666666", outline="#2a2a2a")
+        self.interval_lamp_id = self.interval_lamp.create_oval(3, 3, 15, 15, fill=SUBTLE_TEXT_COLOR, outline=CANVAS_COLOR)
         self._labeled_entry(interval_panel, "间隔s", self.interval_seconds_var, 7, 0, 2)
         self._labeled_entry(interval_panel, "张数", self.interval_limit_var, 7, 0, 4)
         self._labeled_entry(interval_panel, "录像fps", self.record_fps_var, 7, 0, 6)
 
         self._labeled_entry(interval_panel, "时长s", self.record_max_seconds_var, 7, 0, 8)
 
-        info = ttk.Frame(toolbar)
-        info.pack(side=TOP, fill=X, pady=(8, 0))
-        ttk.Label(info, text="Project").pack(side=LEFT, padx=(0, 4))
-        ttk.Label(info, textvariable=self.project_id_var, style="Value.TLabel").pack(side=LEFT, padx=(0, 18))
-        ttk.Label(info, textvariable=self.calibration_summary_var, style="Value.TLabel").pack(side=LEFT, padx=(0, 18))
-        ttk.Label(info, textvariable=self.temperature_status_var, style="Value.TLabel").pack(side=LEFT, padx=(0, 18))
-        ttk.Label(info, text="默认采集尺寸").pack(side=LEFT, padx=(0, 4))
-        ttk.Label(info, text=f"{CAPTURE_WIDTH} x {CAPTURE_HEIGHT}", style="Value.TLabel").pack(side=LEFT, padx=(0, 18))
-        ttk.Label(info, text="保存路径").pack(side=LEFT, padx=(0, 4))
-        ttk.Label(info, textvariable=self.save_dir_var, style="Value.TLabel").pack(side=LEFT, fill=X, expand=True)
-
-        param_panel = ttk.LabelFrame(toolbar, text="参数设置", padding=(10, 8))
-        param_panel.pack(side=TOP, fill=X, pady=(8, 0))
-        param_panel.grid_columnconfigure(0, weight=1)
-        param_panel.grid_columnconfigure(1, weight=1)
-
-        gain_panel = ttk.Frame(param_panel, style="Panel.TFrame", padding=(8, 6))
-        gain_panel.grid(row=0, column=0, sticky="ew", padx=(0, 6), pady=(0, 6))
-        self._configure_parameter_grid(gain_panel)
-        ttk.Label(gain_panel, text="增益", style="Panel.TLabel").grid(row=0, column=0, padx=(0, 6), pady=3, sticky="w")
-        ttk.OptionMenu(gain_panel, self.gain_auto_var, self.gain_auto_var.get(), "Off", "Once", "Continuous").grid(
-            row=0, column=1, padx=3, pady=3, sticky="w"
+        info = ttk.Frame(toolbar, style="InfoBar.TFrame", padding=(8, 4))
+        info.pack(side=TOP, fill=X, pady=(5, 0))
+        ttk.Label(info, text="Project", style="InfoLabel.TLabel").pack(side=LEFT, padx=(0, 4))
+        ttk.Label(info, textvariable=self.project_id_var, style="InfoValue.TLabel").pack(side=LEFT, padx=(0, 18))
+        ttk.Label(info, textvariable=self.calibration_summary_var, style="InfoValue.TLabel").pack(
+            side=LEFT, padx=(0, 18)
         )
-        self._labeled_entry(gain_panel, "值", self.gain_var, 6, 0, 2)
-        self._labeled_entry(gain_panel, "下限", self.auto_gain_lower_var, 6, 0, 4)
-        self._labeled_entry(gain_panel, "上限", self.auto_gain_upper_var, 6, 0, 6)
-        self.apply_gain_button = ttk.Button(gain_panel, text="应用增益", command=self.apply_gain_settings, state=DISABLED)
-        self.apply_gain_button.grid(row=0, column=10, padx=(8, 0), pady=3, sticky="e")
+        ttk.Label(info, textvariable=self.temperature_status_var, style="InfoValue.TLabel").pack(
+            side=LEFT, padx=(0, 18)
+        )
+        ttk.Label(info, text="保存路径", style="InfoLabel.TLabel").pack(side=LEFT, padx=(0, 4))
+        ttk.Label(info, textvariable=self.save_dir_var, style="InfoValue.TLabel").pack(side=LEFT, fill=X, expand=True)
 
-        exposure_panel = ttk.Frame(param_panel, style="Panel.TFrame", padding=(8, 6))
-        exposure_panel.grid(row=0, column=1, sticky="ew", padx=(6, 0), pady=(0, 6))
+        content = DualCameraStrip(
+            self.root,
+            CAMERA_ASPECT_RATIO,
+            CAMERA_GAP,
+            CAMERA_VERTICAL_PADDING,
+            bg=BG_COLOR,
+            height=camera_row_height(self.root),
+        )
+        self.camera_strip = content
+        content.pack(side=TOP, fill=X)
+        content.pack_propagate(False)
+        self.left_pane = ZoomImagePane(content, "左相机", roi_callback=self.set_roi_from_preview)
+        self.right_pane = ZoomImagePane(content, "右相机", roi_callback=self.set_roi_from_preview)
+        self.camera_side_panel = ttk.Frame(content, style="Toolbar.TFrame")
+        content.set_children(self.left_pane, self.right_pane)
+        content.set_sidebar(self.camera_side_panel)
+
+        self.param_panel = ttk.Frame(self.camera_side_panel, style="ParamPanel.TFrame", padding=(4, 4))
+        self.param_panel.pack(side=TOP, fill=BOTH, expand=True)
+        param_header = ttk.Frame(self.param_panel, style="Toolbar.TFrame")
+        param_header.pack(side=TOP, fill=X)
+        ttk.Label(param_header, text="参数设置", style="ParamTitle.TLabel").pack(side=LEFT, padx=(0, 8))
+        ttk.Label(param_header, text="曝光/增益/白平衡/ROI", style="HeaderMeta.TLabel").pack(side=LEFT)
+
+        self.param_panel_body = ttk.Frame(self.param_panel, style="Toolbar.TFrame")
+        param_panel = self.param_panel_body
+        param_panel.grid_columnconfigure(0, weight=1)
+
+        gain_panel = ttk.Frame(param_panel, style="Panel.TFrame", padding=(4, 2))
+        gain_panel.grid(row=0, column=0, sticky="ew", padx=0, pady=(0, 4))
+        self._configure_parameter_grid(gain_panel)
+        ttk.Label(gain_panel, text="增益", style="Panel.TLabel").grid(row=0, column=0, padx=(0, 5), pady=1, sticky="w")
+        ttk.OptionMenu(gain_panel, self.gain_auto_var, self.gain_auto_var.get(), "Off", "Once", "Continuous").grid(
+            row=0, column=1, columnspan=3, padx=2, pady=1, sticky="w"
+        )
+        self._labeled_entry(gain_panel, "值", self.gain_var, 6, 1, 0)
+        self._labeled_entry(gain_panel, "下限", self.auto_gain_lower_var, 6, 1, 2)
+        self._labeled_entry(gain_panel, "上限", self.auto_gain_upper_var, 6, 2, 0)
+        self.apply_gain_button = ttk.Button(gain_panel, text="应用", command=self.apply_gain_settings, state=DISABLED, width=6)
+        self.apply_gain_button.grid(row=2, column=2, columnspan=2, padx=(6, 0), pady=1, sticky="e")
+
+        exposure_panel = ttk.Frame(param_panel, style="Panel.TFrame", padding=(4, 2))
+        exposure_panel.grid(row=1, column=0, sticky="ew", padx=0, pady=(0, 4))
         self._configure_parameter_grid(exposure_panel)
         ttk.Label(exposure_panel, text="曝光", style="Panel.TLabel").grid(
-            row=0, column=0, padx=(0, 6), pady=3, sticky="w"
+            row=0, column=0, padx=(0, 5), pady=1, sticky="w"
         )
         ttk.OptionMenu(
             exposure_panel,
@@ -1391,20 +1622,20 @@ class StereoCaptureOnlyApp:
             "Off",
             "Once",
             "Continuous",
-        ).grid(row=0, column=1, padx=3, pady=3, sticky="w")
+        ).grid(row=0, column=1, columnspan=3, padx=2, pady=1, sticky="w")
         self.apply_exposure_button = ttk.Button(
-            exposure_panel, text="应用曝光", command=self.apply_exposure_settings, state=DISABLED
+            exposure_panel, text="应用", command=self.apply_exposure_settings, state=DISABLED, width=6
         )
-        self._labeled_entry(exposure_panel, "us", self.exposure_time_var, 8, 0, 2)
-        self._labeled_entry(exposure_panel, "下限", self.auto_exposure_lower_var, 8, 0, 4)
-        self._labeled_entry(exposure_panel, "上限", self.auto_exposure_upper_var, 8, 0, 6)
-        self.apply_exposure_button.grid(row=0, column=10, padx=(8, 0), pady=3, sticky="e")
+        self._labeled_entry(exposure_panel, "us", self.exposure_time_var, 8, 1, 0)
+        self._labeled_entry(exposure_panel, "下限", self.auto_exposure_lower_var, 8, 1, 2)
+        self._labeled_entry(exposure_panel, "上限", self.auto_exposure_upper_var, 8, 2, 0)
+        self.apply_exposure_button.grid(row=2, column=2, columnspan=2, padx=(6, 0), pady=1, sticky="e")
 
-        wb_panel = ttk.Frame(param_panel, style="Panel.TFrame", padding=(8, 6))
-        wb_panel.grid(row=1, column=0, sticky="ew", padx=(0, 6))
+        wb_panel = ttk.Frame(param_panel, style="Panel.TFrame", padding=(4, 2))
+        wb_panel.grid(row=2, column=0, sticky="ew", padx=0, pady=(0, 4))
         self._configure_parameter_grid(wb_panel)
         ttk.Label(wb_panel, text="白平衡", style="Panel.TLabel").grid(
-            row=0, column=0, padx=(0, 6), pady=3, sticky="w"
+            row=0, column=0, padx=(0, 5), pady=1, sticky="w"
         )
         ttk.OptionMenu(
             wb_panel,
@@ -1413,54 +1644,55 @@ class StereoCaptureOnlyApp:
             "Off",
             "Once",
             "Continuous",
-        ).grid(row=0, column=1, padx=3, pady=3, sticky="w")
-        self._labeled_entry(wb_panel, "R", self.balance_red_var, 5, 0, 2)
-        self._labeled_entry(wb_panel, "G", self.balance_green_var, 5, 0, 4)
-        self._labeled_entry(wb_panel, "B", self.balance_blue_var, 5, 0, 6)
-        self.apply_wb_button = ttk.Button(wb_panel, text="应用白平衡", command=self.apply_white_balance_settings, state=DISABLED)
-        self.apply_wb_button.grid(row=0, column=10, padx=(8, 0), pady=3, sticky="e")
+        ).grid(row=0, column=1, columnspan=2, padx=2, pady=1, sticky="w")
+        self.apply_wb_button = ttk.Button(
+            wb_panel, text="应用", command=self.apply_white_balance_settings, state=DISABLED, width=6
+        )
+        self.apply_wb_button.grid(row=0, column=3, padx=(6, 0), pady=1, sticky="e")
 
-        roi_panel = ttk.Frame(param_panel, style="Panel.TFrame", padding=(8, 6))
-        roi_panel.grid(row=1, column=1, sticky="ew", padx=(6, 0))
+        wb_rgb_row = ttk.Frame(wb_panel, style="Panel.TFrame")
+        wb_rgb_row.grid(row=1, column=0, columnspan=4, sticky="ew", pady=(1, 0))
+        for index, (label, variable) in enumerate(
+            (("R", self.balance_red_var), ("G", self.balance_green_var), ("B", self.balance_blue_var))
+        ):
+            ttk.Label(wb_rgb_row, text=label, style="Panel.TLabel", anchor="e").pack(
+                side=LEFT, padx=((0 if index == 0 else 8), 2)
+            )
+            ttk.Entry(wb_rgb_row, textvariable=variable, width=5).pack(
+                side=LEFT, fill=X, expand=True, padx=(0, 0 if index == 2 else 4)
+            )
+
+        roi_panel = ttk.Frame(param_panel, style="Panel.TFrame", padding=(4, 2))
+        roi_panel.grid(row=3, column=0, sticky="ew", padx=0)
         self._configure_parameter_grid(roi_panel)
-        roi_panel.grid_columnconfigure(10, minsize=90, weight=0)
-        roi_panel.grid_columnconfigure(11, minsize=90, weight=1)
-        ttk.Label(roi_panel, text="ROI", style="Panel.TLabel").grid(row=0, column=0, padx=(0, 6), pady=3, sticky="w")
-        self._labeled_entry(roi_panel, "W", self.roi_width_var, 6, 0, 1)
-        self._labeled_entry(roi_panel, "H", self.roi_height_var, 6, 0, 3)
-        self._labeled_entry(roi_panel, "X", self.roi_offset_x_var, 5, 0, 5)
-        self._labeled_entry(roi_panel, "Y", self.roi_offset_y_var, 5, 0, 7)
-        self.edit_roi_button = ttk.Button(roi_panel, text="修改ROI", command=self.toggle_roi_edit_mode)
-        self.edit_roi_button.grid(row=0, column=9, padx=(8, 0), pady=3, sticky="e")
-        self.reset_roi_button = ttk.Button(roi_panel, text="还原ROI", command=self.reset_roi_settings)
-        self.reset_roi_button.grid(row=0, column=10, padx=(8, 0), pady=3, sticky="e")
-        self.apply_roi_button = ttk.Button(roi_panel, text="应用ROI", command=self.apply_roi_settings, state=DISABLED)
-        self.apply_roi_button.grid(row=0, column=11, padx=(8, 0), pady=3, sticky="e")
+        ttk.Label(roi_panel, text="ROI", style="Panel.TLabel").grid(
+            row=0, column=0, columnspan=4, padx=(0, 5), pady=1, sticky="w"
+        )
+        self._labeled_entry(roi_panel, "W", self.roi_width_var, 6, 1, 0)
+        self._labeled_entry(roi_panel, "H", self.roi_height_var, 6, 1, 2)
+        self._labeled_entry(roi_panel, "X", self.roi_offset_x_var, 5, 2, 0)
+        self._labeled_entry(roi_panel, "Y", self.roi_offset_y_var, 5, 2, 2)
+        self.edit_roi_button = ttk.Button(roi_panel, text="框选ROI", command=self.toggle_roi_edit_mode)
+        self.edit_roi_button.grid(row=3, column=0, columnspan=2, padx=(0, 6), pady=(4, 1), sticky="ew")
+        self.reset_roi_button = ttk.Button(roi_panel, text="重置", command=self.reset_roi_settings)
+        self.reset_roi_button.grid(row=3, column=2, padx=(0, 6), pady=(4, 1), sticky="ew")
+        self.apply_roi_button = ttk.Button(roi_panel, text="应用", command=self.apply_roi_settings, state=DISABLED)
+        self.apply_roi_button.grid(row=3, column=3, padx=(0, 6), pady=(4, 1), sticky="ew")
+        self.param_panel_body.pack(side=TOP, fill=X, pady=(5, 0))
 
-        content = Frame(self.root, bg=BG_COLOR)
-        content.pack(side=TOP, fill=BOTH, expand=True)
-        content.grid_columnconfigure(0, weight=1, uniform="camera")
-        content.grid_columnconfigure(1, weight=1, uniform="camera")
-        content.grid_rowconfigure(0, weight=1)
-
-        self.left_pane = ZoomImagePane(content, "左相机", roi_callback=self.set_roi_from_preview)
-        self.right_pane = ZoomImagePane(content, "右相机", roi_callback=self.set_roi_from_preview)
-        self.left_pane.grid(row=0, column=0, sticky="nsew", padx=(8, 4), pady=8)
-        self.right_pane.grid(row=0, column=1, sticky="nsew", padx=(4, 8), pady=8)
-
-        self.quality_panel = ttk.Frame(self.root, padding=(8, 0))
-        self.quality_panel.pack(side=TOP, fill=X)
+        self.quality_panel = ttk.Frame(self.root, style="Toolbar.TFrame", padding=(12, 0, 12, 0))
+        self.quality_panel.pack(side=TOP, fill=BOTH, expand=True)
         self._build_quality_panels(self.quality_panel)
 
         ttk.Separator(self.root, orient="horizontal").pack(side=TOP, fill=X)
-        status_bar = ttk.Frame(self.root)
+        status_bar = ttk.Frame(self.root, style="StatusBar.TFrame")
         status_bar.pack(side=BOTTOM, fill=X)
         self.status_label = ttk.Label(
             status_bar,
             textvariable=self.status_var,
             style="Status.TLabel",
             anchor="w",
-            padding=(10, 6),
+            padding=(8, 4),
         )
         self.status_label.pack(side=LEFT, fill=X, expand=True)
 
@@ -1472,146 +1704,413 @@ class StereoCaptureOnlyApp:
             pass
         self.style.configure(".", background=BG_COLOR, foreground=TEXT_COLOR, font=(FONT_FAMILY, BASE_FONT_SIZE))
         self.style.configure("TFrame", background=BG_COLOR)
-        self.style.configure("Panel.TFrame", background=PANEL_COLOR)
+        self.style.configure("Toolbar.TFrame", background=SURFACE_COLOR)
+        self.style.configure(
+            "Panel.TFrame",
+            background=PANEL_COLOR,
+            bordercolor=BORDER_COLOR,
+            borderwidth=1,
+            relief="solid",
+        )
+        self.style.configure("InfoBar.TFrame", background=PANEL_ELEVATED_COLOR)
+        self.style.configure("StatusBar.TFrame", background=SURFACE_COLOR)
         self.style.configure("PaneHeader.TFrame", background=PANEL_COLOR)
         self.style.configure("TLabel", background=BG_COLOR, foreground=TEXT_COLOR, font=(FONT_FAMILY, BASE_FONT_SIZE))
-        self.style.configure("Panel.TLabel", background=PANEL_COLOR, foreground=TEXT_COLOR, font=(FONT_FAMILY, BASE_FONT_SIZE))
-        self.style.configure("Value.TLabel", background=BG_COLOR, foreground="#ffffff", font=(FONT_FAMILY, BASE_FONT_SIZE, "bold"))
-        self.style.configure("PaneTitle.TLabel", background=PANEL_COLOR, foreground="white", font=(FONT_FAMILY, TITLE_FONT_SIZE, "bold"))
-        self.style.configure("PaneInfo.TLabel", background=PANEL_COLOR, foreground="#d7d7d7", font=("Consolas", INFO_FONT_SIZE))
-        self.style.configure("Status.TLabel", background=BG_COLOR, foreground=MUTED_TEXT_COLOR, font=(FONT_FAMILY, BASE_FONT_SIZE))
-        self.style.configure("Tooltip.TLabel", background="#202020", foreground="#f2f2f2", font=(FONT_FAMILY, BASE_FONT_SIZE))
-        self.style.configure("TButton", background=PANEL_COLOR, foreground="white", borderwidth=0, padding=(10, 6))
+        self.style.configure(
+            "Panel.TLabel", background=PANEL_COLOR, foreground=TEXT_COLOR, font=(FONT_FAMILY, BASE_FONT_SIZE)
+        )
+        self.style.configure(
+            "CompactPanel.TLabel",
+            background=PANEL_COLOR,
+            foreground=TEXT_COLOR,
+            font=(FONT_FAMILY, max(BASE_FONT_SIZE - 1, 8)),
+        )
+        self.style.configure(
+            "AppTitle.TLabel",
+            background=SURFACE_COLOR,
+            foreground=TEXT_COLOR,
+            font=(FONT_FAMILY, APP_TITLE_FONT_SIZE, "bold"),
+        )
+        self.style.configure(
+            "AppSubtitle.TLabel",
+            background=SURFACE_COLOR,
+            foreground=MUTED_TEXT_COLOR,
+            font=(FONT_FAMILY, BASE_FONT_SIZE),
+        )
+        self.style.configure(
+            "HeaderMeta.TLabel",
+            background=SURFACE_COLOR,
+            foreground=SUBTLE_TEXT_COLOR,
+            font=(FONT_FAMILY, BASE_FONT_SIZE),
+        )
+        self.style.configure(
+            "ParamTitle.TLabel",
+            background=SURFACE_COLOR,
+            foreground=TEXT_COLOR,
+            font=(FONT_FAMILY, BASE_FONT_SIZE, "bold"),
+        )
+        self.style.configure(
+            "HeaderValue.TLabel",
+            background=SURFACE_COLOR,
+            foreground=ACCENT_ACTIVE_COLOR,
+            font=(MONO_FONT_FAMILY, BASE_FONT_SIZE, "bold"),
+        )
+        self.style.configure(
+            "InfoLabel.TLabel",
+            background=PANEL_ELEVATED_COLOR,
+            foreground=SUBTLE_TEXT_COLOR,
+            font=(FONT_FAMILY, BASE_FONT_SIZE),
+        )
+        self.style.configure(
+            "InfoValue.TLabel",
+            background=PANEL_ELEVATED_COLOR,
+            foreground=TEXT_COLOR,
+            font=(FONT_FAMILY, BASE_FONT_SIZE, "bold"),
+        )
+        self.style.configure(
+            "Value.TLabel", background=BG_COLOR, foreground=TEXT_COLOR, font=(FONT_FAMILY, BASE_FONT_SIZE, "bold")
+        )
+        self.style.configure(
+            "PaneTitle.TLabel",
+            background=PANEL_COLOR,
+            foreground=TEXT_COLOR,
+            font=(FONT_FAMILY, TITLE_FONT_SIZE, "bold"),
+        )
+        self.style.configure(
+            "PaneMeta.TLabel",
+            background=PANEL_COLOR,
+            foreground=ACCENT_ACTIVE_COLOR,
+            font=(MONO_FONT_FAMILY, INFO_FONT_SIZE, "bold"),
+        )
+        self.style.configure(
+            "PaneInfo.TLabel",
+            background=PANEL_COLOR,
+            foreground=MUTED_TEXT_COLOR,
+            font=(MONO_FONT_FAMILY, INFO_FONT_SIZE),
+        )
+        self.style.configure(
+            "Performance.TLabel",
+            background=PANEL_COLOR,
+            foreground=SUCCESS_COLOR,
+            font=(MONO_FONT_FAMILY, INFO_FONT_SIZE, "bold"),
+        )
+        self.style.configure(
+            "Status.TLabel", background=SURFACE_COLOR, foreground=MUTED_TEXT_COLOR, font=(FONT_FAMILY, BASE_FONT_SIZE)
+        )
+        self.style.configure(
+            "Tooltip.TLabel",
+            background=PANEL_ELEVATED_COLOR,
+            foreground=TEXT_COLOR,
+            font=(FONT_FAMILY, BASE_FONT_SIZE),
+        )
+        self.style.configure(
+            "TButton",
+            background=PANEL_ELEVATED_COLOR,
+            foreground=TEXT_COLOR,
+            bordercolor=BORDER_COLOR,
+            borderwidth=1,
+            focusthickness=1,
+            focuscolor=ACCENT_COLOR,
+            padding=(8, 4),
+            relief="flat",
+        )
         self.style.map(
             "TButton",
-            background=[("active", "#505050"), ("disabled", "#303030")],
-            foreground=[("disabled", "#777777")],
+            background=[("pressed", SURFACE_COLOR), ("active", "#2a3641"), ("disabled", "#151b22")],
+            bordercolor=[("active", BORDER_STRONG_COLOR), ("disabled", "#232c35")],
+            foreground=[("disabled", SUBTLE_TEXT_COLOR)],
         )
-        self.style.configure("Accent.TButton", background=ACCENT_COLOR, foreground="white", borderwidth=0, padding=(12, 7))
-        self.style.map("Accent.TButton", background=[("active", "#4a90f5"), ("disabled", "#303030")])
-        self.style.configure("TEntry", fieldbackground="#3d3d3d", foreground="white", bordercolor="#555555")
-        self.style.configure("TMenubutton", background=PANEL_COLOR, foreground="white", borderwidth=0, padding=(8, 5))
-        self.style.map("TMenubutton", background=[("active", "#505050"), ("disabled", "#303030")])
-        self.style.configure("TLabelframe", background=BG_COLOR, bordercolor="#555555", relief="solid")
-        self.style.configure("TLabelframe.Label", background=BG_COLOR, foreground="#dcdcdc", font=(FONT_FAMILY, BASE_FONT_SIZE, "bold"))
-        self.style.configure("Horizontal.TSeparator", background="#555555")
-        self.style.configure("Green.Horizontal.TProgressbar", troughcolor="#1f1f1f", background="#41c46d")
-        self.style.configure("Yellow.Horizontal.TProgressbar", troughcolor="#1f1f1f", background="#ffd166")
-        self.style.configure("Red.Horizontal.TProgressbar", troughcolor="#1f1f1f", background="#ff6b6b")
-        self.style.configure("Good.TLabel", background=BG_COLOR, foreground="#7bd88f", font=(FONT_FAMILY, BASE_FONT_SIZE, "bold"))
-        self.style.configure("Warn.TLabel", background=BG_COLOR, foreground="#ffd166", font=(FONT_FAMILY, BASE_FONT_SIZE, "bold"))
-        self.style.configure("Bad.TLabel", background=BG_COLOR, foreground="#ff6b6b", font=(FONT_FAMILY, BASE_FONT_SIZE, "bold"))
-        self.style.configure("PanelGood.TLabel", background=PANEL_COLOR, foreground="#7bd88f", font=(FONT_FAMILY, BASE_FONT_SIZE, "bold"))
-        self.style.configure("PanelWarn.TLabel", background=PANEL_COLOR, foreground="#ffd166", font=(FONT_FAMILY, BASE_FONT_SIZE, "bold"))
-        self.style.configure("PanelBad.TLabel", background=PANEL_COLOR, foreground="#ff6b6b", font=(FONT_FAMILY, BASE_FONT_SIZE, "bold"))
+        self.style.configure(
+            "Accent.TButton",
+            background=ACCENT_COLOR,
+            foreground="#041016",
+            bordercolor=ACCENT_COLOR,
+            borderwidth=1,
+            padding=(10, 4),
+            relief="flat",
+        )
+        self.style.map(
+            "Accent.TButton",
+            background=[("pressed", "#0b7fb2"), ("active", ACCENT_ACTIVE_COLOR), ("disabled", "#17212a")],
+            bordercolor=[("active", ACCENT_ACTIVE_COLOR), ("disabled", "#25313a")],
+            foreground=[("disabled", SUBTLE_TEXT_COLOR)],
+        )
+        self.style.configure(
+            "Capture.TButton",
+            background=SUCCESS_COLOR,
+            foreground="#03130c",
+            bordercolor=SUCCESS_COLOR,
+            borderwidth=1,
+            padding=(10, 4),
+            relief="flat",
+        )
+        self.style.map(
+            "Capture.TButton",
+            background=[("pressed", "#209967"), ("active", "#48d99a"), ("disabled", "#17221d")],
+            bordercolor=[("active", "#48d99a"), ("disabled", "#25322d")],
+            foreground=[("disabled", SUBTLE_TEXT_COLOR)],
+        )
+        self.style.configure(
+            "Record.TButton",
+            background="#b94343",
+            foreground="#fff3f3",
+            bordercolor="#d75a5a",
+            borderwidth=1,
+            padding=(10, 4),
+            relief="flat",
+        )
+        self.style.map(
+            "Record.TButton",
+            background=[("pressed", "#923333"), ("active", DANGER_COLOR), ("disabled", "#241b1d")],
+            bordercolor=[("active", DANGER_COLOR), ("disabled", "#35272a")],
+            foreground=[("disabled", SUBTLE_TEXT_COLOR)],
+        )
+        self.style.configure("Utility.TButton", padding=(9, 4))
+        self.style.configure(
+            "Danger.TButton",
+            background="#2a1d21",
+            foreground="#ffb4b4",
+            bordercolor="#6f373d",
+            borderwidth=1,
+            padding=(9, 4),
+            relief="flat",
+        )
+        self.style.map("Danger.TButton", background=[("pressed", "#21171a"), ("active", "#3a2529")])
+        self.style.configure("Pane.TButton", padding=(7, 3))
+        self.style.configure(
+            "TEntry",
+            fieldbackground=CHART_COLOR,
+            foreground=TEXT_COLOR,
+            bordercolor=BORDER_COLOR,
+            lightcolor=BORDER_COLOR,
+            darkcolor=BORDER_COLOR,
+            insertcolor=TEXT_COLOR,
+            padding=(4, 2),
+        )
+        self.style.map("TEntry", bordercolor=[("focus", ACCENT_COLOR), ("disabled", "#252c34")])
+        self.style.configure(
+            "TMenubutton",
+            background=PANEL_ELEVATED_COLOR,
+            foreground=TEXT_COLOR,
+            bordercolor=BORDER_COLOR,
+            borderwidth=1,
+            padding=(7, 3),
+        )
+        self.style.map(
+            "TMenubutton",
+            background=[("pressed", SURFACE_COLOR), ("active", "#2a3641"), ("disabled", "#151b22")],
+            foreground=[("disabled", SUBTLE_TEXT_COLOR)],
+        )
+        self.style.configure(
+            "TCheckbutton",
+            background=PANEL_COLOR,
+            foreground=TEXT_COLOR,
+            indicatorcolor=CHART_COLOR,
+            focuscolor=ACCENT_COLOR,
+            padding=(2, 1),
+        )
+        self.style.map(
+            "TCheckbutton",
+            background=[("active", PANEL_COLOR)],
+            foreground=[("disabled", SUBTLE_TEXT_COLOR)],
+            indicatorcolor=[("selected", ACCENT_COLOR), ("disabled", "#252c34")],
+        )
+        self.style.configure(
+            "Toolbar.TLabelframe",
+            background=SURFACE_COLOR,
+            bordercolor=BORDER_COLOR,
+            borderwidth=1,
+            relief="solid",
+        )
+        self.style.configure(
+            "ParamPanel.TFrame",
+            background=SURFACE_COLOR,
+            bordercolor=BORDER_COLOR,
+            borderwidth=1,
+            relief="solid",
+        )
+        self.style.configure(
+            "Toolbar.TLabelframe.Label",
+            background=SURFACE_COLOR,
+            foreground=MUTED_TEXT_COLOR,
+            font=(FONT_FAMILY, BASE_FONT_SIZE, "bold"),
+        )
+        self.style.configure(
+            "TLabelframe",
+            background=BG_COLOR,
+            bordercolor=BORDER_COLOR,
+            borderwidth=1,
+            relief="solid",
+        )
+        self.style.configure(
+            "TLabelframe.Label",
+            background=BG_COLOR,
+            foreground=MUTED_TEXT_COLOR,
+            font=(FONT_FAMILY, BASE_FONT_SIZE, "bold"),
+        )
+        self.style.configure("Horizontal.TSeparator", background=BORDER_COLOR)
+        self.style.configure("Green.Horizontal.TProgressbar", troughcolor=CHART_COLOR, background=SUCCESS_COLOR)
+        self.style.configure("Yellow.Horizontal.TProgressbar", troughcolor=CHART_COLOR, background=WARNING_COLOR)
+        self.style.configure("Red.Horizontal.TProgressbar", troughcolor=CHART_COLOR, background=DANGER_COLOR)
+        self.style.configure(
+            "Good.TLabel", background=BG_COLOR, foreground=SUCCESS_COLOR, font=(FONT_FAMILY, BASE_FONT_SIZE, "bold")
+        )
+        self.style.configure(
+            "Warn.TLabel", background=BG_COLOR, foreground=WARNING_COLOR, font=(FONT_FAMILY, BASE_FONT_SIZE, "bold")
+        )
+        self.style.configure(
+            "Bad.TLabel", background=BG_COLOR, foreground=DANGER_COLOR, font=(FONT_FAMILY, BASE_FONT_SIZE, "bold")
+        )
+        self.style.configure(
+            "PanelGood.TLabel",
+            background=PANEL_COLOR,
+            foreground=SUCCESS_COLOR,
+            font=(FONT_FAMILY, BASE_FONT_SIZE, "bold"),
+        )
+        self.style.configure(
+            "PanelWarn.TLabel",
+            background=PANEL_COLOR,
+            foreground=WARNING_COLOR,
+            font=(FONT_FAMILY, BASE_FONT_SIZE, "bold"),
+        )
+        self.style.configure(
+            "PanelBad.TLabel",
+            background=PANEL_COLOR,
+            foreground=DANGER_COLOR,
+            font=(FONT_FAMILY, BASE_FONT_SIZE, "bold"),
+        )
 
     def _build_quality_panels(self, parent: ttk.Frame) -> None:
-        parent.grid_columnconfigure(0, weight=1)
-        parent.grid_columnconfigure(1, weight=1)
-        parent.grid_columnconfigure(2, weight=1)
-        parent.grid_columnconfigure(3, weight=1)
+        parent.grid_columnconfigure(0, weight=7, uniform="quality_panels")
+        parent.grid_columnconfigure(1, weight=4, uniform="quality_panels")
+        monitor_height = QUALITY_MONITOR_MIN_HEIGHT
+        try:
+            if int(self.root.winfo_screenheight()) >= 1200:
+                monitor_height = QUALITY_MONITOR_HIGH_RES_MIN_HEIGHT
+        except Exception:
+            pass
+        parent.grid_rowconfigure(0, minsize=monitor_height, weight=1)
+        parent.grid_rowconfigure(1, weight=0)
 
-        self.focus_panel = ttk.LabelFrame(parent, text="对焦辅助", padding=(8, 6))
-        self.focus_panel.grid(row=0, column=0, sticky="nsew", padx=(0, 6), pady=(0, 8))
+        self.focus_panel = ttk.LabelFrame(parent, text="对焦辅助", padding=(6, 4))
+        self.focus_panel.grid(row=0, column=0, sticky="nsew", padx=(0, 5), pady=(0, 5))
         self._build_focus_panel(self.focus_panel)
 
-        self.exposure_panel = ttk.LabelFrame(parent, text="曝光监控", padding=(8, 6))
-        self.exposure_panel.grid(row=0, column=1, sticky="nsew", padx=6, pady=(0, 8))
+        self.exposure_panel = ttk.LabelFrame(parent, text="曝光监控", padding=(6, 4))
+        self.exposure_panel.grid(row=0, column=1, sticky="nsew", padx=(5, 0), pady=(0, 5))
         self._build_exposure_panel(self.exposure_panel)
 
-        self.validation_panel = ttk.LabelFrame(parent, text="采集校验", padding=(8, 6))
-        self.validation_panel.grid(row=0, column=2, sticky="nsew", padx=(6, 0), pady=(0, 8))
+        self.validation_panel = ttk.Frame(parent, style="Panel.TFrame", padding=(6, 4))
+        self.validation_panel.grid(row=1, column=0, columnspan=2, sticky="nsew", padx=0, pady=(0, 5))
         self._build_validation_panel(self.validation_panel)
 
-        self.project_panel = ttk.LabelFrame(parent, text="项目/导出", padding=(8, 6))
-        self.project_panel.grid(row=0, column=3, sticky="nsew", padx=(6, 0), pady=(0, 8))
-        self._build_project_panel(self.project_panel)
+    def _build_camera_side_panels(self, parent: ttk.Frame) -> None:
+        self.focus_panel = ttk.LabelFrame(parent, text="对焦辅助", padding=(6, 4))
+        self.focus_panel.pack(side=TOP, fill=X, pady=(0, 8))
+        self._build_focus_panel(self.focus_panel)
+
+        self.exposure_panel = ttk.LabelFrame(parent, text="曝光监控", padding=(6, 4))
+        self.exposure_panel.pack(side=TOP, fill=X)
+        self._build_exposure_panel(self.exposure_panel)
 
     def _build_focus_panel(self, panel: ttk.LabelFrame) -> None:
-        top = ttk.Frame(panel)
+        top = ttk.Frame(panel, style="Panel.TFrame")
         top.pack(side=TOP, fill=X)
-        self.focus_collapse_button = ttk.Button(top, text="v", width=3, command=self._toggle_focus_panel)
-        self.focus_collapse_button.pack(side=LEFT, padx=(0, 6))
         ttk.Checkbutton(top, text="峰值对焦", variable=self.focus_peaking_var, command=self._sync_quality_toggles).pack(
-            side=LEFT, padx=(0, 8)
+            side=LEFT, padx=(0, 6)
         )
         ttk.Checkbutton(top, text="放大镜", variable=self.magnifier_enabled_var, command=self._sync_quality_toggles).pack(
-            side=LEFT, padx=(0, 8)
+            side=LEFT, padx=(0, 6)
         )
-        self.focus_roi_button = ttk.Button(top, text="框选对焦ROI", command=self.toggle_focus_roi_edit_mode)
-        self.focus_roi_button.pack(side=LEFT, padx=(0, 6))
-        ttk.Button(top, text="设为目标", command=self.set_focus_reference).pack(side=LEFT, padx=(0, 6))
-        ttk.Button(top, text="保存对焦基准", command=self.save_focus_reference_snapshot).pack(side=LEFT, padx=(0, 6))
 
-        self.focus_panel_body = ttk.Frame(panel)
-        self.focus_panel_body.pack(side=TOP, fill=X)
-        score_row = ttk.Frame(self.focus_panel_body)
-        score_row.pack(side=TOP, fill=X, pady=(6, 0))
+        self.focus_panel_body = ttk.Frame(panel, style="Panel.TFrame")
+        self.focus_panel_body.pack(side=TOP, fill=BOTH, expand=True)
+        self.focus_panel_body.grid_columnconfigure(0, weight=3)
+        self.focus_panel_body.grid_columnconfigure(1, weight=2, minsize=260)
+        self.focus_panel_body.grid_rowconfigure(0, weight=1)
+
+        focus_controls = ttk.Frame(self.focus_panel_body, style="Panel.TFrame")
+        focus_controls.grid(row=0, column=0, sticky="nsew", padx=(0, 6))
+
+        command_row = ttk.Frame(focus_controls, style="Panel.TFrame")
+        command_row.pack(side=TOP, fill=X, pady=(3, 0))
+        self.focus_roi_button = ttk.Button(command_row, text="框选对焦ROI", command=self.toggle_focus_roi_edit_mode)
+        self.focus_roi_button.pack(side=LEFT, padx=(0, 4))
+        ttk.Button(command_row, text="设为目标", command=self.set_focus_reference).pack(side=LEFT, padx=(0, 4))
+        ttk.Button(command_row, text="保存基准", command=self.save_focus_reference_snapshot).pack(side=LEFT)
+        score_row = ttk.Frame(focus_controls, style="Panel.TFrame")
+        score_row.pack(side=TOP, fill=X, pady=(3, 0))
         ttk.Label(score_row, textvariable=self.focus_score_var).pack(side=LEFT, padx=(0, 8))
         self.focus_progress = ttk.Progressbar(score_row, mode="determinate", maximum=100, style="Yellow.Horizontal.TProgressbar")
         self.focus_progress.pack(side=LEFT, fill=X, expand=True, padx=(0, 8))
         self.focus_status_label = ttk.Label(score_row, textvariable=self.focus_status_var, style="Warn.TLabel", width=18)
         self.focus_status_label.pack(side=LEFT)
 
-        detail_row = ttk.Frame(self.focus_panel_body)
-        detail_row.pack(side=TOP, fill=X, pady=(5, 0))
+        detail_row = ttk.Frame(focus_controls, style="Panel.TFrame")
+        detail_row.pack(side=TOP, fill=X, pady=(2, 0))
         self.focus_detail_label = ttk.Label(detail_row, textvariable=self.focus_detail_var, style="Panel.TLabel")
         self.focus_detail_label.pack(side=LEFT, fill=X, expand=True)
         ttk.Label(detail_row, textvariable=self.focus_roi_var, style="Panel.TLabel").pack(side=RIGHT)
 
-        peak_row = ttk.Frame(self.focus_panel_body)
-        peak_row.pack(side=TOP, fill=X, pady=(5, 0))
+        peak_row = ttk.Frame(focus_controls, style="Panel.TFrame")
+        peak_row.pack(side=TOP, fill=X, pady=(2, 0))
         ttk.Label(peak_row, textvariable=self.focus_peak_var, style="Panel.TLabel").pack(side=LEFT, padx=(0, 8))
         self.focus_chart_canvas = Canvas(
-            peak_row, width=260, height=44, bg="#151515", highlightthickness=1, highlightbackground="#555555"
+            peak_row, width=240, height=36, bg=CHART_COLOR, highlightthickness=1, highlightbackground=BORDER_COLOR
         )
         self.focus_chart_canvas.pack(side=LEFT, fill=X, expand=True)
 
-        self.magnifier_frame = ttk.LabelFrame(self.focus_panel_body, text="对焦放大镜", padding=(6, 4))
-        self.magnifier_frame.pack(side=TOP, fill=X, pady=(6, 0))
-        mag_top = ttk.Frame(self.magnifier_frame)
+        self.magnifier_frame = ttk.LabelFrame(self.focus_panel_body, text="对焦放大镜", padding=(5, 3))
+        self.magnifier_frame.grid(row=0, column=1, sticky="nsew")
+        mag_top = ttk.Frame(self.magnifier_frame, style="Panel.TFrame")
         mag_top.pack(side=TOP, fill=X)
         self.magnifier_info_var = StringVar(value="倍率 100% | 点击预览锁定/解锁，滚轮调倍率")
         ttk.Label(mag_top, textvariable=self.magnifier_info_var, style="Panel.TLabel").pack(side=LEFT, fill=X, expand=True)
-        self.magnifier_canvas = Canvas(self.magnifier_frame, width=240, height=180, bg="#111111", highlightthickness=1, highlightbackground="#555555")
-        self.magnifier_canvas.pack(side=TOP, fill=BOTH, expand=True, pady=(4, 0))
+        self.magnifier_canvas = Canvas(
+            self.magnifier_frame, width=260, height=150, bg=CHART_COLOR, highlightthickness=1, highlightbackground=BORDER_COLOR
+        )
+        self.magnifier_canvas.pack(side=TOP, fill=BOTH, expand=True, pady=(2, 0))
         self._magnifier_image_ref: ImageTk.PhotoImage | None = None
         self.left_pane.bind_external("<Motion>", self._on_magnifier_motion)
         self.left_pane.bind_external("<ButtonPress-1>", self._on_magnifier_click)
         self.left_pane.bind_external("<MouseWheel>", self._on_magnifier_wheel)
         self.left_pane.bind_external("<Button-4>", self._on_magnifier_wheel)
         self.left_pane.bind_external("<Button-5>", self._on_magnifier_wheel)
+        self._update_quality_optional_sections()
 
     def _build_exposure_panel(self, panel: ttk.LabelFrame) -> None:
-        top = ttk.Frame(panel)
+        top = ttk.Frame(panel, style="Panel.TFrame")
         top.pack(side=TOP, fill=X)
-        self.exposure_collapse_button = ttk.Button(top, text="v", width=3, command=self._toggle_exposure_panel)
-        self.exposure_collapse_button.pack(side=LEFT, padx=(0, 6))
         ttk.Checkbutton(top, text="直方图", variable=self.histogram_enabled_var, command=self._sync_quality_toggles).pack(
-            side=LEFT, padx=(0, 8)
+            side=LEFT, padx=(0, 6)
         )
         ttk.Checkbutton(top, text="斑马纹", variable=self.zebra_var, command=self._sync_quality_toggles).pack(side=LEFT)
-        self.exposure_status_label = ttk.Label(top, textvariable=self.exposure_status_var, style="Panel.TLabel")
-        self.exposure_status_label.pack(side=RIGHT)
 
-        self.exposure_panel_body = ttk.Frame(panel)
-        self.exposure_panel_body.pack(side=TOP, fill=X)
-        hist_row = ttk.Frame(self.exposure_panel_body)
-        hist_row.pack(side=TOP, fill=X, pady=(6, 0))
+        self.exposure_panel_body = ttk.Frame(panel, style="Panel.TFrame")
+        self.exposure_panel_body.pack(side=TOP, fill=BOTH, expand=True)
+        self.exposure_status_label = ttk.Label(
+            self.exposure_panel_body, textvariable=self.exposure_status_var, style="Panel.TLabel"
+        )
+        self.exposure_status_label.pack(side=TOP, fill=X, pady=(3, 0))
+        ttk.Label(self.exposure_panel_body, textvariable=self.exposure_advice_var, style="Panel.TLabel").pack(
+            side=TOP, fill=X, pady=(2, 0)
+        )
+        hist_row = ttk.Frame(self.exposure_panel_body, style="Panel.TFrame")
+        hist_row.pack(side=TOP, fill=BOTH, expand=True, pady=(3, 0))
         hist_row.grid_columnconfigure(0, weight=1)
         hist_row.grid_columnconfigure(1, weight=1)
+        hist_row.grid_rowconfigure(0, weight=1)
         self.left_hist_canvas = HistogramCanvas(hist_row, "左直方图")
         self.right_hist_canvas = HistogramCanvas(hist_row, "右直方图")
         self.left_hist_canvas.grid(row=0, column=0, sticky="nsew", padx=(0, 4))
         self.right_hist_canvas.grid(row=0, column=1, sticky="nsew", padx=(4, 0))
-        ttk.Label(self.exposure_panel_body, textvariable=self.exposure_advice_var, style="Panel.TLabel").pack(side=TOP, fill=X, pady=(5, 0))
 
     def _build_validation_panel(self, panel: ttk.LabelFrame) -> None:
-        top = ttk.Frame(panel)
+        top = ttk.Frame(panel, style="Panel.TFrame")
         top.pack(side=TOP, fill=X)
-        self.validation_collapse_button = ttk.Button(top, text="v", width=3, command=self._toggle_validation_panel)
-        self.validation_collapse_button.pack(side=LEFT, padx=(0, 6))
-        ttk.Label(top, text="预览模式", style="Panel.TLabel").pack(side=LEFT, padx=(0, 4))
+        self.validation_panel_body = top
+        self.validation_collapse_button = ttk.Button(top, text="校验", width=5, state=DISABLED)
+        ttk.Label(top, text="预览模式", style="CompactPanel.TLabel").pack(side=LEFT, padx=(0, 4))
         ttk.OptionMenu(
             top,
             self.stereo_preview_mode_var,
@@ -1621,8 +2120,8 @@ class StereoCaptureOnlyApp:
             "交替闪烁",
             "校正叠加",
             command=self._on_quality_menu_changed,
-        ).pack(side=LEFT, padx=(0, 10))
-        ttk.Label(top, text="辅助线", style="Panel.TLabel").pack(side=LEFT, padx=(0, 4))
+        ).pack(side=LEFT, padx=(0, 6))
+        ttk.Label(top, text="辅助线", style="CompactPanel.TLabel").pack(side=LEFT, padx=(0, 4))
         ttk.OptionMenu(
             top,
             self.guide_mode_var,
@@ -1631,82 +2130,112 @@ class StereoCaptureOnlyApp:
             "中心十字",
             "全部网格线",
             command=self._on_quality_menu_changed,
-        ).pack(side=LEFT, padx=(0, 10))
+        ).pack(side=LEFT, padx=(0, 6))
         self.epipolar_button = ttk.Button(top, text="极线对准检查", command=self.run_epipolar_check)
-        self.epipolar_button.pack(side=LEFT)
-
-        self.validation_panel_body = ttk.Frame(panel)
-        self.validation_panel_body.pack(side=TOP, fill=X)
-        ttk.Label(self.validation_panel_body, textvariable=self.capture_gate_var, style="Panel.TLabel").pack(side=TOP, fill=X, pady=(6, 0))
-        self.epipolar_label = ttk.Label(self.validation_panel_body, textvariable=self.epipolar_status_var, style="Panel.TLabel")
-        self.epipolar_label.pack(side=TOP, fill=X, pady=(4, 0))
-        ttk.Label(self.validation_panel_body, textvariable=self.calibration_status_var, style="Panel.TLabel").pack(side=TOP, fill=X, pady=(4, 0))
+        self.epipolar_button.pack(side=LEFT, padx=(0, 10))
+        ttk.Label(
+            top, textvariable=self.capture_gate_var, style="CompactPanel.TLabel"
+        ).pack(side=LEFT, fill=X, expand=True, padx=(0, 8))
+        self.epipolar_label = ttk.Label(
+            top, textvariable=self.epipolar_status_var, style="CompactPanel.TLabel"
+        )
+        self.epipolar_label.pack(side=LEFT, fill=X, expand=True, padx=(0, 8))
+        ttk.Label(
+            top, textvariable=self.calibration_status_var, style="CompactPanel.TLabel"
+        ).pack(side=LEFT, fill=X, expand=True)
 
     def _build_project_panel(self, panel: ttk.LabelFrame) -> None:
-        top = ttk.Frame(panel)
+        top = ttk.Frame(panel, style="Panel.TFrame")
         top.pack(side=TOP, fill=X)
-        ttk.Button(top, text="新建项目", command=self.create_new_project).pack(side=LEFT, padx=(0, 6))
-        ttk.Button(top, text="重载标定", command=self.reload_calibration).pack(side=LEFT, padx=(0, 6))
+        ttk.Button(top, text="新建项目", command=self.create_new_project).pack(side=LEFT, padx=(0, 4))
+        ttk.Button(top, text="重载标定", command=self.reload_calibration).pack(side=LEFT, padx=(0, 4))
         ttk.Checkbutton(top, text="HDR", variable=self.hdr_enabled_var).pack(side=LEFT)
 
-        body = ttk.Frame(panel)
-        body.pack(side=TOP, fill=X, pady=(6, 0))
-        ttk.Label(body, text="项目", style="Panel.TLabel").grid(row=0, column=0, sticky="w", padx=(0, 4), pady=2)
-        ttk.Label(body, textvariable=self.project_id_var, style="Panel.TLabel").grid(row=0, column=1, sticky="ew", pady=2)
-        ttk.Label(body, text="EV", style="Panel.TLabel").grid(row=1, column=0, sticky="w", padx=(0, 4), pady=2)
-        ttk.Entry(body, textvariable=self.hdr_sequence_var, width=18).grid(row=1, column=1, sticky="ew", pady=2)
+        body = ttk.Frame(panel, style="Panel.TFrame")
+        body.pack(side=TOP, fill=X, pady=(3, 0))
+        ttk.Label(body, text="项目", style="Panel.TLabel").grid(row=0, column=0, sticky="w", padx=(0, 4), pady=1)
+        ttk.Label(body, textvariable=self.project_id_var, style="Panel.TLabel").grid(row=0, column=1, sticky="ew", pady=1)
+        ttk.Label(body, text="EV", style="Panel.TLabel").grid(row=1, column=0, sticky="w", padx=(0, 4), pady=1)
+        ttk.Entry(body, textvariable=self.hdr_sequence_var, width=18).grid(row=1, column=1, sticky="ew", pady=1)
         ttk.Label(body, textvariable=self.calibration_summary_var, style="Panel.TLabel").grid(
-            row=2, column=0, columnspan=2, sticky="ew", pady=(4, 0)
+            row=2, column=0, columnspan=2, sticky="ew", pady=(2, 0)
         )
         ttk.Label(body, textvariable=self.temperature_status_var, style="Panel.TLabel").grid(
-            row=3, column=0, columnspan=2, sticky="ew", pady=(4, 0)
+            row=3, column=0, columnspan=2, sticky="ew", pady=(2, 0)
         )
         body.grid_columnconfigure(1, weight=1)
 
     def _configure_parameter_grid(self, panel: ttk.Frame) -> None:
         widths = {
-            0: 54,
-            1: 96,
-            2: 36,
-            3: 74,
-            4: 42,
-            5: 74,
-            6: 42,
-            7: 74,
-            8: 42,
-            9: 70,
-            10: 90,
+            0: 28,
+            1: 86,
+            2: 32,
+            3: 86,
         }
         for column, width in widths.items():
             panel.grid_columnconfigure(column, minsize=width, weight=0)
-        panel.grid_columnconfigure(10, weight=1)
+        panel.grid_columnconfigure(1, weight=1)
+        panel.grid_columnconfigure(3, weight=1)
 
     def _labeled_entry(
         self, parent: ttk.Frame, label: str, variable: StringVar, width: int = 7, row: int = 0, column: int = 0
     ) -> ttk.Entry:
         ttk.Label(parent, text=label, style="Panel.TLabel", anchor="e").grid(
-            row=row, column=column, padx=(8, 3), pady=3, sticky="e"
+            row=row, column=column, padx=(4, 1), pady=1, sticky="e"
         )
         entry = ttk.Entry(parent, textvariable=variable, width=width)
-        entry.grid(row=row, column=column + 1, padx=(0, 4), pady=3, sticky="ew")
+        entry.grid(row=row, column=column + 1, padx=(0, 2), pady=1, sticky="ew")
         return entry
+
+    def _toggle_param_panel(self) -> None:
+        self.param_panel_open_var.set(True)
+        if not self.param_panel_body.winfo_manager():
+            self.param_panel_body.pack(side=TOP, fill=X, pady=(5, 0))
+        if self.param_panel.winfo_manager():
+            self.param_panel.pack_configure(fill=BOTH, expand=True)
+        if hasattr(self, "camera_strip"):
+            self.root.update_idletasks()
+            self.camera_strip._layout_children()
+
+    def show_project_export_popup(self) -> None:
+        popup = getattr(self, "_project_export_popup", None)
+        if popup is not None and popup.winfo_exists():
+            popup.lift()
+            popup.focus_force()
+            return
+
+        popup = Toplevel(self.root)
+        self._project_export_popup = popup
+        popup.title("项目/导出")
+        popup.configure(bg=BG_COLOR)
+        popup.transient(self.root)
+        popup.geometry("+%d+%d" % (self.root.winfo_rootx() + 96, self.root.winfo_rooty() + 96))
+        popup.protocol("WM_DELETE_WINDOW", popup.destroy)
+
+        container = ttk.LabelFrame(popup, text="项目/导出", padding=(10, 8))
+        container.pack(side=TOP, fill=BOTH, expand=True, padx=12, pady=12)
+        self._build_project_panel(container)
+        popup.update_idletasks()
+        width = max(container.winfo_reqwidth() + 32, 520)
+        height = max(container.winfo_reqheight() + 36, 190)
+        popup.geometry(f"{width}x{height}+{self.root.winfo_rootx() + 96}+{self.root.winfo_rooty() + 96}")
 
     def _toggle_panel(self, panel_name: str) -> None:
         mapping = {
-            "focus": (self.focus_panel_body, self.focus_panel_open_var, self.focus_collapse_button),
-            "exposure": (self.exposure_panel_body, self.exposure_panel_open_var, self.exposure_collapse_button),
             "validation": (self.validation_panel_body, self.validation_panel_open_var, self.validation_collapse_button),
         }
+        if panel_name not in mapping:
+            return
         body, variable, button = mapping[panel_name]
         is_open = bool(variable.get())
         if is_open:
             body.pack_forget()
             variable.set(False)
-            button.configure(text=">")
+            button.configure(text="展开")
         else:
             body.pack(side=TOP, fill=X)
             variable.set(True)
-            button.configure(text="v")
+            button.configure(text="收起")
             self._redraw_panel_after_expand(panel_name)
 
     def _redraw_panel_after_expand(self, panel_name: str) -> None:
@@ -1717,13 +2246,13 @@ class StereoCaptureOnlyApp:
                 histogram.redraw_when_visible()
 
     def _toggle_focus_panel(self) -> None:
-        self._toggle_panel("focus")
+        return None
 
     def _toggle_exposure_panel(self) -> None:
-        self._toggle_panel("exposure")
+        return None
 
     def _toggle_validation_panel(self) -> None:
-        self._toggle_panel("validation")
+        self.validation_panel_open_var.set(True)
 
     def _on_fullscreen_key(self, _event=None) -> None:
         self.toggle_fullscreen()
@@ -1774,12 +2303,12 @@ class StereoCaptureOnlyApp:
         if left_info is not None:
             self.left_pane.set_title(f"左相机：{left_info.label}")
         else:
-            self.left_pane.set_title("左相机：No Signal")
+            self.left_pane.set_title("左相机：无信号")
             self.left_pane.set_no_signal()
         if right_info is not None:
             self.right_pane.set_title(f"右相机：{right_info.label}")
         else:
-            self.right_pane.set_title("右相机：No Signal")
+            self.right_pane.set_title("右相机：无信号")
             self.right_pane.set_no_signal()
         self._update_stereo_controls()
 
@@ -1832,7 +2361,7 @@ class StereoCaptureOnlyApp:
             if frame is not None:
                 self.left_pane.set_display_image(frame.image, f"Blink {side} {frame.width}x{frame.height}")
             else:
-                self.left_pane.set_no_signal(f"Blink {side}: No Signal")
+                self.left_pane.set_no_signal(f"闪烁 {side}: 无信号")
             self.right_pane.set_no_signal("交替闪烁模式使用左侧单窗显示")
         elif mode == "校正叠加" and left is not None and right is not None:
             image = self._rectified_overlay_for_frames(left, right)
@@ -1949,7 +2478,7 @@ class StereoCaptureOnlyApp:
         self._set_last_quality_metrics(None)
         self.previewing = True
         self.preview_button.configure(text="停止采集")
-        self.status_var.set("实时采集中。鼠标左键拖动画面平移，滚轮缩放；需要框选 ROI 时点击“修改ROI”。")
+        self.status_var.set("实时采集中。鼠标左键拖动画面平移，滚轮缩放；需要框选 ROI 时点击“框选ROI”。")
         self._set_capture_buttons(NORMAL)
         if self.recording or self.interval_capturing:
             return
@@ -2276,7 +2805,7 @@ class StereoCaptureOnlyApp:
         self.previewing = display_enabled
         self.interval_stop_event.clear()
         self.interval_count = 0
-        self._set_interval_lamp("#d32f2f")
+        self._set_interval_lamp(DANGER_COLOR)
         self.interval_button.configure(text="停止定时")
         self._set_capture_buttons(NORMAL)
         count_text = "持续拍照" if limit is None else f"拍 {limit} 组"
@@ -2288,7 +2817,7 @@ class StereoCaptureOnlyApp:
         self.interval_capturing = False
         self.interval_stop_event.set()
         self.interval_button.configure(state=DISABLED)
-        self._set_interval_lamp("#666666")
+        self._set_interval_lamp(SUBTLE_TEXT_COLOR)
         self.status_var.set("正在停止定时拍照...")
 
     def _interval_capture_loop(self, interval_s: float, limit: int | None) -> None:
@@ -2981,11 +3510,11 @@ class StereoCaptureOnlyApp:
         if self._interval_lamp_after_id is not None:
             self.root.after_cancel(self._interval_lamp_after_id)
             self._interval_lamp_after_id = None
-        self._set_interval_lamp("#2e7d32")
+        self._set_interval_lamp(SUCCESS_COLOR)
 
         def restore() -> None:
             self._interval_lamp_after_id = None
-            self._set_interval_lamp("#d32f2f" if self.interval_capturing else "#666666")
+            self._set_interval_lamp(DANGER_COLOR if self.interval_capturing else SUBTLE_TEXT_COLOR)
 
         self._interval_lamp_after_id = self.root.after(1000, restore)
 
@@ -3010,7 +3539,7 @@ class StereoCaptureOnlyApp:
             self.focus_roi_editing = False
             if hasattr(self, "focus_roi_button"):
                 self.focus_roi_button.configure(text="框选对焦ROI")
-        self.edit_roi_button.configure(text="退出ROI" if enabled else "修改ROI")
+        self.edit_roi_button.configure(text="退出ROI" if enabled else "框选ROI")
         self.left_pane.set_roi_mode(enabled)
         self.right_pane.set_roi_mode(enabled)
 
@@ -3354,7 +3883,7 @@ class StereoCaptureOnlyApp:
                     self.interval_button.configure(text="定时拍照")
                     self.preview_button.configure(text="停止采集" if self.previewing else "开始采集")
                     if self._interval_lamp_after_id is None:
-                        self._set_interval_lamp("#666666")
+                        self._set_interval_lamp(SUBTLE_TEXT_COLOR)
                     if self.camera_system is not None and not self.recording:
                         self._set_capture_buttons(NORMAL)
                     if not payload:
@@ -3567,9 +4096,17 @@ class StereoCaptureOnlyApp:
         exposure_monitor["histogram_enabled"] = bool(self.histogram_enabled_var.get())
         self._focus_peaking_enabled_setting = bool(self.focus_peaking_var.get())
         self._histogram_enabled_setting = bool(self.histogram_enabled_var.get())
+        self._update_quality_optional_sections()
         save_config(self.config)
         if hasattr(self, "left_pane"):
             self._display_frames(self._last_left_frame_obj, self._last_right_frame_obj)
+
+    def _update_quality_optional_sections(self) -> None:
+        if not hasattr(self, "magnifier_frame"):
+            return
+        if not self.magnifier_frame.winfo_manager():
+            self.magnifier_frame.grid(row=0, column=1, sticky="nsew")
+        self._update_magnifier()
 
     def _set_last_quality_metrics(self, metrics: dict[str, object] | None) -> None:
         with self._quality_metrics_lock:
@@ -3691,14 +4228,14 @@ class StereoCaptureOnlyApp:
             self._focus_peak_score = score
         peak = max(self._focus_peak_score, 1e-9)
         pct = max(min(score / peak * 100.0, 100.0), 0.0)
-        self.focus_peak_var.set(f"Peak {self._focus_peak_score:.1f} | {pct:.0f}%")
+        self.focus_peak_var.set(f"峰值 {self._focus_peak_score:.1f} | {pct:.0f}%")
         if not hasattr(self, "focus_chart_canvas"):
             return
         canvas = self.focus_chart_canvas
         canvas.delete("all")
         width = max(canvas.winfo_width(), 40)
         height = max(canvas.winfo_height(), 32)
-        canvas.create_rectangle(0, 0, width, height, fill="#151515", outline="")
+        canvas.create_rectangle(0, 0, width, height, fill=CHART_COLOR, outline="")
         if len(self._focus_history) < 2:
             return
         scores = [item[1] for item in self._focus_history]
@@ -3709,8 +4246,14 @@ class StereoCaptureOnlyApp:
             x = 4 + index * (width - 8) / max(count - 1, 1)
             y = height - 4 - (value / max_score) * (height - 8)
             points.extend([x, y])
-        canvas.create_line(*points, fill="#7bd88f", width=2, smooth=True)
-        canvas.create_line(4, height - 4 - (score / max_score) * (height - 8), width - 4, height - 4 - (score / max_score) * (height - 8), fill="#ffd166")
+        canvas.create_line(*points, fill=SUCCESS_COLOR, width=2, smooth=True)
+        canvas.create_line(
+            4,
+            height - 4 - (score / max_score) * (height - 8),
+            width - 4,
+            height - 4 - (score / max_score) * (height - 8),
+            fill=WARNING_COLOR,
+        )
 
     def _update_focus_display(self, focus: dict[str, object]) -> None:
         score = float(focus.get("score") or 0.0)
@@ -4089,7 +4632,7 @@ class StereoCaptureOnlyApp:
             return
         self.magnifier_canvas.delete("all")
         if not self.magnifier_enabled_var.get() or self._last_left_frame_obj is None:
-            self.magnifier_canvas.create_text(120, 90, text="未开启", fill="#777777", anchor="center")
+            self.magnifier_canvas.create_text(120, 90, text="未开启", fill=SUBTLE_TEXT_COLOR, anchor="center")
             return
         image = self._last_left_frame_obj.image
         roi = clamp_roi_frac(self._magnifier_roi_frac)

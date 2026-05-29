@@ -12,7 +12,7 @@
   "gain_auto": "Once",
   "auto_gain_lower_limit": 0.0,
   "auto_gain_upper_limit": 15.0,
-  "balance_white_auto": "Off",
+  "balance_white_auto": "Once",
   "balance_ratio_red": null,
   "balance_ratio_green": null,
   "balance_ratio_blue": null,
@@ -96,8 +96,8 @@
     }
   },
   "focus_roi": {
-    "x_frac": 0.07236842105263158,
-    "y_frac": 0.9451754385964912,
+    "x_frac": 0.3355263157894737,
+    "y_frac": 0.5586622807017544,
     "w_frac": 0.03654970760233918,
     "h_frac": 0.05482456140350877
   },
@@ -154,8 +154,8 @@
   "project": {
     "enabled": true,
     "projects_subdir": "projects",
-    "current_project_id": "20260526_154649_234",
-    "current_project_name": "Project 20260526_154649_234"
+    "current_project_id": "20260529_111703_409",
+    "current_project_name": "Project 20260529_111703_409"
   },
   "hdr_bracketing": {
     "enabled": true,
@@ -169,5 +169,6 @@
     "settle_seconds": 0.1,
     "min_exposure_time_us": 50.0,
     "max_exposure_time_us": 1000000.0
-  }
+  },
+  "close_thread_join_timeout_seconds": 1.0
 }
