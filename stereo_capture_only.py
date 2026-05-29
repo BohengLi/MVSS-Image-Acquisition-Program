@@ -4196,7 +4196,7 @@ class StereoCaptureOnlyApp:
             "record_disk_min_free_gb": 2.0,
             "record_stop_on_low_disk": True,
             "record_writer_stop_timeout_seconds": 10.0,
-            "close_thread_join_timeout_seconds": 1.0,
+            "close_thread_join_timeout_seconds": 10.0,
             "record_writer_batch_size": 4,
             "record_meta_flush_every": 32,
             "focus_peaking_overlay_interval_seconds": 0.20,
@@ -4207,6 +4207,7 @@ class StereoCaptureOnlyApp:
             "timestamp_reject_enabled": False,
             "max_camera_timestamp_delta": 0,
             "max_host_timestamp_delta": DEFAULT_HOST_TIMESTAMP_DELTA_NS,
+            "camera_timestamp_offset_samples": 5,
         }
         for key, value in defaults.items():
             self.config.setdefault(key, value)
@@ -5786,7 +5787,7 @@ class StereoCaptureOnlyApp:
             self.left_pane.unbind_external_callbacks()
             self.right_pane.unbind_external_callbacks()
             self._set_recording_indicator(False)
-        join_timeout = max(config_float(self.config, "close_thread_join_timeout_seconds", 1.0), 0.1)
+        join_timeout = max(config_float(self.config, "close_thread_join_timeout_seconds", 10.0), 0.1)
         self._join_thread_on_close(self.preview_thread, join_timeout)
         self._join_thread_on_close(self.interval_thread, join_timeout)
         self._join_thread_on_close(self.record_thread, join_timeout)

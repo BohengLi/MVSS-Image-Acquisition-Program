@@ -14,7 +14,7 @@ from typing import Any
 import numpy as np
 from PIL import Image
 
-from config_utils import config_bool
+from config_utils import config_bool, config_int
 
 _DLL_DIRECTORIES: list[Any] = []
 LOGGER = logging.getLogger("mvss_capture")
@@ -672,9 +672,9 @@ class MvsCamera:
         if not self._grabbing:
             return
         ret = self._cam.MV_CC_StopGrabbing()
-        self._grabbing = False
         if ret != 0:
             raise MvsError(f"{self.info.label} 停止取流失败: 0x{ret:08x}")
+        self._grabbing = False
 
     def close(self) -> None:
         try:
@@ -991,11 +991,14 @@ class StereoCameraSystem:
         if self.max_camera_timestamp_delta <= 0 and self.max_host_timestamp_delta <= 0:
             self.timestamp_reject_enabled = False
         self.require_hardware_trigger = config_bool(config, "require_hardware_trigger", False)
+        self.camera_timestamp_offset_samples = max(config_int(config, "camera_timestamp_offset_samples", 5), 1)
         self._camera_timestamp_offset: int | None = None
+        self._camera_timestamp_offset_samples: list[int] = []
         self._capture_lock = threading.Lock()
 
     def connect(self) -> tuple[CameraInfo | None, CameraInfo | None]:
         self._camera_timestamp_offset = None
+        self._camera_timestamp_offset_samples = []
         left_info, right_info, dev_list = select_capture_devices(
             str(self.config.get("left_serial", "")).strip(),
             str(self.config.get("right_serial", "")).strip(),
@@ -1016,7 +1019,7 @@ class StereoCameraSystem:
                     exposure_time_us=float(self.config.get("exposure_time_us", 0) or 0),
                     gain=float(self.config.get("gain", -1)),
                     pixel_format=str(self.config.get("pixel_format", "Mono8")),
-                    gain_auto=str(self.config.get("gain_auto", self.config.get("gain_auto_mode", "Off"))),
+                    gain_auto=str(self.config.get("gain_auto", "Off")),
                     auto_gain_lower_limit=self._optional_float("auto_gain_lower_limit"),
                     auto_gain_upper_limit=self._optional_float("auto_gain_upper_limit"),
                     exposure_auto=str(self.config.get("exposure_auto", "Off")),
@@ -1267,14 +1270,24 @@ class StereoCameraSystem:
         if self.max_camera_timestamp_delta > 0:
             raw_camera_delta = int(left.camera_timestamp) - int(right.camera_timestamp)
             if self._camera_timestamp_offset is None:
-                self._camera_timestamp_offset = raw_camera_delta
-            camera_delta = abs(raw_camera_delta - self._camera_timestamp_offset)
-            if camera_delta > self.max_camera_timestamp_delta:
-                issues.append(
-                    "camera timestamp drift "
-                    f"{camera_delta} exceeds {self.max_camera_timestamp_delta} "
-                    f"(offset {self._camera_timestamp_offset})"
-                )
+                self._camera_timestamp_offset_samples.append(raw_camera_delta)
+                if len(self._camera_timestamp_offset_samples) >= self.camera_timestamp_offset_samples:
+                    sorted_offsets = sorted(self._camera_timestamp_offset_samples)
+                    midpoint = len(sorted_offsets) // 2
+                    if len(sorted_offsets) % 2:
+                        self._camera_timestamp_offset = sorted_offsets[midpoint]
+                    else:
+                        self._camera_timestamp_offset = int(
+                            round((sorted_offsets[midpoint - 1] + sorted_offsets[midpoint]) / 2)
+                        )
+            if self._camera_timestamp_offset is not None:
+                camera_delta = abs(raw_camera_delta - self._camera_timestamp_offset)
+                if camera_delta > self.max_camera_timestamp_delta:
+                    issues.append(
+                        "camera timestamp drift "
+                        f"{camera_delta} exceeds {self.max_camera_timestamp_delta} "
+                        f"(offset {self._camera_timestamp_offset})"
+                    )
         if self.max_host_timestamp_delta > 0:
             host_delta = abs(int(left.host_timestamp) - int(right.host_timestamp))
             if host_delta > self.max_host_timestamp_delta:

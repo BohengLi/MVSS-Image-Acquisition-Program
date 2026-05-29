@@ -26,6 +26,7 @@
   "timestamp_reject_enabled": false,
   "max_camera_timestamp_delta": 0,
   "max_host_timestamp_delta": 0,
+  "camera_timestamp_offset_samples": 5,
   "require_hardware_trigger": false,
   "preview_fps": 15.0,
   "record_fps": 5.0,
@@ -170,5 +171,5 @@
     "min_exposure_time_us": 50.0,
     "max_exposure_time_us": 1000000.0
   },
-  "close_thread_join_timeout_seconds": 1.0
+  "close_thread_join_timeout_seconds": 10.0
 }

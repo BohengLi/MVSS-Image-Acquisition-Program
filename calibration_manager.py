@@ -309,7 +309,10 @@ class StereoCalibration:
         left_mode = "L" if left.mode == "L" else "RGB"
         right_mode = "L" if right.mode == "L" else "RGB"
         left_arr = np.asarray(left.convert(left_mode))
-        right_arr = np.asarray(right.convert(right_mode).resize(image_size, Image.Resampling.BILINEAR))
+        right_image = right.convert(right_mode)
+        if right_image.size != image_size:
+            right_image = right_image.resize(image_size, Image.Resampling.BILINEAR)
+        right_arr = np.asarray(right_image)
         rect_left = cv2.remap(left_arr, map1_left, map2_left, cv2.INTER_LINEAR)
         rect_right = cv2.remap(right_arr, map1_right, map2_right, cv2.INTER_LINEAR)
         return Image.fromarray(rect_left, left_mode), Image.fromarray(rect_right, right_mode)
