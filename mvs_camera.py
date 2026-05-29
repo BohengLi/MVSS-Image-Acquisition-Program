@@ -1,10 +1,11 @@
 from __future__ import annotations
 
+import logging
 import os
 import sys
 import threading
 import time
-from ctypes import POINTER, byref, c_ubyte, cast, memset, sizeof, string_at
+from ctypes import POINTER, byref, c_ubyte, cast, create_string_buffer, memset, sizeof
 from dataclasses import dataclass
 from importlib.util import find_spec
 from pathlib import Path
@@ -13,7 +14,12 @@ from typing import Any
 import numpy as np
 from PIL import Image
 
+from config_utils import config_bool
+
 _DLL_DIRECTORIES: list[Any] = []
+LOGGER = logging.getLogger("mvss_capture")
+_MVS_IMPORT_ATTEMPTS = 3
+_MVS_IMPORT_RETRY_DELAY_SECONDS = 0.4
 
 
 class MvsError(RuntimeError):
@@ -24,37 +30,26 @@ class FrameTimeoutError(MvsError):
     pass
 
 
-def _config_bool(config: dict[str, Any], key: str, default: bool) -> bool:
-    value = config.get(key, default)
-    if isinstance(value, bool):
-        return value
-    if value is None:
-        return default
-    if isinstance(value, (int, float)):
-        return bool(value)
-    return str(value).strip().lower() in {"1", "true", "yes", "y", "on", "enabled"}
+class FrameSyncError(MvsError):
+    pass
+
+
+def _mvs_runtime_candidates() -> list[Path]:
+    if sys.maxsize > 2**32:
+        return [
+            Path(r"C:\Program Files (x86)\Common Files\MVS\Runtime\Win64_x64"),
+            Path(r"C:\Program Files\MVS\Runtime\Win64_x64"),
+            Path(r"C:\Program Files\MVS\Development\Samples\Python\MvImport"),
+        ]
+    return [
+        Path(r"C:\Program Files (x86)\Common Files\MVS\Runtime\Win32_i86"),
+        Path(r"C:\Program Files\MVS\Runtime\Win32_i86"),
+        Path(r"C:\Program Files\MVS\Development\Samples\Python\MvImport"),
+    ]
 
 
 def _add_mvs_runtime_path() -> None:
-    candidates: list[Path] = []
-    if sys.maxsize > 2**32:
-        candidates.extend(
-            [
-                Path(r"C:\Program Files (x86)\Common Files\MVS\Runtime\Win64_x64"),
-                Path(r"C:\Program Files\MVS\Runtime\Win64_x64"),
-                Path(r"C:\Program Files\MVS\Development\Samples\Python\MvImport"),
-            ]
-        )
-    else:
-        candidates.extend(
-            [
-                Path(r"C:\Program Files (x86)\Common Files\MVS\Runtime\Win32_i86"),
-                Path(r"C:\Program Files\MVS\Runtime\Win32_i86"),
-                Path(r"C:\Program Files\MVS\Development\Samples\Python\MvImport"),
-            ]
-        )
-
-    for path in candidates:
+    for path in _mvs_runtime_candidates():
         if path.exists():
             try:
                 _DLL_DIRECTORIES.append(os.add_dll_directory(str(path)))
@@ -62,7 +57,7 @@ def _add_mvs_runtime_path() -> None:
                 os.environ["PATH"] = str(path) + os.pathsep + os.environ.get("PATH", "")
 
 
-def _add_mvs_python_path() -> None:
+def _mvs_python_candidates() -> list[Path]:
     candidates = [
         Path(r"C:\Program Files (x86)\MVS\Development\Samples\Python\MvImport"),
         Path(r"C:\Program Files\MVS\Development\Samples\Python\MvImport"),
@@ -78,14 +73,41 @@ def _add_mvs_python_path() -> None:
     except Exception:
         pass
 
-    for path in candidates:
+    return candidates
+
+
+def _add_mvs_python_path() -> None:
+    for path in _mvs_python_candidates():
         if path.exists():
             value = str(path)
             if value not in sys.path:
                 sys.path.insert(0, value)
 
 
-def _load_mvs_imports():
+def _format_path_diagnostics(paths: list[Path]) -> str:
+    return "; ".join(f"{path} ({'exists' if path.exists() else 'missing'})" for path in paths)
+
+
+def _mvs_import_error_message(exc: BaseException) -> str:
+    arch = "64-bit" if sys.maxsize > 2**32 else "32-bit"
+    return (
+        "无法加载海康 MVS Python SDK，已重试 "
+        f"{_MVS_IMPORT_ATTEMPTS} 次仍失败。\n"
+        f"Python: {sys.version.split()[0]} {arch}\n"
+        "请确认：1) 已安装与 Python 位数匹配的 MVS；"
+        "2) MVS Python 示例目录 MvImport 存在；"
+        "3) 运行 `python -m pip install -r requirements.txt` 安装依赖；"
+        "4) 如安装在非默认目录，请把 MvImport 目录加入 PYTHONPATH，"
+        "并把 MVS Runtime 目录加入 PATH。\n"
+        "已检查的 Python SDK 路径: "
+        f"{_format_path_diagnostics(_mvs_python_candidates())}\n"
+        "已检查的 Runtime 路径: "
+        f"{_format_path_diagnostics(_mvs_runtime_candidates())}\n"
+        f"原始错误: {type(exc).__name__}: {exc}"
+    )
+
+
+def _load_mvs_imports_once():
     _add_mvs_runtime_path()
     _add_mvs_python_path()
     try:
@@ -97,6 +119,11 @@ def _load_mvs_imports():
             MV_FRAME_OUT_INFO_EX,
             MVCC_INTVALUE,
         )
+        try:
+            from MvImport.CameraParams_header import MVCC_FLOATVALUE, MVCC_STRINGVALUE
+        except Exception:
+            MVCC_FLOATVALUE = None
+            MVCC_STRINGVALUE = None
         from MvImport.MvCameraControl_class import MvCamera
         from MvImport.PixelType_header import PixelType_Gvsp_Mono8, PixelType_Gvsp_RGB8_Packed
 
@@ -109,6 +136,8 @@ def _load_mvs_imports():
             "MV_CC_PIXEL_CONVERT_PARAM": MV_CC_PIXEL_CONVERT_PARAM,
             "MV_FRAME_OUT_INFO_EX": MV_FRAME_OUT_INFO_EX,
             "MVCC_INTVALUE": MVCC_INTVALUE,
+            "MVCC_FLOATVALUE": MVCC_FLOATVALUE,
+            "MVCC_STRINGVALUE": MVCC_STRINGVALUE,
             "MvCamera": MvCamera,
             "PixelType_Gvsp_Mono8": PixelType_Gvsp_Mono8,
             "PixelType_Gvsp_RGB8_Packed": PixelType_Gvsp_RGB8_Packed,
@@ -119,6 +148,19 @@ def _load_mvs_imports():
             "`python -m pip install -r requirements.txt`。原始错误: "
             f"{exc}"
         ) from exc
+
+
+def _load_mvs_imports():
+    last_exc: BaseException | None = None
+    for attempt in range(1, _MVS_IMPORT_ATTEMPTS + 1):
+        try:
+            return _load_mvs_imports_once()
+        except Exception as exc:
+            last_exc = exc
+            if attempt < _MVS_IMPORT_ATTEMPTS:
+                time.sleep(_MVS_IMPORT_RETRY_DELAY_SECONDS)
+    assert last_exc is not None
+    raise MvsError(_mvs_import_error_message(last_exc)) from last_exc
 
 
 SDK: dict[str, Any] | None = None
@@ -189,10 +231,19 @@ class IntNodeInfo:
     increment: int
 
 
-class RoiApplyResult(list[str]):
-    def __init__(self, warnings: list[str] | None = None, actual_roi: tuple[int, int, int, int] | None = None):
-        super().__init__(warnings or [])
-        self.actual_roi = actual_roi
+@dataclass(frozen=True)
+class RoiApplyResult:
+    warnings: list[str]
+    actual_roi: tuple[int, int, int, int] | None = None
+
+    def __iter__(self):
+        return iter(self.warnings)
+
+    def __len__(self) -> int:
+        return len(self.warnings)
+
+    def __bool__(self) -> bool:
+        return bool(self.warnings)
 
 
 def enumerate_cameras() -> tuple[list[CameraInfo], Any]:
@@ -235,11 +286,12 @@ def enumerate_cameras() -> tuple[list[CameraInfo], Any]:
     return cameras, dev_list
 
 
-def select_stereo_devices(left_serial: str = "", right_serial: str = "") -> tuple[CameraInfo, CameraInfo, Any]:
-    cameras, dev_list = enumerate_cameras()
-    if len(cameras) < 2:
-        raise MvsError(f"至少需要两台相机，当前检测到 {len(cameras)} 台。")
-
+def _select_stereo_devices_by_serial(
+    cameras: list[CameraInfo],
+    dev_list: Any,
+    left_serial: str = "",
+    right_serial: str = "",
+) -> tuple[CameraInfo, CameraInfo, Any]:
     by_serial = {cam.serial: cam for cam in cameras if cam.serial}
     if not left_serial and not right_serial:
         left, right = cameras[0], cameras[1]
@@ -269,21 +321,37 @@ def select_stereo_devices(left_serial: str = "", right_serial: str = "") -> tupl
     return left, right, dev_list
 
 
+def select_stereo_devices(
+    left_serial: str = "",
+    right_serial: str = "",
+    bind_serials: bool = False,
+) -> tuple[CameraInfo, CameraInfo, Any]:
+    cameras, dev_list = enumerate_cameras()
+    if len(cameras) < 2:
+        raise MvsError(f"至少需要两台相机，当前检测到 {len(cameras)} 台。")
+    if not bind_serials:
+        return cameras[0], cameras[1], dev_list
+    return _select_stereo_devices_by_serial(cameras, dev_list, left_serial, right_serial)
+
+
 def select_capture_devices(
     left_serial: str = "",
     right_serial: str = "",
     allow_single: bool = False,
+    bind_serials: bool = False,
 ) -> tuple[CameraInfo | None, CameraInfo | None, Any]:
     cameras, dev_list = enumerate_cameras()
     if not cameras:
         raise MvsError("未检测到相机。")
     if len(cameras) >= 2:
-        return select_stereo_devices(left_serial, right_serial)
+        if not bind_serials:
+            return cameras[0], cameras[1], dev_list
+        return _select_stereo_devices_by_serial(cameras, dev_list, left_serial, right_serial)
     if not allow_single:
         raise MvsError(f"至少需要两台相机，当前检测到 {len(cameras)} 台。")
 
     camera = cameras[0]
-    if right_serial and camera.serial == right_serial and camera.serial != left_serial:
+    if bind_serials and right_serial and camera.serial == right_serial and camera.serial != left_serial:
         return None, camera, dev_list
     return camera, None, dev_list
 
@@ -298,6 +366,7 @@ class MvsCamera:
         self._grab_lock = threading.Lock()
         self._opened = False
         self._grabbing = False
+        self._float_node_cache: dict[tuple[str, ...], str] = {}
 
     def open(self) -> None:
         s = sdk()
@@ -479,6 +548,7 @@ class MvsCamera:
         was_grabbing = self._grabbing
         if restart_stream and was_grabbing:
             self.stop()
+        roi_failed = False
         try:
             self._try_set_int("OffsetX", 0)
             self._try_set_int("OffsetY", 0)
@@ -498,9 +568,17 @@ class MvsCamera:
                 self._payload_size = self._get_int("PayloadSize")
             except MvsError:
                 pass
+        except BaseException:
+            roi_failed = True
+            raise
         finally:
             if restart_stream and was_grabbing:
-                self.start()
+                try:
+                    self.start()
+                except Exception:
+                    LOGGER.exception("%s: failed to restart stream after applying ROI.", self.info.label)
+                    if not roi_failed:
+                        raise
         return RoiApplyResult(warnings, (width, height, offset_x, offset_y))
 
     def _normalize_roi_size(
@@ -608,6 +686,22 @@ class MvsCamera:
         if ret != 0:
             raise MvsError(f"{self.info.label} 软触发失败: 0x{ret:08x}")
 
+    def device_version(self) -> str | None:
+        return self._try_get_string_any(("DeviceVersion", "DeviceFirmwareVersion", "FirmwareVersion"))
+
+    def sensor_temperature(self) -> float | None:
+        for selector_key in ("DeviceTemperatureSelector", "TemperatureSelector"):
+            self._try_set_enum_by_string(selector_key, "Sensor")
+        return self._try_get_float_any(
+            (
+                "DeviceTemperature",
+                "SensorTemperature",
+                "TemperatureAbs",
+                "Temperature",
+                "DeviceTemperatureSensor",
+            )
+        )
+
     def grab_frame(self, timeout_ms: int) -> Frame:
         s = sdk()
         with self._grab_lock:
@@ -620,7 +714,7 @@ class MvsCamera:
             if ret != 0:
                 if ret == 0x80000007:
                     raise FrameTimeoutError(f"{self.info.label} 等待图像超时: 0x{ret:08x}")
-                raise MvsError(f"{self.info.label} 等待图像超时或失败: 0x{ret:08x}")
+                raise MvsError(f"{self.info.label} 获取图像失败: 0x{ret:08x}")
 
             image = self._frame_to_image(raw_buffer, frame_info)
             camera_timestamp = (int(frame_info.nDevTimeStampHigh) << 32) | int(frame_info.nDevTimeStampLow)
@@ -661,8 +755,11 @@ class MvsCamera:
         if ret != 0:
             raise MvsError(f"{self.info.label} 像素格式转换失败: 0x{ret:08x}")
 
-        rgb = string_at(convert.pDstBuffer, int(convert.nDstLen))
-        return Image.frombytes("RGB", (width, height), rgb)
+        converted_len = int(convert.nDstLen)
+        if converted_len < rgb_size:
+            raise MvsError(f"{self.info.label} 像素格式转换输出长度异常: {converted_len} < {rgb_size}")
+        rgb = np.ctypeslib.as_array(rgb_buffer)[:rgb_size].reshape((height, width, 3))
+        return Image.fromarray(rgb, mode="RGB").copy()
 
     def _get_int(self, key: str) -> int:
         s = sdk()
@@ -731,7 +828,119 @@ class MvsCamera:
             return False
 
     def _try_set_float_any(self, keys: tuple[str, ...], value: float) -> bool:
-        return any(self._try_set_float(key, value) for key in keys)
+        cached_key = self._float_node_cache.get(keys)
+        if cached_key is not None:
+            if self._try_set_float(cached_key, value):
+                return True
+            self._float_node_cache.pop(keys, None)
+
+        for key in keys:
+            if self._try_set_float(key, value):
+                self._float_node_cache[keys] = key
+                return True
+        return False
+
+    def _try_get_float(self, key: str) -> float | None:
+        value_cls = sdk().get("MVCC_FLOATVALUE")
+        if value_cls is not None:
+            try:
+                value = value_cls()
+                memset(byref(value), 0, sizeof(value))
+                ret = self._cam.MV_CC_GetFloatValue(key, value)
+                if ret == 0 and hasattr(value, "fCurValue"):
+                    return float(value.fCurValue)
+            except Exception:
+                pass
+        try:
+            value = self._cam.MV_CC_GetFloatValue(key)
+            if isinstance(value, tuple) and value:
+                for item in reversed(value):
+                    if isinstance(item, (int, float)):
+                        return float(item)
+                    if hasattr(item, "fCurValue"):
+                        return float(item.fCurValue)
+            if hasattr(value, "fCurValue"):
+                return float(value.fCurValue)
+            if isinstance(value, (int, float)):
+                return float(value)
+        except Exception:
+            pass
+        try:
+            return float(self._get_int(key))
+        except Exception:
+            return None
+
+    def _try_get_float_any(self, keys: tuple[str, ...]) -> float | None:
+        for key in keys:
+            value = self._try_get_float(key)
+            if value is not None:
+                return value
+        return None
+
+    def _try_get_string(self, key: str) -> str | None:
+        value_cls = sdk().get("MVCC_STRINGVALUE")
+        if value_cls is not None:
+            try:
+                value = value_cls()
+                memset(byref(value), 0, sizeof(value))
+                ret = self._cam.MV_CC_GetStringValue(key, value)
+                if ret == 0:
+                    text = self._string_from_sdk_value(value)
+                    if text:
+                        return text
+            except Exception:
+                pass
+        try:
+            value = self._cam.MV_CC_GetStringValue(key)
+            if isinstance(value, tuple):
+                for item in value:
+                    text = self._string_from_sdk_value(item)
+                    if text:
+                        return text
+            text = self._string_from_sdk_value(value)
+            if text:
+                return text
+        except Exception:
+            pass
+        try:
+            buffer = create_string_buffer(256)
+            ret = self._cam.MV_CC_GetStringValue(key, buffer, sizeof(buffer))
+            if ret == 0:
+                return buffer.value.decode("utf-8", errors="ignore").strip()
+        except Exception:
+            return None
+        return None
+
+    def _try_get_string_any(self, keys: tuple[str, ...]) -> str | None:
+        for key in keys:
+            value = self._try_get_string(key)
+            if value:
+                return value
+        return None
+
+    def _string_from_sdk_value(self, value: object) -> str | None:
+        if value is None:
+            return None
+        if isinstance(value, bytes):
+            return value.decode("utf-8", errors="ignore").strip("\x00").strip()
+        if isinstance(value, str):
+            return value.strip()
+        for attr in ("chCurValue", "chCurString", "strCurValue"):
+            if hasattr(value, attr):
+                raw = getattr(value, attr)
+                if isinstance(raw, bytes):
+                    return raw.decode("utf-8", errors="ignore").strip("\x00").strip()
+                if isinstance(raw, str):
+                    return raw.strip()
+                try:
+                    return _decode_c_ubyte_array(raw)
+                except Exception:
+                    return None
+        return None
+
+    @property
+    def is_ready(self) -> bool:
+        return self._opened and self._grabbing
 
     def _try_set_int(self, key: str, value: int) -> bool:
         try:
@@ -749,17 +958,21 @@ class StereoCameraSystem:
         self.right_info: CameraInfo | None = None
         self.trigger_source = str(config.get("trigger_source", "Software"))
         self.timeout_ms = int(config.get("frame_timeout_ms", 3000))
-        self.timestamp_reject_enabled = _config_bool(config, "timestamp_reject_enabled", True)
+        self.timestamp_reject_enabled = config_bool(config, "timestamp_reject_enabled", False)
         self.max_camera_timestamp_delta = int(config.get("max_camera_timestamp_delta", 0) or 0)
         self.max_host_timestamp_delta = int(config.get("max_host_timestamp_delta", 0) or 0)
-        self.require_hardware_trigger = _config_bool(config, "require_hardware_trigger", False)
+        if self.max_camera_timestamp_delta <= 0 and self.max_host_timestamp_delta <= 0:
+            self.timestamp_reject_enabled = False
+        self.require_hardware_trigger = config_bool(config, "require_hardware_trigger", False)
+        self._camera_timestamp_offset: int | None = None
         self._capture_lock = threading.Lock()
 
     def connect(self) -> tuple[CameraInfo | None, CameraInfo | None]:
         left_info, right_info, dev_list = select_capture_devices(
             str(self.config.get("left_serial", "")).strip(),
             str(self.config.get("right_serial", "")).strip(),
-            _config_bool(self.config, "allow_single_camera", False),
+            config_bool(self.config, "allow_single_camera", False),
+            config_bool(self.config, "bind_camera_serials", False),
         )
         left = MvsCamera(dev_list, left_info) if left_info is not None else None
         right = MvsCamera(dev_list, right_info) if right_info is not None else None
@@ -830,11 +1043,22 @@ class StereoCameraSystem:
 
     def _connected_cameras(self) -> list[tuple[str, MvsCamera]]:
         cameras: list[tuple[str, MvsCamera]] = []
-        if self.left is not None:
+        if self.left is not None and self.left.is_ready:
             cameras.append(("left", self.left))
-        if self.right is not None:
+        if self.right is not None and self.right.is_ready:
             cameras.append(("right", self.right))
         return cameras
+
+    def has_ready_camera(self) -> bool:
+        return bool(self._connected_cameras())
+
+    def device_versions(self) -> dict[str, str | None]:
+        with self._capture_lock:
+            return {name: cam.device_version() for name, cam in self._connected_cameras()}
+
+    def sensor_temperatures(self) -> dict[str, float | None]:
+        with self._capture_lock:
+            return {name: cam.sensor_temperature() for name, cam in self._connected_cameras()}
 
     def apply_gain_settings(
         self,
@@ -897,6 +1121,7 @@ class StereoCameraSystem:
         height: int | None,
         offset_x: int,
         offset_y: int,
+        restart_stream: bool = True,
     ) -> RoiApplyResult:
         cameras = self._connected_cameras()
         if not cameras:
@@ -905,7 +1130,7 @@ class StereoCameraSystem:
             warnings: list[str] = []
             results: dict[str, RoiApplyResult] = {}
             for name, cam in cameras:
-                result = cam.apply_roi_settings(width, height, offset_x, offset_y)
+                result = cam.apply_roi_settings(width, height, offset_x, offset_y, restart_stream=restart_stream)
                 results[name] = result
                 warnings.extend(result)
             left_result = results.get("left")
@@ -949,28 +1174,32 @@ class StereoCameraSystem:
             raise MvsError("Hardware trigger is required, but trigger_source is Software.")
 
         if self.trigger_source.lower() == "software":
-            barrier = threading.Barrier(len(cameras) + 1)
-            errors: list[BaseException] = []
+            if len(cameras) == 1:
+                trigger_time = time.time()
+                cameras[0][1].trigger_software()
+            else:
+                barrier = threading.Barrier(len(cameras) + 1)
+                errors: list[BaseException] = []
 
-            def fire(cam: MvsCamera) -> None:
-                try:
-                    barrier.wait()
-                    cam.trigger_software()
-                except BaseException as exc:
-                    errors.append(exc)
+                def fire(cam: MvsCamera) -> None:
+                    try:
+                        barrier.wait()
+                        cam.trigger_software()
+                    except BaseException as exc:
+                        errors.append(exc)
 
-            trigger_threads = [threading.Thread(target=fire, args=(cam,), daemon=True) for _name, cam in cameras]
-            for thread in trigger_threads:
-                thread.start()
-            trigger_time = time.time()
-            barrier.wait()
-            for thread in trigger_threads:
-                thread.join()
-            if errors:
-                message = "; ".join(str(exc) for exc in errors)
-                if all(isinstance(exc, FrameTimeoutError) for exc in errors):
-                    raise FrameTimeoutError(message)
-                raise MvsError(message)
+                trigger_threads = [threading.Thread(target=fire, args=(cam,), daemon=True) for _name, cam in cameras]
+                for thread in trigger_threads:
+                    thread.start()
+                trigger_time = time.time()
+                barrier.wait()
+                for thread in trigger_threads:
+                    thread.join()
+                if errors:
+                    message = "; ".join(str(exc) for exc in errors)
+                    if all(isinstance(exc, FrameTimeoutError) for exc in errors):
+                        raise FrameTimeoutError(message)
+                    raise MvsError(message)
         else:
             trigger_time = time.time()
 
@@ -1005,12 +1234,19 @@ class StereoCameraSystem:
             return
         issues: list[str] = []
         if self.max_camera_timestamp_delta > 0:
-            camera_delta = abs(int(left.camera_timestamp) - int(right.camera_timestamp))
+            raw_camera_delta = int(left.camera_timestamp) - int(right.camera_timestamp)
+            if self._camera_timestamp_offset is None:
+                self._camera_timestamp_offset = raw_camera_delta
+            camera_delta = abs(raw_camera_delta - self._camera_timestamp_offset)
             if camera_delta > self.max_camera_timestamp_delta:
-                issues.append(f"camera timestamp delta {camera_delta} exceeds {self.max_camera_timestamp_delta}")
+                issues.append(
+                    "camera timestamp drift "
+                    f"{camera_delta} exceeds {self.max_camera_timestamp_delta} "
+                    f"(offset {self._camera_timestamp_offset})"
+                )
         if self.max_host_timestamp_delta > 0:
             host_delta = abs(int(left.host_timestamp) - int(right.host_timestamp))
             if host_delta > self.max_host_timestamp_delta:
                 issues.append(f"host timestamp delta {host_delta} exceeds {self.max_host_timestamp_delta}")
         if issues:
-            raise MvsError("Stereo frame rejected: " + "; ".join(issues))
+            raise FrameSyncError("Stereo frame rejected: " + "; ".join(issues))

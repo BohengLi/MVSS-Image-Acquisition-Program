@@ -1,6 +1,7 @@
 {
   "left_serial": "DB0371852",
   "right_serial": "DB0371907",
+  "bind_camera_serials": false,
   "save_dir": "captures",
   "trigger_source": "Software",
   "exposure_time_us": 20000.0,
@@ -22,7 +23,7 @@
   "pixel_format": "Mono8",
   "image_format": "bmp",
   "frame_timeout_ms": 3000,
-  "timestamp_reject_enabled": true,
+  "timestamp_reject_enabled": false,
   "max_camera_timestamp_delta": 0,
   "max_host_timestamp_delta": 0,
   "require_hardware_trigger": false,
@@ -39,7 +40,21 @@
   "use_nvenc": false,
   "record_split_interval_seconds": 600,
   "record_split_size_gb": 4.0,
-  "record_max_seconds": 0,
+  "record_max_seconds": 0.0,
+  "logging_enabled": true,
+  "sound_alert_enabled": true,
+  "auto_reconnect_enabled": true,
+  "auto_reconnect_max_attempts": 5,
+  "auto_reconnect_initial_delay_seconds": 1.0,
+  "auto_reconnect_max_delay_seconds": 16.0,
+  "consecutive_timeout_alert_threshold": 3,
+  "record_checksum_algorithm": "sha256",
+  "record_disk_check_interval_seconds": 10.0,
+  "record_disk_warning_minutes": 2.0,
+  "record_disk_min_free_gb": 2.0,
+  "record_stop_on_low_disk": true,
+  "record_writer_stop_timeout_seconds": 10.0,
+  "record_writer_batch_size": 4,
   "presets": {
     "室内低光": {
       "trigger_source": "Software",
@@ -81,10 +96,10 @@
     }
   },
   "focus_roi": {
-    "x_frac": 0.3,
-    "y_frac": 0.3,
-    "w_frac": 0.4,
-    "h_frac": 0.4
+    "x_frac": 0.07236842105263158,
+    "y_frac": 0.9451754385964912,
+    "w_frac": 0.03654970760233918,
+    "h_frac": 0.05482456140350877
   },
   "focus_method": "laplacian",
   "focus_reference_score": null,
@@ -100,7 +115,9 @@
     "board_min_area_frac": 0.05,
     "board_max_area_frac": 0.4,
     "board_grid_rows": 3,
-    "board_grid_cols": 3
+    "board_grid_cols": 3,
+    "board_pattern_cols": 9,
+    "board_pattern_rows": 6
   },
   "capture_quality_gate": {
     "enabled": true,
@@ -113,5 +130,44 @@
       "brightness_min": 40,
       "brightness_max": 220
     }
+  },
+  "record_meta_flush_every": 32,
+  "focus_peaking_overlay_interval_seconds": 0.2,
+  "record_disk_benchmark_enabled": true,
+  "record_disk_benchmark_size_mb": 512.0,
+  "record_disk_benchmark_seconds": 3.0,
+  "record_disk_benchmark_margin": 1.25,
+  "calibration": {
+    "enabled": false,
+    "left_intrinsics": "calib/left.yaml",
+    "right_intrinsics": "calib/right.yaml",
+    "stereo_params": "calib/stereo.yaml",
+    "rectified_overlay_alpha": 0.5,
+    "rectified_line_interval_px": 120
+  },
+  "temperature_monitor": {
+    "enabled": true,
+    "interval_seconds": 30.0,
+    "warning_threshold_c": 65.0,
+    "critical_threshold_c": 75.0
+  },
+  "project": {
+    "enabled": true,
+    "projects_subdir": "projects",
+    "current_project_id": "20260526_154649_234",
+    "current_project_name": "Project 20260526_154649_234"
+  },
+  "hdr_bracketing": {
+    "enabled": true,
+    "ev_offsets": [
+      -2.0,
+      -1.0,
+      0.0,
+      1.0,
+      2.0
+    ],
+    "settle_seconds": 0.1,
+    "min_exposure_time_us": 50.0,
+    "max_exposure_time_us": 1000000.0
   }
 }
