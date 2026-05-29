@@ -407,7 +407,7 @@ def setup_logging(config: dict) -> None:
     handler = RotatingFileHandler(log_path, maxBytes=5 * 1024 * 1024, backupCount=5, encoding="utf-8")
     handler.setFormatter(logging.Formatter("%(asctime)s [%(levelname)s] %(message)s"))
     LOGGER.addHandler(handler)
-    if not config_bool(config, "logging_enabled", True):
+    if not config_bool(config, "logging_enabled", True, True):
         LOGGER.disabled = True
 
 
@@ -1504,7 +1504,7 @@ class StereoCaptureOnlyApp:
         hdr_ev_offsets = hdr.get("ev_offsets", [-2, -1, 0, 1, 2])
         if not isinstance(hdr_ev_offsets, (list, tuple)):
             hdr_ev_offsets = [-2, -1, 0, 1, 2]
-        self.hdr_enabled_var = BooleanVar(value=config_bool(hdr, "enabled", True))
+        self.hdr_enabled_var = BooleanVar(value=config_bool(hdr, "enabled", True, True))
         self.hdr_sequence_var = StringVar(
             value=", ".join(str(v) for v in hdr_ev_offsets)
         )
@@ -3038,13 +3038,13 @@ class StereoCaptureOnlyApp:
         image_queue: Queue[dict | None] = Queue(maxsize=max(8, int(fps * 4)))
         video_queue: Queue[dict | None] = Queue(maxsize=max(8, int(fps * 4)))
         meta_writer = RecordMetaWriter(record_dir / "frames.meta.json", config_int(config_snapshot, "record_meta_flush_every", 32))
-        writer_errors: list[BaseException] = []
+        writer_errors: list[Exception] = []
         writer_errors_lock = threading.Lock()
         video_outputs: dict[str, list[str]] = {"left": [], "right": []}
         next_time = time.perf_counter()
         last_status_time = 0.0
         max_seconds = max(config_float(config_snapshot, "record_max_seconds", 0.0), 0.0)
-        auto_make_mp4 = config_bool(config_snapshot, "auto_make_mp4", True)
+        auto_make_mp4 = config_bool(config_snapshot, "auto_make_mp4", True, True)
         make_mp4_after = auto_make_mp4 and shutil.which("ffmpeg") is not None
         use_realtime_mp4 = auto_make_mp4 and not make_mp4_after
         mp4_generation = "ffmpeg_after_recording" if make_mp4_after else "opencv_realtime" if use_realtime_mp4 else "disabled"
@@ -3187,8 +3187,8 @@ class StereoCaptureOnlyApp:
                 "video_bitrate_kbps": config_int(config_snapshot, "video_bitrate_kbps", 8000),
                 "video_quality_crf": config_int(config_snapshot, "video_quality_crf", 23),
                 "video_preset": config_snapshot.get("video_preset", "medium"),
-                "use_nvenc": config_bool(config_snapshot, "use_nvenc", False),
-                "auto_make_mp4": config_bool(config_snapshot, "auto_make_mp4", True),
+                "use_nvenc": config_bool(config_snapshot, "use_nvenc", False, False),
+                "auto_make_mp4": config_bool(config_snapshot, "auto_make_mp4", True, True),
                 "mp4_generation": mp4_generation,
                 "record_split_interval_seconds": config_float(config_snapshot, "record_split_interval_seconds", 600.0),
                 "record_split_size_gb": config_float(config_snapshot, "record_split_size_gb", 4.0),
@@ -3362,26 +3362,26 @@ class StereoCaptureOnlyApp:
 
     def _append_writer_error(
         self,
-        writer_errors: list[BaseException],
+        writer_errors: list[Exception],
         writer_errors_lock: threading.Lock,
-        exc: BaseException,
+        exc: Exception,
     ) -> None:
         with writer_errors_lock:
             writer_errors.append(exc)
 
     def _first_writer_error(
         self,
-        writer_errors: list[BaseException],
+        writer_errors: list[Exception],
         writer_errors_lock: threading.Lock,
-    ) -> BaseException | None:
+    ) -> Exception | None:
         with writer_errors_lock:
             return writer_errors[0] if writer_errors else None
 
     def _writer_errors_snapshot(
         self,
-        writer_errors: list[BaseException],
+        writer_errors: list[Exception],
         writer_errors_lock: threading.Lock,
-    ) -> list[BaseException]:
+    ) -> list[Exception]:
         with writer_errors_lock:
             return list(writer_errors)
 
@@ -3457,7 +3457,7 @@ class StereoCaptureOnlyApp:
         meta_writer: RecordMetaWriter,
         interval: float,
         ext: str,
-        writer_errors: list[BaseException],
+        writer_errors: list[Exception],
         writer_errors_lock: threading.Lock,
         config_snapshot: dict,
     ) -> None:
@@ -3507,7 +3507,7 @@ class StereoCaptureOnlyApp:
         meta_writer: RecordMetaWriter,
         interval: float,
         ext: str,
-        writer_errors: list[BaseException],
+        writer_errors: list[Exception],
         writer_errors_lock: threading.Lock,
         config_snapshot: dict,
     ) -> None:
@@ -3553,7 +3553,7 @@ class StereoCaptureOnlyApp:
                 }
             )
             self._advance_record_segment_if_needed(segment_index, config_snapshot)
-        except BaseException as exc:
+        except Exception as exc:
             self._append_writer_error(writer_errors, writer_errors_lock, exc)
             self.recording = False
 
@@ -3562,7 +3562,7 @@ class StereoCaptureOnlyApp:
         writer_queue: Queue[dict | None],
         fps: float,
         video_outputs: dict[str, list[str]],
-        writer_errors: list[BaseException],
+        writer_errors: list[Exception],
         writer_errors_lock: threading.Lock,
         config_snapshot: dict,
     ) -> None:
@@ -3588,7 +3588,7 @@ class StereoCaptureOnlyApp:
                             if codec_name != str(config_snapshot.get("video_codec", "mp4v")):
                                 self._set_record_write_warning(f"编码器回退到 {codec_name}")
                         writers[key].write(self._image_to_video_frame(frame.image))
-                except BaseException as exc:
+                except Exception as exc:
                     self._append_writer_error(writer_errors, writer_errors_lock, exc)
                     self.recording = False
                 finally:
@@ -3606,7 +3606,7 @@ class StereoCaptureOnlyApp:
     ) -> tuple[cv2.VideoWriter, str]:
         width, height = image.size
         codec = str(config_snapshot.get("video_codec", "mp4v")).strip() or "mp4v"
-        candidates = self._opencv_fourcc_candidates(codec, config_bool(config_snapshot, "use_nvenc", False))
+        candidates = self._opencv_fourcc_candidates(codec, config_bool(config_snapshot, "use_nvenc", False, False))
         for candidate, fourcc_text in candidates:
             fourcc = cv2.VideoWriter_fourcc(*fourcc_text)
             writer = cv2.VideoWriter(str(path), fourcc, fps, (width, height), True)
@@ -3982,7 +3982,7 @@ class StereoCaptureOnlyApp:
                     self.status_var.set(
                         f"{mode_text}连接成功。当前 ROI：{self.config.get('roi_width')}x{self.config.get('roi_height')}。"
                     )
-                    if count >= 2 and config_bool(self.config, "timestamp_reject_enabled", False):
+                    if count >= 2 and config_bool(self.config, "timestamp_reject_enabled", False, False):
                         cam_delta = int(self.config.get("max_camera_timestamp_delta", 0) or 0)
                         host_delta = int(self.config.get("max_host_timestamp_delta", 0) or 0)
                         if cam_delta <= 0 and host_delta <= 0:
@@ -4212,7 +4212,7 @@ class StereoCaptureOnlyApp:
         for key, value in defaults.items():
             self.config.setdefault(key, value)
         if (
-            config_bool(self.config, "timestamp_reject_enabled", False)
+            config_bool(self.config, "timestamp_reject_enabled", False, False)
             and int(self.config.get("max_camera_timestamp_delta", 0) or 0) <= 0
             and int(self.config.get("max_host_timestamp_delta", 0) or 0) <= 0
         ):
@@ -4348,7 +4348,7 @@ class StereoCaptureOnlyApp:
 
     def _poll_camera_temperatures(self, force: bool = False) -> None:
         monitor = self.config.get("temperature_monitor", {})
-        if not config_bool(monitor, "enabled", True):
+        if not config_bool(monitor, "enabled", True, True):
             return
         if self.camera_system is None:
             return
@@ -4819,10 +4819,10 @@ class StereoCaptureOnlyApp:
 
     def _capture_quality_gate_allows(self, metrics: dict[str, object] | None = None) -> tuple[bool, dict[str, object]]:
         gate = self.config.get("capture_quality_gate", {})
-        if not config_bool(gate, "enabled", True):
+        if not config_bool(gate, "enabled", True, True):
             return True, {"ok": True, "text": "采集检查已关闭"}
         report = self._quality_report_from_metrics(metrics)
-        strict = config_bool(gate, "strict_mode", False)
+        strict = config_bool(gate, "strict_mode", False, False)
         if report["ok"] or not strict:
             return True, report
         failed_names = [str(item["name"]) for item in report["results"] if not item["ok"]]
@@ -4833,7 +4833,7 @@ class StereoCaptureOnlyApp:
         metrics = self._analyze_preview_frames(left, right, self._preview_frame_counter + 1)
         self._set_last_quality_metrics(metrics)
         calibration_cfg = self.config.get("calibration_check", {})
-        if config_bool(calibration_cfg, "board_coverage_enabled", False):
+        if config_bool(calibration_cfg, "board_coverage_enabled", False, False):
             board = calibration_board_coverage(
                 left.image if left is not None else None,
                 calibration_cfg if isinstance(calibration_cfg, dict) else {},
@@ -5035,7 +5035,7 @@ class StereoCaptureOnlyApp:
         LOGGER.warning(message)
         if not log_only:
             self.ui_queue.put(("status", message))
-            if config_bool(self.config, "sound_alert_enabled", True):
+            if config_bool(self.config, "sound_alert_enabled", True, True):
                 self._play_alert_sound()
 
     def _play_alert_sound(self) -> None:
@@ -5068,7 +5068,7 @@ class StereoCaptureOnlyApp:
     def _disable_timestamp_reject_after_sync_error(self, detail: str) -> None:
         if self.camera_system is not None:
             self.camera_system.timestamp_reject_enabled = False
-        if config_bool(self.config, "timestamp_reject_enabled", False):
+        if config_bool(self.config, "timestamp_reject_enabled", False, False):
             self._update_config(
                 {
                     "timestamp_reject_enabled": False,
@@ -5079,7 +5079,7 @@ class StereoCaptureOnlyApp:
         LOGGER.warning("Timestamp reject disabled after FrameSyncError; continuing without reconnect: %s", detail)
 
     def _attempt_reconnect(self, mode: str) -> bool:
-        if self._closing or not config_bool(self.config, "auto_reconnect_enabled", True):
+        if self._closing or not config_bool(self.config, "auto_reconnect_enabled", True, True):
             return False
         if self._reconnecting:
             return False
@@ -5234,7 +5234,7 @@ class StereoCaptureOnlyApp:
             self._add_record_disk_warning()
             message = f"磁盘空间预警：剩余 {free_gb:.1f} GB，按当前设置约可录 {format_duration(seconds_left)}。"
             self._notify_warning("record_low_disk", message)
-            if config_bool(config_snapshot, "record_stop_on_low_disk", True) and free_gb <= min_free_gb:
+            if config_bool(config_snapshot, "record_stop_on_low_disk", True, True) and free_gb <= min_free_gb:
                 self._set_record_stop_reason("low_disk_space")
                 self.recording = False
 
@@ -5276,7 +5276,7 @@ class StereoCaptureOnlyApp:
         video_outputs: dict[str, list[str]],
         config_snapshot: dict,
     ) -> list[str]:
-        if config_bool(config_snapshot, "auto_make_mp4", True):
+        if config_bool(config_snapshot, "auto_make_mp4", True, True):
             ffmpeg_outputs = self._try_make_mp4_from_frames(record_dir, fps, frames, config_snapshot)
             for side, paths in ffmpeg_outputs.items():
                 if paths:
@@ -5334,7 +5334,7 @@ class StereoCaptureOnlyApp:
                     )
                     if result.returncode == 0 and output.exists():
                         outputs[side].append(output)
-                    elif config_bool(config_snapshot, "use_nvenc", False):
+                    elif config_bool(config_snapshot, "use_nvenc", False, False):
                         if result.stderr:
                             LOGGER.warning("ffmpeg NVENC MP4 generation failed for %s: %s", output, result.stderr[-2000:])
                         fallback = self._ffmpeg_mp4_command(
@@ -5419,7 +5419,7 @@ class StereoCaptureOnlyApp:
         crf = max(config_int(config_snapshot, "video_quality_crf", 23), 0)
         preset = str(config_snapshot.get("video_preset", "medium"))
         codec = str(config_snapshot.get("video_codec", "mp4v")).strip().lower()
-        use_nvenc = config_bool(config_snapshot, "use_nvenc", False) and not force_software
+        use_nvenc = config_bool(config_snapshot, "use_nvenc", False, False) and not force_software
         command = [
             ffmpeg,
             "-y",
@@ -5476,7 +5476,7 @@ class StereoCaptureOnlyApp:
                 f"{estimated_one_minute / 1024**3:.1f} GB。是否继续？",
             ):
                 return False
-        if config_bool(config_snapshot, "record_disk_benchmark_enabled", True):
+        if config_bool(config_snapshot, "record_disk_benchmark_enabled", True, True):
             required_mbps = pair_bytes * fps / 1024 / 1024
             benchmark = benchmark_write_speed(
                 save_root,

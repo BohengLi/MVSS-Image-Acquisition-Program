@@ -553,7 +553,6 @@ class MvsCamera:
         was_grabbing = self._grabbing
         if restart_stream and was_grabbing:
             self.stop()
-        roi_failed = False
         try:
             self._try_set_int("OffsetX", 0)
             self._try_set_int("OffsetY", 0)
@@ -573,16 +572,14 @@ class MvsCamera:
                 self._set_payload_size(self._get_int("PayloadSize"))
             except MvsError as exc:
                 LOGGER.debug("%s: failed to refresh PayloadSize after ROI update: %s", self.info.label, exc, exc_info=True)
-        except BaseException:
-            roi_failed = True
-            raise
         finally:
+            pending_exc_type = sys.exc_info()[0]
             if restart_stream and was_grabbing:
                 try:
                     self.start()
                 except Exception:
                     LOGGER.exception("%s: failed to restart stream after applying ROI.", self.info.label)
-                    if not roi_failed:
+                    if pending_exc_type is None:
                         raise
         return RoiApplyResult(warnings, (width, height, offset_x, offset_y))
 
@@ -985,12 +982,12 @@ class StereoCameraSystem:
         self.right_info: CameraInfo | None = None
         self.trigger_source = str(config.get("trigger_source", "Software"))
         self.timeout_ms = int(config.get("frame_timeout_ms", 3000))
-        self.timestamp_reject_enabled = config_bool(config, "timestamp_reject_enabled", False)
+        self.timestamp_reject_enabled = config_bool(config, "timestamp_reject_enabled", False, False)
         self.max_camera_timestamp_delta = int(config.get("max_camera_timestamp_delta", 0) or 0)
         self.max_host_timestamp_delta = int(config.get("max_host_timestamp_delta", 0) or 0)
         if self.max_camera_timestamp_delta <= 0 and self.max_host_timestamp_delta <= 0:
             self.timestamp_reject_enabled = False
-        self.require_hardware_trigger = config_bool(config, "require_hardware_trigger", False)
+        self.require_hardware_trigger = config_bool(config, "require_hardware_trigger", False, False)
         self.camera_timestamp_offset_samples = max(config_int(config, "camera_timestamp_offset_samples", 5), 1)
         self._camera_timestamp_offset: int | None = None
         self._camera_timestamp_offset_samples: list[int] = []
@@ -1002,8 +999,8 @@ class StereoCameraSystem:
         left_info, right_info, dev_list = select_capture_devices(
             str(self.config.get("left_serial", "")).strip(),
             str(self.config.get("right_serial", "")).strip(),
-            config_bool(self.config, "allow_single_camera", False),
-            config_bool(self.config, "bind_camera_serials", False),
+            config_bool(self.config, "allow_single_camera", False, False),
+            config_bool(self.config, "bind_camera_serials", False, False),
         )
         left = MvsCamera(dev_list, left_info) if left_info is not None else None
         right = MvsCamera(dev_list, right_info) if right_info is not None else None
@@ -1213,13 +1210,13 @@ class StereoCameraSystem:
                 cameras[0][1].trigger_software()
             else:
                 barrier = threading.Barrier(len(cameras) + 1)
-                errors: list[BaseException] = []
+                errors: list[Exception] = []
 
                 def fire(cam: MvsCamera) -> None:
                     try:
                         barrier.wait()
                         cam.trigger_software()
-                    except BaseException as exc:
+                    except Exception as exc:
                         errors.append(exc)
 
                 trigger_threads = [threading.Thread(target=fire, args=(cam,), daemon=True) for _name, cam in cameras]
@@ -1238,12 +1235,12 @@ class StereoCameraSystem:
             trigger_time = time.time()
 
         frames: dict[str, Frame] = {}
-        errors: list[BaseException] = []
+        errors: list[Exception] = []
 
         def grab(name: str, cam: MvsCamera) -> None:
             try:
                 frames[name] = cam.grab_frame(self.timeout_ms)
-            except BaseException as exc:
+            except Exception as exc:
                 errors.append(exc)
 
         grab_threads = [threading.Thread(target=grab, args=(name, cam), daemon=True) for name, cam in cameras]
