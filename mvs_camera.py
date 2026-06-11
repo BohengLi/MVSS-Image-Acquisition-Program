@@ -8,7 +8,7 @@ import time
 from collections import deque
 from concurrent.futures import ThreadPoolExecutor, wait
 from ctypes import CFUNCTYPE, POINTER, byref, c_ubyte, c_void_p, cast, create_string_buffer, memset, sizeof, string_at
-from dataclasses import dataclass
+from dataclasses import asdict, dataclass
 from importlib.util import find_spec
 from pathlib import Path
 from typing import Any
@@ -22,6 +22,7 @@ LOGGER = logging.getLogger("mvss_capture")
 _MVS_IMPORT_ATTEMPTS = 3
 _MVS_IMPORT_RETRY_DELAY_SECONDS = 0.4
 _SDK_LOCK = threading.Lock()
+DEFAULT_CHUNK_SELECTORS = ("Timestamp", "Framecounter", "FrameCounter", "ExposureTime", "Gain")
 
 
 class MvsError(RuntimeError):
@@ -243,6 +244,7 @@ class CameraParameters:
     roi_height: int | None = None
     roi_offset_x: int = 0
     roi_offset_y: int = 0
+    chunk_data_enabled: bool = False
 
 
 @dataclass(frozen=True)
@@ -251,6 +253,13 @@ class IntNodeInfo:
     minimum: int
     maximum: int
     increment: int
+
+
+@dataclass(frozen=True)
+class StreamStats:
+    buffered_frames: int
+    dropped_frames: int
+    callback_enabled: bool
 
 
 @dataclass(frozen=True)
@@ -428,6 +437,8 @@ class MvsCamera:
         roi_height: int | None = None,
         roi_offset_x: int = 0,
         roi_offset_y: int = 0,
+        chunk_data_enabled: bool = False,
+        chunk_selectors: list[str] | tuple[str, ...] | None = None,
     ) -> None:
         self._try_set_enum_by_string("AcquisitionMode", "Continuous")
         self._try_set_enum_by_string("TriggerSelector", "FrameStart")
@@ -449,6 +460,8 @@ class MvsCamera:
             balance_ratio_green,
             balance_ratio_blue,
         )
+        for warning in self.apply_chunk_settings(chunk_data_enabled, chunk_selectors):
+            LOGGER.warning(warning)
 
         self._set_payload_size(self._get_int("PayloadSize"))
 
@@ -568,6 +581,36 @@ class MvsCamera:
                     continue
                 if not self._try_set_float("BalanceRatio", value):
                     warnings.append(f"{self.info.label}: BalanceRatio {selector}={value} 设置失败")
+        return warnings
+
+    def apply_chunk_settings(
+        self,
+        enabled: bool,
+        selectors: list[str] | tuple[str, ...] | None = None,
+    ) -> list[str]:
+        warnings: list[str] = []
+        enabled = bool(enabled)
+        if not self._try_set_bool("ChunkModeActive", enabled):
+            if enabled:
+                warnings.append(f"{self.info.label}: ChunkModeActive=On is not supported or failed")
+            return warnings
+        if not enabled:
+            return warnings
+
+        raw_selectors: list[str] | tuple[str, ...]
+        if isinstance(selectors, str):
+            raw_selectors = tuple(selectors.replace(";", ",").split(","))
+        else:
+            raw_selectors = selectors or DEFAULT_CHUNK_SELECTORS
+        requested = [str(selector).strip() for selector in raw_selectors if str(selector).strip()]
+        enabled_count = 0
+        for selector in requested:
+            if not self._try_set_enum_by_string("ChunkSelector", selector):
+                continue
+            if self._try_set_bool("ChunkEnable", True):
+                enabled_count += 1
+        if requested and enabled_count == 0:
+            warnings.append(f"{self.info.label}: ChunkModeActive enabled, but no ChunkSelector could be enabled")
         return warnings
 
     def apply_roi_settings(
@@ -803,6 +846,14 @@ class MvsCamera:
             return None
         return max(bytes_per_second * 8.0 / 1_000_000.0, 0.0)
 
+    def stream_stats(self) -> StreamStats:
+        with self._stream_condition:
+            return StreamStats(
+                buffered_frames=len(self._stream_frames),
+                dropped_frames=self._stream_dropped_frames,
+                callback_enabled=self._stream_callback_enabled,
+            )
+
     def _set_payload_size(self, payload_size: int) -> None:
         with self._payload_lock:
             self._payload_size = int(payload_size)
@@ -869,8 +920,10 @@ class MvsCamera:
 
     def _packet_to_image(self, packet: RawFramePacket) -> Image.Image:
         s = sdk()
-        if packet.pixel_type == s["PixelType_Gvsp_Mono8"] and packet.frame_len >= packet.width * packet.height:
-            return Image.frombytes("L", (packet.width, packet.height), packet.data[: packet.width * packet.height])
+        expected_len = packet.width * packet.height
+        if packet.pixel_type == s["PixelType_Gvsp_Mono8"] and packet.frame_len >= expected_len:
+            payload = packet.data if packet.frame_len == expected_len else memoryview(packet.data)[:expected_len]
+            return Image.frombytes("L", (packet.width, packet.height), payload)
         buffer_type = c_ubyte * len(packet.data)
         raw_buffer = buffer_type.from_buffer_copy(packet.data)
 
@@ -972,6 +1025,16 @@ class MvsCamera:
         except Exception as exc:
             LOGGER.debug("%s: exception while probing enum node %s=%s: %s", self.info.label, key, value, exc, exc_info=True)
             return False
+
+    def _try_set_bool(self, key: str, value: bool) -> bool:
+        try:
+            setter = getattr(self._cam, "MV_CC_SetBoolValue", None)
+            if setter is not None:
+                return setter(key, bool(value)) == 0
+        except Exception as exc:
+            LOGGER.debug("%s: exception while probing bool node %s=%s: %s", self.info.label, key, value, exc, exc_info=True)
+            return False
+        return self._try_set_int(key, 1 if value else 0)
 
     def _set_float(self, key: str, value: float) -> None:
         ret = self._cam.MV_CC_SetFloatValue(key, float(value))
@@ -1196,6 +1259,8 @@ class StereoCameraSystem:
                     roi_height=self._roi_value(side, "height", "roi_height"),
                     roi_offset_x=int(self._roi_value(side, "offset_x", "roi_offset_x", 0) or 0),
                     roi_offset_y=int(self._roi_value(side, "offset_y", "roi_offset_y", 0) or 0),
+                    chunk_data_enabled=config_bool(self.config, "chunk_data_enabled", False, False),
+                    chunk_selectors=self.config.get("chunk_selectors"),
                 )
                 cam.start()
         except Exception:
@@ -1270,6 +1335,10 @@ class StereoCameraSystem:
     def link_throughput_mbps(self) -> dict[str, float | None]:
         with self._capture_lock:
             return {name: cam.current_throughput_mbps() for name, cam in self._connected_cameras()}
+
+    def stream_stats(self) -> dict[str, dict[str, int | bool]]:
+        with self._capture_lock:
+            return {name: asdict(cam.stream_stats()) for name, cam in self._connected_cameras()}
 
     def apply_gain_settings(
         self,

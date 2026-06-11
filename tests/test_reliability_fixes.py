@@ -5,9 +5,11 @@ import threading
 import unittest
 from pathlib import Path
 from queue import Queue
+from unittest.mock import patch
 
 import image_quality
-from mvs_camera import Frame, MvsCamera, StereoCameraSystem
+import mvs_camera
+from mvs_camera import Frame, MvsCamera, RawFramePacket, StereoCameraSystem
 import stereo_capture_only
 from stereo_capture_only import StereoCaptureOnlyApp
 
@@ -57,6 +59,45 @@ class _FakeNodeCamera:
         self.enum_strings: list[tuple[str, str]] = []
 
 
+class _FakeChunkSdkCamera:
+    def __init__(self):
+        self.bool_values: list[tuple[str, bool]] = []
+        self.enum_strings: list[tuple[str, str]] = []
+
+    def MV_CC_SetBoolValue(self, key: str, value: bool) -> int:
+        self.bool_values.append((key, bool(value)))
+        return 0
+
+    def MV_CC_SetEnumValueByString(self, key: str, value: str) -> int:
+        self.enum_strings.append((key, value))
+        return 0
+
+
+class _Var:
+    def __init__(self):
+        self.value = ""
+
+    def set(self, value) -> None:
+        self.value = str(value)
+
+
+class _FakeStatsSystem:
+    def __init__(self):
+        self.temperature_reads = 0
+        self.stream_reads = 0
+
+    def sensor_temperatures(self):
+        self.temperature_reads += 1
+        return {"left": 40.0}
+
+    def link_throughput_mbps(self):
+        return {"left": 100.0}
+
+    def stream_stats(self):
+        self.stream_reads += 1
+        return {"left": {"buffered_frames": 0, "dropped_frames": 2, "callback_enabled": True}}
+
+
 class ReliabilityFixTests(unittest.TestCase):
     def test_float_from_sdk_value_handles_bad_sdk_object(self) -> None:
         camera = MvsCamera.__new__(MvsCamera)
@@ -76,6 +117,42 @@ class ReliabilityFixTests(unittest.TestCase):
         self.assertEqual(warnings, [])
         self.assertIn(("TriggerMode", "Off"), fake.enum_strings)
         self.assertNotIn(("TriggerSource", "Software"), fake.enum_strings)
+
+    def test_mono8_packet_to_image_uses_exact_payload_without_slice(self) -> None:
+        camera = MvsCamera.__new__(MvsCamera)
+        payload = b"123456"
+        packet = RawFramePacket(payload, len(payload), 3, 2, 1, 1, 0, 0)
+        seen: dict[str, object] = {}
+
+        def fake_frombytes(mode, size, data):
+            seen["mode"] = mode
+            seen["size"] = size
+            seen["data"] = data
+            return object()
+
+        with patch.object(mvs_camera, "sdk", return_value={"PixelType_Gvsp_Mono8": 1}), patch.object(
+            mvs_camera.Image,
+            "frombytes",
+            side_effect=fake_frombytes,
+        ):
+            camera._packet_to_image(packet)
+
+        self.assertEqual(seen["mode"], "L")
+        self.assertEqual(seen["size"], (3, 2))
+        self.assertIs(seen["data"], payload)
+
+    def test_chunk_settings_enable_timestamp_metadata_nodes(self) -> None:
+        camera = MvsCamera.__new__(MvsCamera)
+        camera.info = _Info()
+        camera._cam = _FakeChunkSdkCamera()
+
+        warnings = camera.apply_chunk_settings(True, ["Timestamp", "ExposureTime"])
+
+        self.assertEqual(warnings, [])
+        self.assertIn(("ChunkModeActive", True), camera._cam.bool_values)
+        self.assertIn(("ChunkSelector", "Timestamp"), camera._cam.enum_strings)
+        self.assertIn(("ChunkSelector", "ExposureTime"), camera._cam.enum_strings)
+        self.assertGreaterEqual(camera._cam.bool_values.count(("ChunkEnable", True)), 2)
 
     def test_save_image_removes_partial_file_on_failure(self) -> None:
         app = StereoCaptureOnlyApp.__new__(StereoCaptureOnlyApp)
@@ -277,6 +354,20 @@ class ReliabilityFixTests(unittest.TestCase):
             )
         )
 
+    def test_unlimited_preview_analysis_is_time_gated(self) -> None:
+        app = StereoCaptureOnlyApp.__new__(StereoCaptureOnlyApp)
+        app._histogram_enabled_setting = True
+        app._focus_peaking_enabled_setting = False
+        config = {
+            "preview_quality_analysis_enabled": False,
+            "preview_fps": 0,
+            "preview_analysis_fps": 20.0,
+        }
+        with patch.object(stereo_capture_only.time, "perf_counter", side_effect=[100.0, 100.2, 101.0]):
+            self.assertTrue(app._should_analyze_preview_frame(2, config))
+            self.assertFalse(app._should_analyze_preview_frame(3, config))
+            self.assertTrue(app._should_analyze_preview_frame(4, config))
+
     def test_record_status_text_accepts_unlimited_target_fps(self) -> None:
         app = StereoCaptureOnlyApp.__new__(StereoCaptureOnlyApp)
         app._record_elapsed_seconds = lambda: 1.0
@@ -310,6 +401,66 @@ class ReliabilityFixTests(unittest.TestCase):
         self.assertEqual(warnings, [])
         self.assertEqual(left.grab_timeouts, [400, 400])
         self.assertEqual(right.grab_timeouts, [400, 400])
+
+    def test_stream_stats_are_aggregated_for_ui(self) -> None:
+        system = StereoCameraSystem.__new__(StereoCameraSystem)
+        system._capture_lock = threading.Lock()
+        left = MvsCamera.__new__(MvsCamera)
+        left._stream_condition = threading.Condition()
+        left._stream_frames = []
+        left._stream_dropped_frames = 3
+        left._stream_callback_enabled = True
+        right = MvsCamera.__new__(MvsCamera)
+        right._stream_condition = threading.Condition()
+        right._stream_frames = [object()]
+        right._stream_dropped_frames = 0
+        right._stream_callback_enabled = False
+        system._connected_cameras = lambda: [("left", left), ("right", right)]
+
+        stats = system.stream_stats()
+
+        self.assertEqual(stats["left"]["dropped_frames"], 3)
+        self.assertTrue(stats["left"]["callback_enabled"])
+        self.assertEqual(stats["right"]["buffered_frames"], 1)
+
+    def test_temperature_display_shows_stream_drop_counter(self) -> None:
+        app = StereoCaptureOnlyApp.__new__(StereoCaptureOnlyApp)
+        app.temperature_status_var = _Var()
+        app.config = {"temperature_monitor": {}}
+
+        app._update_temperature_display(
+            {
+                "temperatures_c": {},
+                "link_throughput_mbps": {"left": 750.0},
+                "stream_stats": {"left": {"dropped_frames": 5}, "right": {"dropped_frames": 0}},
+            }
+        )
+
+        self.assertIn("Link left:750Mbps", app.temperature_status_var.value)
+        self.assertIn("StreamDrop left:5", app.temperature_status_var.value)
+
+    def test_stream_stats_poll_runs_when_temperature_monitor_disabled(self) -> None:
+        app = StereoCaptureOnlyApp.__new__(StereoCaptureOnlyApp)
+        app.config = {"temperature_monitor": {"enabled": False, "stream_stats_interval_seconds": 1.0}}
+        app.camera_system = _FakeStatsSystem()
+        app._latest_temperatures = {}
+        app._latest_link_throughput_mbps = {}
+        app._latest_stream_stats = {}
+        app._temperature_samples = []
+        app._last_temperature_poll = 0.0
+        app._last_stream_stats_poll = 0.0
+        app.ui_queue = Queue()
+
+        with patch.object(stereo_capture_only.time, "perf_counter", return_value=2.0):
+            app._poll_camera_temperatures()
+
+        self.assertEqual(app.camera_system.temperature_reads, 0)
+        self.assertEqual(app.camera_system.stream_reads, 1)
+        self.assertEqual(app._latest_stream_stats["left"]["dropped_frames"], 2)
+        self.assertEqual(app._temperature_samples, [])
+        kind, payload = app.ui_queue.get_nowait()
+        self.assertEqual(kind, "temperature")
+        self.assertEqual(payload["stream_stats"]["left"]["dropped_frames"], 2)
 
     def test_video_segment_size_estimate_uses_bitrate_and_fps(self) -> None:
         app = StereoCaptureOnlyApp.__new__(StereoCaptureOnlyApp)

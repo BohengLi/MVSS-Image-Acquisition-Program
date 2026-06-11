@@ -1519,6 +1519,7 @@ class StereoCaptureOnlyApp:
         self._last_left_frame_obj: CameraFrame | None = None
         self._last_right_frame_obj: CameraFrame | None = None
         self._last_analysis_time = 0.0
+        self._last_preview_analysis_gate_time = 0.0
         self._preview_frame_counter = 0
         self._cached_focus_roi: dict[str, float] = clamp_roi_frac(self.config.get("focus_roi"))
         self._cached_focus_roi_source: object = None
@@ -1540,8 +1541,10 @@ class StereoCaptureOnlyApp:
         self._device_versions: dict[str, str | None] = {}
         self._latest_temperatures: dict[str, float | None] = {}
         self._latest_link_throughput_mbps: dict[str, float | None] = {}
+        self._latest_stream_stats: dict[str, dict[str, int | bool]] = {}
         self._temperature_samples: list[dict[str, object]] = []
         self._last_temperature_poll = 0.0
+        self._last_stream_stats_poll = 0.0
         self._focus_history: list[tuple[float, float]] = []
         self._focus_peak_score = 0.0
         self._calibration_wizard: dict[str, object] = {}
@@ -3109,7 +3112,15 @@ class StereoCaptureOnlyApp:
             return False
         fps = optional_positive_fps(config_snapshot.get("preview_fps", 15.0))
         analysis_fps = max(config_float(config_snapshot, "preview_analysis_fps", 1.0), 0.1)
-        every_n = max(int(round((fps or analysis_fps) / analysis_fps)), 1)
+        if fps is None:
+            now = time.perf_counter()
+            interval_s = max(1.0 / analysis_fps, 1.0)
+            last_analysis = float(getattr(self, "_last_preview_analysis_gate_time", 0.0) or 0.0)
+            if frame_index <= 1 or now - last_analysis >= interval_s:
+                self._last_preview_analysis_gate_time = now
+                return True
+            return False
+        every_n = max(int(round(fps / analysis_fps)), 1)
         return frame_index <= 1 or frame_index % every_n == 0
 
     def capture_photo(self) -> None:
@@ -3783,6 +3794,7 @@ class StereoCaptureOnlyApp:
                 "right_camera": asdict(camera_system.right_info) if camera_system and camera_system.right_info else None,
                 "device_versions": dict(self._device_versions),
                 "temperatures_c": dict(self._latest_temperatures),
+                "stream_stats": dict(getattr(self, "_latest_stream_stats", {})),
                 "temperature_samples": list(self._temperature_samples),
                 "calibration": self.calibration.meta(),
                 "project": self.project_manager.project_meta(),
@@ -5184,6 +5196,8 @@ class StereoCaptureOnlyApp:
             "max_camera_timestamp_delta": 0,
             "max_host_timestamp_delta": DEFAULT_HOST_TIMESTAMP_DELTA_NS,
             "camera_timestamp_offset_samples": 5,
+            "chunk_data_enabled": True,
+            "chunk_selectors": ["Timestamp", "FrameCounter", "ExposureTime", "Gain"],
         }
         for key, value in defaults.items():
             self.config.setdefault(key, value)
@@ -5232,6 +5246,7 @@ class StereoCaptureOnlyApp:
         temperature = self._ensure_config_section("temperature_monitor")
         temperature.setdefault("enabled", True)
         temperature.setdefault("interval_seconds", 30.0)
+        temperature.setdefault("stream_stats_interval_seconds", 1.0)
         temperature.setdefault("warning_threshold_c", 65.0)
         temperature.setdefault("critical_threshold_c", 75.0)
         hdr = self._ensure_config_section("hdr_bracketing")
@@ -5560,52 +5575,92 @@ class StereoCaptureOnlyApp:
         self._update_capture_gate_preview()
 
     def _poll_camera_temperatures(self, force: bool = False) -> None:
-        monitor = self.config.get("temperature_monitor", {})
-        if not config_bool(monitor, "enabled", True, True):
-            return
         if self.camera_system is None:
             return
+        monitor = self.config.get("temperature_monitor", {})
         interval_s = max(config_float(monitor, "interval_seconds", 30.0), 1.0)
+        stream_interval_s = max(config_float(monitor, "stream_stats_interval_seconds", 1.0), 0.2)
         now = time.perf_counter()
-        if not force and now - self._last_temperature_poll < interval_s:
+        poll_temperature = config_bool(monitor, "enabled", True, True) and (force or now - self._last_temperature_poll >= interval_s)
+        poll_stream_stats = force or now - getattr(self, "_last_stream_stats_poll", 0.0) >= stream_interval_s
+        if not poll_temperature and not poll_stream_stats:
             return
-        self._last_temperature_poll = now
-        try:
-            readings = self.camera_system.sensor_temperatures()
-        except Exception as exc:
-            LOGGER.info("temperature read failed: %s", exc)
-            return
-        try:
-            throughput = self.camera_system.link_throughput_mbps()
-        except Exception as exc:
-            LOGGER.debug("link throughput read failed: %s", exc, exc_info=True)
-            throughput = {}
+        readings = dict(getattr(self, "_latest_temperatures", {}))
+        throughput = dict(getattr(self, "_latest_link_throughput_mbps", {}))
+        stream_stats = dict(getattr(self, "_latest_stream_stats", {}))
+        if poll_temperature:
+            self._last_temperature_poll = now
+            try:
+                readings = self.camera_system.sensor_temperatures()
+            except Exception as exc:
+                LOGGER.info("temperature read failed: %s", exc)
+                readings = dict(getattr(self, "_latest_temperatures", {}))
+            try:
+                throughput = self.camera_system.link_throughput_mbps()
+            except Exception as exc:
+                LOGGER.debug("link throughput read failed: %s", exc, exc_info=True)
+                throughput = dict(getattr(self, "_latest_link_throughput_mbps", {}))
+        if poll_stream_stats:
+            self._last_stream_stats_poll = now
+            try:
+                stream_stats = self.camera_system.stream_stats()
+            except Exception as exc:
+                LOGGER.debug("stream stats read failed: %s", exc, exc_info=True)
+                stream_stats = dict(getattr(self, "_latest_stream_stats", {}))
         self._latest_temperatures = readings
         self._latest_link_throughput_mbps = throughput
-        sample = {"time": time.time(), "temperatures_c": dict(readings), "link_throughput_mbps": dict(throughput)}
-        self._temperature_samples.append(sample)
-        if len(self._temperature_samples) > 10000:
-            self._temperature_samples = self._temperature_samples[-10000:]
-        self.ui_queue.put(("temperature", {"temperatures_c": dict(readings), "link_throughput_mbps": dict(throughput)}))
+        self._latest_stream_stats = stream_stats
+        if poll_temperature:
+            sample = {
+                "time": time.time(),
+                "temperatures_c": dict(readings),
+                "link_throughput_mbps": dict(throughput),
+                "stream_stats": dict(stream_stats),
+            }
+            self._temperature_samples.append(sample)
+            if len(self._temperature_samples) > 10000:
+                self._temperature_samples = self._temperature_samples[-10000:]
+        self.ui_queue.put(
+            (
+                "temperature",
+                {
+                    "temperatures_c": dict(readings),
+                    "link_throughput_mbps": dict(throughput),
+                    "stream_stats": dict(stream_stats),
+                },
+            )
+        )
 
     def _update_temperature_display(self, readings: dict[str, float | None]) -> None:
         throughput: dict[str, float | None] = {}
-        if "temperatures_c" in readings or "link_throughput_mbps" in readings:
+        stream_stats: dict[str, dict[str, int | bool]] = {}
+        if "temperatures_c" in readings or "link_throughput_mbps" in readings or "stream_stats" in readings:
             throughput = readings.get("link_throughput_mbps", {}) if isinstance(readings.get("link_throughput_mbps"), dict) else {}
+            stream_stats = readings.get("stream_stats", {}) if isinstance(readings.get("stream_stats"), dict) else {}
             readings = readings.get("temperatures_c", {}) if isinstance(readings.get("temperatures_c"), dict) else {}
+        parts: list[str] = []
         values = {side: value for side, value in readings.items() if value is not None}
-        if not values:
-            link_values = {side: value for side, value in throughput.items() if value is not None}
-            if link_values:
-                self.temperature_status_var.set("Link " + " | ".join(f"{side}:{value:.0f}Mbps" for side, value in link_values.items()))
-            else:
-                self.temperature_status_var.set("Temp unavailable")
-            return
-        text = " | ".join(f"{side}:{value:.1f}C" for side, value in values.items())
+        if values:
+            parts.append(" | ".join(f"{side}:{value:.1f}C" for side, value in values.items()))
         link_values = {side: value for side, value in throughput.items() if value is not None}
         if link_values:
-            text += " | Link " + " | ".join(f"{side}:{value:.0f}Mbps" for side, value in link_values.items())
+            parts.append("Link " + " | ".join(f"{side}:{value:.0f}Mbps" for side, value in link_values.items()))
+        drop_values: dict[str, int] = {}
+        for side, stats in stream_stats.items():
+            if not isinstance(stats, dict):
+                continue
+            try:
+                dropped = int(stats.get("dropped_frames", 0) or 0)
+            except (TypeError, ValueError, OverflowError):
+                continue
+            if dropped > 0:
+                drop_values[side] = dropped
+        if drop_values:
+            parts.append("StreamDrop " + " | ".join(f"{side}:{value}" for side, value in drop_values.items()))
+        text = " | ".join(parts) if parts else "Temp unavailable"
         self.temperature_status_var.set(text)
+        if not values:
+            return
         monitor = self.config.get("temperature_monitor", {})
         warning = config_float(monitor, "warning_threshold_c", 65.0)
         critical = config_float(monitor, "critical_threshold_c", 75.0)
@@ -7491,6 +7546,7 @@ Output {esc('MP4 + image sequence' if config_bool(config_snapshot, 'record_save_
         camera_settings = self._capture_settings_snapshot(config_snapshot)
         environment = {
             "temperatures_c": dict(self._latest_temperatures),
+            "stream_stats": dict(getattr(self, "_latest_stream_stats", {})),
             "temperature_samples": list(self._temperature_samples[-1000:]),
             "save_dir": str(resolve_output_root(config_snapshot)),
             "project": self.project_manager.project_meta(),
@@ -7538,6 +7594,8 @@ Output {esc('MP4 + image sequence' if config_bool(config_snapshot, 'record_save_
             "record_split_interval_seconds",
             "record_split_size_gb",
             "record_max_seconds",
+            "chunk_data_enabled",
+            "chunk_selectors",
         )
         snapshot = {key: config_snapshot.get(key) for key in keys}
         snapshot["image_format"] = image_extension(config_snapshot)
@@ -7559,6 +7617,7 @@ Output {esc('MP4 + image sequence' if config_bool(config_snapshot, 'record_save_
         )
         payload["device_versions"] = dict(self._device_versions)
         payload["temperatures_c"] = dict(self._latest_temperatures)
+        payload["stream_stats"] = dict(getattr(self, "_latest_stream_stats", {}))
         payload["temperature_samples"] = list(self._temperature_samples[-1000:])
         payload["calibration"] = self.calibration.meta()
         payload["project"] = self.project_manager.project_meta()
