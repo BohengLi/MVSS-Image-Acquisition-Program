@@ -52,6 +52,11 @@ class _FakeGrabCamera:
         )
 
 
+class _FakeNodeCamera:
+    def __init__(self):
+        self.enum_strings: list[tuple[str, str]] = []
+
+
 class ReliabilityFixTests(unittest.TestCase):
     def test_float_from_sdk_value_handles_bad_sdk_object(self) -> None:
         camera = MvsCamera.__new__(MvsCamera)
@@ -59,6 +64,18 @@ class ReliabilityFixTests(unittest.TestCase):
 
         self.assertIsNone(camera._float_from_sdk_value(object(), "Gain"))
         self.assertIsNone(camera._float_from_sdk_value(_BadFloatValue(), "Gain"))
+
+    def test_camera_continuous_trigger_mode_turns_trigger_off(self) -> None:
+        camera = MvsCamera.__new__(MvsCamera)
+        camera.info = _Info()
+        fake = _FakeNodeCamera()
+        camera._try_set_enum_by_string = lambda key, value: fake.enum_strings.append((key, value)) or True
+
+        warnings = camera.apply_trigger_settings("Continuous")
+
+        self.assertEqual(warnings, [])
+        self.assertIn(("TriggerMode", "Off"), fake.enum_strings)
+        self.assertNotIn(("TriggerSource", "Software"), fake.enum_strings)
 
     def test_save_image_removes_partial_file_on_failure(self) -> None:
         app = StereoCaptureOnlyApp.__new__(StereoCaptureOnlyApp)
@@ -224,6 +241,53 @@ class ReliabilityFixTests(unittest.TestCase):
         self.assertEqual(right.grab_timeouts, [500])
         self.assertEqual(left.trigger_count, 1)
         self.assertEqual(right.trigger_count, 1)
+
+    def test_continuous_capture_does_not_fire_software_trigger(self) -> None:
+        system = StereoCameraSystem.__new__(StereoCameraSystem)
+        system._capture_lock = threading.Lock()
+        system.trigger_source = "Continuous"
+        system.timeout_ms = 800
+        system.software_trigger_barrier_timeout_s = 1.0
+        system.require_hardware_trigger = False
+        system.timestamp_reject_enabled = False
+        left = _FakeGrabCamera("left")
+        right = _FakeGrabCamera("right")
+        system._connected_cameras = lambda: [("left", left), ("right", right)]
+
+        system.capture_pair(timeout_ms=250)
+
+        self.assertEqual(left.grab_timeouts, [250])
+        self.assertEqual(right.grab_timeouts, [250])
+        self.assertEqual(left.trigger_count, 0)
+        self.assertEqual(right.trigger_count, 0)
+
+    def test_preview_analysis_accepts_unlimited_preview_fps(self) -> None:
+        app = StereoCaptureOnlyApp.__new__(StereoCaptureOnlyApp)
+        app._histogram_enabled_setting = True
+        app._focus_peaking_enabled_setting = False
+
+        self.assertTrue(
+            app._should_analyze_preview_frame(
+                2,
+                {
+                    "preview_quality_analysis_enabled": False,
+                    "preview_fps": 0,
+                    "preview_analysis_fps": 20.0,
+                },
+            )
+        )
+
+    def test_record_status_text_accepts_unlimited_target_fps(self) -> None:
+        app = StereoCaptureOnlyApp.__new__(StereoCaptureOnlyApp)
+        app._record_elapsed_seconds = lambda: 1.0
+        app._record_free_space_gb = lambda: 100.0
+        app._record_write_state_snapshot = lambda: (0.0, "", 1, 1)
+        app._record_counter_values = lambda: (10, 8)
+        app._config_snapshot = lambda: {}
+
+        text = app._record_status_text(None, 8.0, {})
+
+        self.assertIn("max", text)
 
     def test_roi_warmup_uses_configured_short_timeout(self) -> None:
         system = StereoCameraSystem.__new__(StereoCameraSystem)

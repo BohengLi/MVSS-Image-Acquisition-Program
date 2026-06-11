@@ -387,6 +387,14 @@ def optional_int_text(text: str) -> int | None:
     return int(value)
 
 
+def optional_positive_fps(text: object) -> float | None:
+    value = str(text).strip()
+    if not value:
+        return None
+    fps = float(value)
+    return fps if fps > 0 else None
+
+
 def optional_config_text(config: dict, key: str, default: str = "") -> str:
     value = config.get(key, default)
     return "" if value is None else str(value)
@@ -418,6 +426,13 @@ def estimate_frame_bytes(config: dict, width: int = CAPTURE_WIDTH, height: int =
     if ext == "png":
         return max(int(raw_bytes * 0.60), 1)
     return raw_bytes
+
+
+def configured_record_output_fps(config: dict) -> float:
+    return optional_positive_fps(config.get("record_fps", 5.0)) or max(
+        config_float(config, "record_output_fps_when_unlimited", 30.0),
+        0.1,
+    )
 
 
 def format_duration(seconds: float) -> str:
@@ -1524,6 +1539,7 @@ class StereoCaptureOnlyApp:
         self._last_rectified_overlay_image: Image.Image | None = None
         self._device_versions: dict[str, str | None] = {}
         self._latest_temperatures: dict[str, float | None] = {}
+        self._latest_link_throughput_mbps: dict[str, float | None] = {}
         self._temperature_samples: list[dict[str, object]] = []
         self._last_temperature_poll = 0.0
         self._focus_history: list[tuple[float, float]] = []
@@ -1710,6 +1726,7 @@ class StereoCaptureOnlyApp:
             self.trigger_source_var.get(),
             "Software",
             "Line0",
+            "Continuous",
         ).grid(row=0, column=1, padx=3, pady=2)
         self.apply_trigger_button = ttk.Button(
             trigger_panel, text="应用触发", command=self.apply_trigger_settings, state=DISABLED
@@ -3017,8 +3034,8 @@ class StereoCaptureOnlyApp:
         self.status_var.set("正在停止实时采集...")
 
     def _preview_loop(self, generation: int, config_snapshot: dict) -> None:
-        fps = max(float(config_snapshot.get("preview_fps", 15.0)), 0.1)
-        interval = 1.0 / fps
+        fps = optional_positive_fps(config_snapshot.get("preview_fps", 15.0))
+        interval = 1.0 / fps if fps is not None else 0.0
         timeout_ms = self._preview_capture_timeout_ms(config_snapshot)
         next_time = time.perf_counter()
         had_error = False
@@ -3036,11 +3053,11 @@ class StereoCaptureOnlyApp:
                     if now - self._last_preview_status_time >= 1.0:
                         self._last_preview_status_time = now
                         self.ui_queue.put(("status", self._capture_timeout_message(exc, consecutive_timeouts)))
-                    next_time = time.perf_counter() + interval
+                    next_time = time.perf_counter() + interval if interval > 0 else time.perf_counter()
                     continue
                 except Exception as exc:
                     if self._handle_capture_exception(exc, "preview", 0):
-                        next_time = time.perf_counter() + interval
+                        next_time = time.perf_counter() + interval if interval > 0 else time.perf_counter()
                         continue
                     raise
 
@@ -3056,14 +3073,16 @@ class StereoCaptureOnlyApp:
                 if now - self._last_preview_status_time >= 1.0:
                     self._last_preview_status_time = now
                     trigger_note = "等待 Line0 外触发" if self._cached_trigger_source() == "Line0" else "软件触发"
-                    self.ui_queue.put(("status", self._status_with_stats(f"实时采集中：目标 {fps:g} fps；{trigger_note}")))
+                    target_text = f"{fps:g} fps" if fps is not None else "max"
+                    self.ui_queue.put(("status", self._status_with_stats(f"实时采集中：目标 {target_text}；{trigger_note}")))
 
-                next_time += interval
-                sleep_s = next_time - time.perf_counter()
-                if sleep_s > 0:
-                    time.sleep(sleep_s)
-                else:
-                    next_time = time.perf_counter()
+                if interval > 0:
+                    next_time += interval
+                    sleep_s = next_time - time.perf_counter()
+                    if sleep_s > 0:
+                        time.sleep(sleep_s)
+                    else:
+                        next_time = time.perf_counter()
         except Exception as exc:
             had_error = True
             self.ui_queue.put(("error", exc))
@@ -3088,9 +3107,9 @@ class StereoCaptureOnlyApp:
         )
         if not analysis_required:
             return False
-        fps = max(config_float(config_snapshot, "preview_fps", 15.0), 0.1)
+        fps = optional_positive_fps(config_snapshot.get("preview_fps", 15.0))
         analysis_fps = max(config_float(config_snapshot, "preview_analysis_fps", 1.0), 0.1)
-        every_n = max(int(round(fps / analysis_fps)), 1)
+        every_n = max(int(round((fps or analysis_fps) / analysis_fps)), 1)
         return frame_index <= 1 or frame_index % every_n == 0
 
     def capture_photo(self) -> None:
@@ -3438,11 +3457,11 @@ class StereoCaptureOnlyApp:
             return
         self._ensure_recording_config_defaults()
         try:
-            fps = max(float(self.record_fps_var.get()), 0.1)
+            fps = optional_positive_fps(self.record_fps_var.get())
         except ValueError:
-            self.status_var.set("录像 FPS 必须是数字。")
+            self.status_var.set("录像 FPS 必须是数字；0 或留空表示不限速。")
             return
-        record_updates: dict[str, object] = {"record_fps": fps}
+        record_updates: dict[str, object] = {"record_fps": fps or 0.0}
         try:
             record_updates["record_max_seconds"] = max(float(self.record_max_seconds_var.get() or 0), 0.0)
         except ValueError:
@@ -3541,8 +3560,10 @@ class StereoCaptureOnlyApp:
         config_snapshot = self._capture_priority_record_config(config_snapshot)
         self._require_camera_system()
         record_dir = self._require_record_dir()
-        fps = max(float(config_snapshot.get("record_fps", 5.0)), 0.1)
-        interval = 1.0 / fps
+        capture_fps = optional_positive_fps(config_snapshot.get("record_fps", 5.0))
+        output_fps_setting = config_float(config_snapshot, "record_output_fps_when_unlimited", 30.0)
+        fps = capture_fps or max(output_fps_setting, 0.1)
+        interval = 1.0 / capture_fps if capture_fps is not None else 0.0
         ext = image_extension(config_snapshot)
         save_image_sequence = config_bool(config_snapshot, "record_save_image_sequence", False, False)
         auto_make_mp4 = config_bool(config_snapshot, "auto_make_mp4", True, True)
@@ -3624,12 +3645,12 @@ class StereoCaptureOnlyApp:
                 except FrameTimeoutError as exc:
                     consecutive_timeouts = self._record_timeout_observed()
                     self._handle_capture_exception(exc, "record", consecutive_timeouts)
-                    next_time = time.perf_counter() + interval
+                    next_time = time.perf_counter() + interval if interval > 0 else time.perf_counter()
                     continue
                 except Exception as exc:
                     self._add_record_errors()
                     if self._handle_capture_exception(exc, "record", 0):
-                        next_time = time.perf_counter() + interval
+                        next_time = time.perf_counter() + interval if interval > 0 else time.perf_counter()
                         continue
                     raise
                 self._reset_record_timeouts()
@@ -3662,7 +3683,7 @@ class StereoCaptureOnlyApp:
                 if self.previewing:
                     self._preview_frame_counter += 1
                     record_preview_fps = max(config_float(config_snapshot, "record_preview_fps", 2.0), 0.1)
-                    display_every_n = max(int(round(fps / record_preview_fps)), 1)
+                    display_every_n = max(int(round((capture_fps or record_preview_fps) / record_preview_fps)), 1)
                     display_this_frame = self._preview_frame_counter % display_every_n == 0
                     if display_this_frame and self._should_analyze_preview_frame(self._preview_frame_counter, config_snapshot):
                         analysis = self._analyze_preview_frames(left, right, self._preview_frame_counter)
@@ -3678,21 +3699,22 @@ class StereoCaptureOnlyApp:
                     self.ui_queue.put(
                         (
                             "status",
-                            self._record_status_text(fps, self._effective_record_fps(fps), config_snapshot),
+                            self._record_status_text(capture_fps, self._effective_record_fps(capture_fps), config_snapshot),
                         )
                     )
                     self.ui_queue.put(("record_progress", None))
-                    self._check_disk_space_during_recording(fps, config_snapshot)
+                    self._check_disk_space_during_recording(capture_fps or fps, config_snapshot)
                 writer_error = self._first_writer_error(writer_errors, writer_errors_lock)
                 if writer_error is not None:
                     raise writer_error
 
-                next_time += interval
-                sleep_s = next_time - time.perf_counter()
-                if sleep_s > 0:
-                    time.sleep(sleep_s)
-                elif time.perf_counter() - loop_start > interval * 2:
-                    next_time = time.perf_counter()
+                if interval > 0:
+                    next_time += interval
+                    sleep_s = next_time - time.perf_counter()
+                    if sleep_s > 0:
+                        time.sleep(sleep_s)
+                    elif time.perf_counter() - loop_start > interval * 2:
+                        next_time = time.perf_counter()
         except Exception as exc:
             self.ui_queue.put(("error", exc))
         finally:
@@ -3709,7 +3731,7 @@ class StereoCaptureOnlyApp:
             if writer_errors_snapshot:
                 self.ui_queue.put(("error", writer_errors_snapshot[0]))
                 self._add_record_errors(len(writer_errors_snapshot))
-            output_fps = self._record_output_fps(fps)
+            output_fps = self._record_output_fps(capture_fps or fps)
             generated_video_names = self._finalize_recording_videos(
                 record_dir,
                 output_fps,
@@ -3717,7 +3739,7 @@ class StereoCaptureOnlyApp:
                 video_outputs,
                 config_snapshot,
             )
-            summary = self._build_record_summary(record_dir, fps, output_fps, frames_snapshot)
+            summary = self._build_record_summary(record_dir, capture_fps or 0.0, output_fps, frames_snapshot)
             reports = self._write_record_reports(record_dir, summary, frames_snapshot, config_snapshot)
             summary["record_reports"] = reports
             write_lag, _write_warning, skip_every_n, skip_keep_frames = self._record_write_state_snapshot()
@@ -4021,7 +4043,7 @@ class StereoCaptureOnlyApp:
         with self._record_stats_lock:
             segment_first_saved = self._record_segment_start_saved + 1 if segment_index == self._record_split_index else saved_index
         frames_in_segment = max(int(saved_index) - int(segment_first_saved) + 1, 1)
-        fps = max(config_float(config_snapshot, "record_fps", 5.0), 0.1)
+        fps = configured_record_output_fps(config_snapshot)
         per_side_bytes = frames_in_segment * bitrate_kbps * 1000 / 8 / fps
         return max(int(per_side_bytes * 2), 1)
 
@@ -4138,7 +4160,8 @@ class StereoCaptureOnlyApp:
             queued["left"] = self._clone_frame(item.get("left"))
             queued["right"] = self._clone_frame(item.get("right"))
         try:
-            queue.put_nowait(queued)
+            config = getattr(self, "config", {})
+            queue.put(queued, timeout=max(config_float(config, "record_queue_put_timeout_seconds", 0.05), 0.0))
             return True
         except Full:
             warning = self._raise_record_write_lag(2.1, "写入队列已满，已丢弃当前录像帧以保护内存")
@@ -4736,6 +4759,8 @@ class StereoCaptureOnlyApp:
         self.apply_trigger_button.configure(state=DISABLED)
         if trigger_source == "Line0":
             self.status_var.set("正在应用 Line0 外触发模式；请确认两台相机 Line0 已接入同一个上升沿触发脉冲。")
+        elif trigger_source == "Continuous":
+            self.status_var.set("正在应用 Continuous 连续采集模式；相机会按曝光和带宽能力自由运行。")
         else:
             self.status_var.set("正在应用触发模式...")
 
@@ -4747,6 +4772,8 @@ class StereoCaptureOnlyApp:
                 message = self._format_apply_result("触发模式已应用", warnings)
                 if trigger_source == "Line0":
                     message += "；Line0 模式不会发送软件触发，若没有外部脉冲会持续超时。"
+                elif trigger_source == "Continuous":
+                    message += "；Continuous 模式关闭帧触发，预览/录像会读取相机连续输出的最新帧。"
                 self.ui_queue.put(("status", message))
             except Exception as exc:
                 self.ui_queue.put(("error", exc))
@@ -5117,7 +5144,9 @@ class StereoCaptureOnlyApp:
             "auto_reconnect_initial_delay_seconds": 1.0,
             "auto_reconnect_max_delay_seconds": 16.0,
             "consecutive_timeout_alert_threshold": 3,
-            "preview_frame_timeout_ms": 500,
+            "preview_fps": 0.0,
+            "frame_timeout_ms": 800,
+            "preview_frame_timeout_ms": 300,
             "roi_restart_settle_seconds": 0.20,
             "roi_warmup_frames": 2,
             "roi_warmup_timeout_ms": 800,
@@ -5129,8 +5158,10 @@ class StereoCaptureOnlyApp:
             "record_writer_stop_timeout_seconds": 10.0,
             "close_thread_join_timeout_seconds": 10.0,
             "close_total_thread_join_timeout_seconds": 10.0,
-            "software_trigger_barrier_timeout_seconds": 4.0,
+            "software_trigger_barrier_timeout_seconds": 1.0,
             "record_queue_max_items": 64,
+            "record_queue_put_timeout_seconds": 0.05,
+            "record_output_fps_when_unlimited": 30.0,
             "ffmpeg_sequence_gap_warning_threshold": 300,
             "record_writer_batch_size": 4,
             "record_meta_flush_every": 32,
@@ -5236,7 +5267,7 @@ class StereoCaptureOnlyApp:
     def _record_pair_bytes_from_config(self, config_snapshot: dict) -> int:
         if not config_bool(config_snapshot, "record_save_image_sequence", False, False):
             bitrate_kbps = max(config_int(config_snapshot, "video_bitrate_kbps", 8000), 1)
-            fps = max(config_float(config_snapshot, "record_fps", 5.0), 0.1)
+            fps = configured_record_output_fps(config_snapshot)
             return max(int((bitrate_kbps * 1000 / 8) / fps) * 2, 1)
         left_size, right_size = self._record_roi_sizes_from_config(config_snapshot)
         return estimate_frame_bytes(config_snapshot, left_size[0], left_size[1]) + estimate_frame_bytes(
@@ -5268,9 +5299,9 @@ class StereoCaptureOnlyApp:
     def _collect_record_config_for_preflight(self) -> dict[str, object] | None:
         self._ensure_recording_config_defaults()
         try:
-            fps = max(float(self.record_fps_var.get()), 0.1)
+            fps = optional_positive_fps(self.record_fps_var.get())
             max_seconds = max(float(self.record_max_seconds_var.get() or 0), 0.0)
-            updates: dict[str, object] = {"record_fps": fps, "record_max_seconds": max_seconds}
+            updates: dict[str, object] = {"record_fps": fps or 0.0, "record_max_seconds": max_seconds}
             updates.update(self._current_parameter_config())
         except ValueError as exc:
             self.status_var.set(f"录像评估失败：{exc}")
@@ -5289,7 +5320,7 @@ class StereoCaptureOnlyApp:
         save_root = self.project_manager.output_root_for_mode("videos")
         save_root.mkdir(parents=True, exist_ok=True)
         usage = shutil.disk_usage(save_root)
-        fps = max(float(config_snapshot.get("record_fps", 5.0)), 0.1)
+        fps = configured_record_output_fps(config_snapshot)
         left_size, right_size = self._record_roi_sizes_from_config(config_snapshot)
         pair_bytes = self._record_pair_bytes_from_config(config_snapshot)
         required_mbps = pair_bytes * fps / 1024 / 1024
@@ -5544,19 +5575,36 @@ class StereoCaptureOnlyApp:
         except Exception as exc:
             LOGGER.info("temperature read failed: %s", exc)
             return
+        try:
+            throughput = self.camera_system.link_throughput_mbps()
+        except Exception as exc:
+            LOGGER.debug("link throughput read failed: %s", exc, exc_info=True)
+            throughput = {}
         self._latest_temperatures = readings
-        sample = {"time": time.time(), "temperatures_c": dict(readings)}
+        self._latest_link_throughput_mbps = throughput
+        sample = {"time": time.time(), "temperatures_c": dict(readings), "link_throughput_mbps": dict(throughput)}
         self._temperature_samples.append(sample)
         if len(self._temperature_samples) > 10000:
             self._temperature_samples = self._temperature_samples[-10000:]
-        self.ui_queue.put(("temperature", dict(readings)))
+        self.ui_queue.put(("temperature", {"temperatures_c": dict(readings), "link_throughput_mbps": dict(throughput)}))
 
     def _update_temperature_display(self, readings: dict[str, float | None]) -> None:
+        throughput: dict[str, float | None] = {}
+        if "temperatures_c" in readings or "link_throughput_mbps" in readings:
+            throughput = readings.get("link_throughput_mbps", {}) if isinstance(readings.get("link_throughput_mbps"), dict) else {}
+            readings = readings.get("temperatures_c", {}) if isinstance(readings.get("temperatures_c"), dict) else {}
         values = {side: value for side, value in readings.items() if value is not None}
         if not values:
-            self.temperature_status_var.set("Temp unavailable")
+            link_values = {side: value for side, value in throughput.items() if value is not None}
+            if link_values:
+                self.temperature_status_var.set("Link " + " | ".join(f"{side}:{value:.0f}Mbps" for side, value in link_values.items()))
+            else:
+                self.temperature_status_var.set("Temp unavailable")
             return
         text = " | ".join(f"{side}:{value:.1f}C" for side, value in values.items())
+        link_values = {side: value for side, value in throughput.items() if value is not None}
+        if link_values:
+            text += " | Link " + " | ".join(f"{side}:{value:.0f}Mbps" for side, value in link_values.items())
         self.temperature_status_var.set(text)
         monitor = self.config.get("temperature_monitor", {})
         warning = config_float(monitor, "warning_threshold_c", 65.0)
@@ -6142,7 +6190,7 @@ class StereoCaptureOnlyApp:
         values = self._current_parameter_config()
         values["interval_capture_seconds"] = float(self.interval_seconds_var.get() or 0)
         values["interval_capture_count"] = optional_int_text(self.interval_limit_var.get())
-        values["record_fps"] = max(float(self.record_fps_var.get() or 0), 0.1)
+        values["record_fps"] = optional_positive_fps(self.record_fps_var.get()) or 0.0
         values["record_max_seconds"] = max(float(self.record_max_seconds_var.get() or 0), 0.0)
         self._update_config(values, save=False)
         self._set_cached_trigger_source(str(values.get("trigger_source", "Software")))
@@ -6288,15 +6336,16 @@ class StereoCaptureOnlyApp:
             suffix += f" | {write_warning}"
         return suffix
 
-    def _record_status_text(self, target_fps: float, effective_fps: float, config_snapshot: dict | None = None) -> str:
+    def _record_status_text(self, target_fps: float | None, effective_fps: float, config_snapshot: dict | None = None) -> str:
         config_snapshot = config_snapshot or self._config_snapshot()
         elapsed = self._record_elapsed_seconds()
         free_gb = self._record_free_space_gb()
         write_lag, write_warning, skip_every_n, _skip_keep_frames = self._record_write_state_snapshot()
         record_count, record_saved_count = self._record_counter_values()
+        target_text = f"{target_fps:g} fps" if target_fps is not None else "max"
         parts = [
             f"录像中：采集 {record_count} 组，保存 {record_saved_count} 组",
-            f"目标 {target_fps:g} fps，实际写入约 {effective_fps:g} fps",
+            f"目标 {target_text}，实际写入约 {effective_fps:g} fps",
             f"已录 {format_duration(elapsed)} / 剩余空间 {free_gb:.1f} GB",
         ]
         max_seconds = max(config_float(config_snapshot, "record_max_seconds", 0.0), 0.0)
@@ -6340,7 +6389,7 @@ class StereoCaptureOnlyApp:
                 if self._cached_trigger_source() == "Line0":
                     detail += "；当前为 Line0 外触发模式，请检查触发线、共地、触发电平/上升沿和脉冲频率。"
                 self._notify_warning(f"{mode}_timeouts", detail)
-                if self._cached_trigger_source() != "Line0":
+                if mode == "preview" or self._cached_trigger_source() != "Line0":
                     return self._attempt_reconnect(mode)
             LOGGER.warning(message)
             return True
@@ -6474,7 +6523,11 @@ class StereoCaptureOnlyApp:
             if self._record_write_warning.startswith("磁盘写入"):
                 self._record_write_warning = ""
 
-    def _effective_record_fps(self, target_fps: float) -> float:
+    def _effective_record_fps(self, target_fps: float | None) -> float:
+        if target_fps is None:
+            elapsed = self._record_elapsed_seconds()
+            _record_count, record_saved_count = self._record_counter_values()
+            return record_saved_count / elapsed if elapsed > 0 else 0.0
         _write_lag, _write_warning, skip_every_n, skip_keep_frames = self._record_write_state_snapshot()
         if skip_every_n > 1:
             keep = min(max(skip_keep_frames, 1), skip_every_n)

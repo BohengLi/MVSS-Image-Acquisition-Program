@@ -229,6 +229,8 @@ class StereoCalibration:
 
     def status_text(self) -> str:
         if not self.enabled:
+            if self.warnings:
+                return "Calibration: disabled (" + "; ".join(self.warnings[:2]) + ")"
             return "Calibration: disabled"
         if self.rectification_ready:
             return "Calibration: loaded, rectification ready"
@@ -345,6 +347,15 @@ def load_stereo_calibration(config: dict[str, Any], base_dir: Path) -> StereoCal
     enabled = bool(settings.get("enabled", True)) if isinstance(settings, dict) else False
     calibration = StereoCalibration(enabled=enabled)
     if not enabled or not isinstance(settings, dict):
+        if isinstance(settings, dict):
+            paths = [
+                _resolve_path(base_dir, settings.get("left_intrinsics")),
+                _resolve_path(base_dir, settings.get("right_intrinsics")),
+                _resolve_path(base_dir, settings.get("stereo_params")),
+            ]
+            missing = [str(path) for path in paths if path is not None and not path.exists()]
+            if missing:
+                calibration.warnings.append("files not present; use calibration wizard before enabling")
         return calibration
 
     paths = {

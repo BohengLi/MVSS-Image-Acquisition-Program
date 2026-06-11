@@ -1,8 +1,14 @@
 __pycache__/
 .model_download/
+.idea/
+build/
+dist/
+MVSS图像采集程序/
 captures/
 logs/
 *.zip
+*.exe
+*.exe.bak_*
 *.pyc
 *.pyo
 *.pyd
