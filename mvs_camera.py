@@ -7,11 +7,11 @@ import threading
 import time
 from collections import deque
 from concurrent.futures import ThreadPoolExecutor, wait
-from ctypes import CFUNCTYPE, POINTER, byref, c_ubyte, c_void_p, cast, create_string_buffer, memset, sizeof, string_at
-from dataclasses import asdict, dataclass
+from ctypes import CFUNCTYPE, POINTER, byref, c_ubyte, c_void_p, cast, create_string_buffer, memset, memmove, sizeof, string_at
+from dataclasses import asdict, dataclass, field
 from importlib.util import find_spec
 from pathlib import Path
-from typing import Any
+from typing import Any, Callable
 
 from PIL import Image
 
@@ -23,6 +23,41 @@ _MVS_IMPORT_ATTEMPTS = 3
 _MVS_IMPORT_RETRY_DELAY_SECONDS = 0.4
 _SDK_LOCK = threading.Lock()
 DEFAULT_CHUNK_SELECTORS = ("Timestamp", "Framecounter", "FrameCounter", "ExposureTime", "Gain")
+DEFAULT_HOST_TIMESTAMP_DELTA_NS = 10_000_000
+DEFAULT_STREAM_BUFFER_SIZE = 128
+DEFAULT_RAW_BUFFER_POOL_SIZE = 64
+MVS_ERROR_CODES = {
+    0x80000000: ("MV_E_HANDLE", "错误或无效的句柄"),
+    0x80000001: ("MV_E_SUPPORT", "不支持的功能"),
+    0x80000002: ("MV_E_BUFOVER", "缓存已满"),
+    0x80000003: ("MV_E_CALLORDER", "接口调用顺序错误"),
+    0x80000004: ("MV_E_PARAMETER", "参数错误"),
+    0x80000006: ("MV_E_RESOURCE", "资源申请失败"),
+    0x80000007: ("MV_E_NODATA", "无数据/等待图像超时"),
+    0x80000008: ("MV_E_PRECONDITION", "前置条件错误或运行环境变化"),
+    0x80000009: ("MV_E_VERSION", "版本不匹配"),
+    0x8000000A: ("MV_E_NOENOUGH_BUF", "传入缓存空间不足"),
+    0x8000000B: ("MV_E_ABNORMAL_IMAGE", "异常图像，可能丢包或数据不完整"),
+    0x8000000C: ("MV_E_LOAD_LIBRARY", "动态库加载失败"),
+    0x8000000D: ("MV_E_NOOUTBUF", "无可输出缓存"),
+    0x800000FF: ("MV_E_UNKNOW", "未知错误"),
+    0x80000100: ("MV_E_GC_GENERIC", "GenICam 通用错误"),
+    0x80000101: ("MV_E_GC_ARGUMENT", "GenICam 参数错误"),
+    0x80000102: ("MV_E_GC_RANGE", "GenICam 值超出范围"),
+    0x80000103: ("MV_E_GC_PROPERTY", "GenICam 属性错误"),
+    0x80000104: ("MV_E_GC_RUNTIME", "GenICam 运行时错误"),
+    0x80000105: ("MV_E_GC_LOGICAL", "GenICam 逻辑错误"),
+    0x80000106: ("MV_E_GC_ACCESS", "GenICam 节点访问失败"),
+    0x80000107: ("MV_E_GC_TIMEOUT", "GenICam 超时"),
+    0x80000108: ("MV_E_GC_DYNAMICCAST", "GenICam 类型转换失败"),
+    0x80000200: ("MV_E_NOT_IMPLEMENTED", "命令不支持"),
+    0x80000201: ("MV_E_INVALID_ADDRESS", "访问地址无效"),
+    0x80000202: ("MV_E_WRITE_PROTECT", "写保护"),
+    0x80000203: ("MV_E_ACCESS_DENIED", "访问权限不足"),
+    0x80000204: ("MV_E_BUSY", "设备忙或网络忙"),
+    0x80000205: ("MV_E_PACKET", "网络数据包错误"),
+    0x80000206: ("MV_E_NETER", "网络相关错误"),
+}
 
 
 class MvsError(RuntimeError):
@@ -35,6 +70,12 @@ class FrameTimeoutError(MvsError):
 
 class FrameSyncError(MvsError):
     pass
+
+
+def _format_mvs_error(ret: int) -> str:
+    code = int(ret) & 0xFFFFFFFF
+    name, description = MVS_ERROR_CODES.get(code, ("UNKNOWN", "未收录的 SDK 错误码"))
+    return f"0x{code:08x} ({name}: {description})"
 
 
 def _mvs_runtime_candidates() -> list[Path]:
@@ -121,6 +162,11 @@ def _load_mvs_imports_once():
     _add_mvs_python_path()
     try:
         from MvImport.CameraParams_const import MV_ACCESS_Exclusive, MV_GIGE_DEVICE, MV_USB_DEVICE
+        try:
+            from MvImport.CameraParams_const import MV_Image_Bmp, MV_Image_Jpeg
+        except Exception:
+            MV_Image_Bmp = None
+            MV_Image_Jpeg = None
         from MvImport.CameraParams_header import (
             MV_CC_DEVICE_INFO,
             MV_CC_DEVICE_INFO_LIST,
@@ -129,12 +175,26 @@ def _load_mvs_imports_once():
             MVCC_INTVALUE,
         )
         try:
+            from MvImport.CameraParams_header import MV_FRAME_OUT
+        except Exception:
+            MV_FRAME_OUT = None
+        try:
+            from MvImport.CameraParams_header import MV_SAVE_IMAGE_PARAM_EX
+        except Exception:
+            MV_SAVE_IMAGE_PARAM_EX = None
+        try:
             from MvImport.CameraParams_header import MVCC_FLOATVALUE, MVCC_STRINGVALUE
         except Exception:
             MVCC_FLOATVALUE = None
             MVCC_STRINGVALUE = None
         from MvImport.MvCameraControl_class import MvCamera
+        from MvImport import PixelType_header as PixelTypeHeader
         from MvImport.PixelType_header import PixelType_Gvsp_Mono8, PixelType_Gvsp_RGB8_Packed
+        pixel_type_names = {
+            int(value): name
+            for name, value in vars(PixelTypeHeader).items()
+            if name.startswith("PixelType_") and isinstance(value, int)
+        }
 
         return {
             "MV_GIGE_DEVICE": MV_GIGE_DEVICE,
@@ -143,13 +203,18 @@ def _load_mvs_imports_once():
             "MV_CC_DEVICE_INFO": MV_CC_DEVICE_INFO,
             "MV_CC_DEVICE_INFO_LIST": MV_CC_DEVICE_INFO_LIST,
             "MV_CC_PIXEL_CONVERT_PARAM": MV_CC_PIXEL_CONVERT_PARAM,
+            "MV_FRAME_OUT": MV_FRAME_OUT,
             "MV_FRAME_OUT_INFO_EX": MV_FRAME_OUT_INFO_EX,
+            "MV_SAVE_IMAGE_PARAM_EX": MV_SAVE_IMAGE_PARAM_EX,
             "MVCC_INTVALUE": MVCC_INTVALUE,
             "MVCC_FLOATVALUE": MVCC_FLOATVALUE,
             "MVCC_STRINGVALUE": MVCC_STRINGVALUE,
             "MvCamera": MvCamera,
+            "MV_Image_Bmp": MV_Image_Bmp,
+            "MV_Image_Jpeg": MV_Image_Jpeg,
             "PixelType_Gvsp_Mono8": PixelType_Gvsp_Mono8,
             "PixelType_Gvsp_RGB8_Packed": PixelType_Gvsp_RGB8_Packed,
+            "PIXEL_TYPE_NAMES": pixel_type_names,
         }
     except Exception as exc:
         raise MvsError(
@@ -205,17 +270,34 @@ class CameraInfo:
 
 @dataclass
 class Frame:
-    image: Image.Image
+    image: Image.Image | None
     frame_number: int
     width: int
     height: int
     host_timestamp: int
     camera_timestamp: int
+    raw_data: bytes | bytearray | memoryview | None = None
+    raw_frame_len: int = 0
+    pixel_type: int = 0
+    pixel_type_name: str = ""
+    raw_bit_depth: int = 8
+    raw_array_shape: tuple[int, ...] | None = None
+    _raw_release: Callable[[], None] | None = field(default=None, repr=False, compare=False)
+
+    def release_raw_data(self) -> None:
+        release = self._raw_release
+        self._raw_release = None
+        self.raw_data = None
+        if release is not None:
+            release()
+
+    def __del__(self) -> None:
+        self.release_raw_data()
 
 
-@dataclass(frozen=True)
+@dataclass
 class RawFramePacket:
-    data: bytes
+    data: bytes | bytearray | memoryview
     frame_len: int
     width: int
     height: int
@@ -223,6 +305,22 @@ class RawFramePacket:
     frame_number: int
     host_timestamp: int
     camera_timestamp: int
+    _raw_release: Callable[[], None] | None = field(default=None, repr=False, compare=False)
+
+    def take_release(self) -> Callable[[], None] | None:
+        release = self._raw_release
+        self._raw_release = None
+        return release
+
+    def release_raw_data(self) -> None:
+        release = self._raw_release
+        self._raw_release = None
+        self.data = b""
+        if release is not None:
+            release()
+
+    def __del__(self) -> None:
+        self.release_raw_data()
 
 
 @dataclass
@@ -282,7 +380,7 @@ def enumerate_cameras() -> tuple[list[CameraInfo], Any]:
     dev_list = s["MV_CC_DEVICE_INFO_LIST"]()
     ret = s["MvCamera"].MV_CC_EnumDevices(s["MV_GIGE_DEVICE"] | s["MV_USB_DEVICE"], dev_list)
     if ret != 0:
-        raise MvsError(f"枚举相机失败: 0x{ret:08x}")
+        raise MvsError(f"枚举相机失败: {_format_mvs_error(ret)}")
 
     cameras: list[CameraInfo] = []
     for index in range(dev_list.nDeviceNum):
@@ -400,22 +498,47 @@ class MvsCamera:
         self._grabbing = False
         self._stream_callback_enabled = False
         self._stream_callback = None
+        self._prefer_stream_callback = False
         self._stream_condition = threading.Condition()
-        self._stream_frames: deque[RawFramePacket] = deque(maxlen=1)
+        self._stream_frames: deque[RawFramePacket] = deque(maxlen=DEFAULT_STREAM_BUFFER_SIZE)
         self._stream_dropped_frames = 0
+        self._raw_buffer_pool: deque[bytearray] = deque()
+        self._raw_buffer_pool_limit = DEFAULT_RAW_BUFFER_POOL_SIZE
+        self._raw_buffer_pool_lock = threading.Lock()
         self._float_node_cache: dict[tuple[str, ...], str] = {}
         self._float_node_cache_lock = threading.Lock()
+
+    def configure_streaming(
+        self,
+        stream_buffer_size: int | None = None,
+        raw_buffer_pool_size: int | None = None,
+        prefer_callback: bool | None = None,
+    ) -> None:
+        if stream_buffer_size is not None:
+            maxlen = max(int(stream_buffer_size), 1)
+            with self._stream_condition:
+                current = list(self._stream_frames)[-maxlen:]
+                self._stream_frames.clear()
+                self._stream_frames = deque(current, maxlen=maxlen)
+        if raw_buffer_pool_size is not None:
+            self._raw_buffer_pool_limit = max(int(raw_buffer_pool_size), 0)
+            with self._raw_buffer_pool_lock:
+                while len(self._raw_buffer_pool) > self._raw_buffer_pool_limit:
+                    self._raw_buffer_pool.pop()
+        if prefer_callback is not None:
+            self._prefer_stream_callback = bool(prefer_callback)
 
     def open(self) -> None:
         s = sdk()
         ret = self._cam.MV_CC_CreateHandle(self._device_info)
         if ret != 0:
-            raise MvsError(f"{self.info.label} 创建句柄失败: 0x{ret:08x}")
+            raise MvsError(f"{self.info.label} 创建句柄失败: {_format_mvs_error(ret)}")
         ret = self._cam.MV_CC_OpenDevice(s["MV_ACCESS_Exclusive"], 0)
         if ret != 0:
             self._cam.MV_CC_DestroyHandle()
-            raise MvsError(f"{self.info.label} 打开失败，可能被 MVS 占用: 0x{ret:08x}")
+            raise MvsError(f"{self.info.label} 打开失败，可能被 MVS 占用: {_format_mvs_error(ret)}")
         self._opened = True
+        self._optimize_gige_packet_size()
 
     def configure(
         self,
@@ -439,10 +562,16 @@ class MvsCamera:
         roi_offset_y: int = 0,
         chunk_data_enabled: bool = False,
         chunk_selectors: list[str] | tuple[str, ...] | None = None,
+        acquisition_frame_rate: float | None = None,
+        trigger_delay_us: float | None = None,
+        line_debouncer_time_us: float | None = None,
+        trigger_activation: str | None = None,
     ) -> None:
         self._try_set_enum_by_string("AcquisitionMode", "Continuous")
         self._try_set_enum_by_string("TriggerSelector", "FrameStart")
-        self.apply_trigger_settings(trigger_source)
+        self.apply_trigger_settings(trigger_source, trigger_activation=trigger_activation)
+        for warning in self.apply_timing_settings(acquisition_frame_rate, trigger_delay_us, line_debouncer_time_us):
+            LOGGER.warning(warning)
 
         if pixel_format:
             self._try_set_enum_by_string("PixelFormat", pixel_format)
@@ -465,7 +594,26 @@ class MvsCamera:
 
         self._set_payload_size(self._get_int("PayloadSize"))
 
-    def apply_trigger_settings(self, trigger_source: str) -> list[str]:
+    def _optimize_gige_packet_size(self) -> None:
+        if self.info.transport != "GigE":
+            return
+        getter = getattr(self._cam, "MV_CC_GetOptimalPacketSize", None)
+        if getter is None:
+            return
+        try:
+            packet_size = int(getter())
+        except Exception as exc:
+            LOGGER.debug("%s: MV_CC_GetOptimalPacketSize failed: %s", self.info.label, exc, exc_info=True)
+            return
+        if packet_size <= 0:
+            LOGGER.info("%s: optimal GigE packet size unavailable: %s", self.info.label, packet_size)
+            return
+        if self._try_set_int("GevSCPSPacketSize", packet_size):
+            LOGGER.info("%s: GigE packet size optimized to %s.", self.info.label, packet_size)
+        else:
+            LOGGER.info("%s: failed to set GevSCPSPacketSize=%s.", self.info.label, packet_size)
+
+    def apply_trigger_settings(self, trigger_source: str, trigger_activation: str | None = None) -> list[str]:
         source = self._normalize_trigger_source(trigger_source)
         warnings: list[str] = []
         if source == "Continuous":
@@ -482,9 +630,31 @@ class MvsCamera:
             if not self._try_set_enum_by_string("TriggerSource", "Line0"):
                 if not self._try_set_enum("TriggerSource", 0):
                     warnings.append(f"{self.info.label}: TriggerSource=Line0 设置失败")
-            self._try_set_enum_by_string("TriggerActivation", "RisingEdge")
+            activation = self._normalize_trigger_activation(trigger_activation)
+            if not self._try_set_enum_by_string("TriggerActivation", activation):
+                warnings.append(f"{self.info.label}: TriggerActivation={activation} 设置失败")
         else:
             warnings.append(f"{self.info.label}: 不支持的触发源 {trigger_source}")
+        return warnings
+
+    def apply_timing_settings(
+        self,
+        acquisition_frame_rate: float | None = None,
+        trigger_delay_us: float | None = None,
+        line_debouncer_time_us: float | None = None,
+    ) -> list[str]:
+        warnings: list[str] = []
+        if acquisition_frame_rate is not None and acquisition_frame_rate > 0:
+            if not self._try_set_bool_any(("AcquisitionFrameRateEnable", "AcquisitionFrameRateEnabled"), True):
+                LOGGER.debug("%s: AcquisitionFrameRateEnable is not available.", self.info.label)
+            if not self._try_set_float_any(("AcquisitionFrameRate", "AcquisitionFrameRateAbs"), acquisition_frame_rate):
+                warnings.append(f"{self.info.label}: AcquisitionFrameRate={acquisition_frame_rate} 设置失败")
+        if trigger_delay_us is not None and trigger_delay_us >= 0:
+            if not self._try_set_float_any(("TriggerDelay", "TriggerDelayAbs"), trigger_delay_us):
+                warnings.append(f"{self.info.label}: TriggerDelay={trigger_delay_us} 设置失败")
+        if line_debouncer_time_us is not None and line_debouncer_time_us >= 0:
+            if not self._try_set_float_any(("LineDebouncerTime", "LineDebouncerTimeAbs"), line_debouncer_time_us):
+                warnings.append(f"{self.info.label}: LineDebouncerTime={line_debouncer_time_us} 设置失败")
         return warnings
 
     def _normalize_trigger_source(self, trigger_source: str) -> str:
@@ -494,6 +664,27 @@ class MvsCamera:
         if value in {"continuous", "freerun", "free-run", "free run", "off", "none", "trigger off", "no trigger"}:
             return "Continuous"
         return "Software"
+
+    def _normalize_trigger_activation(self, trigger_activation: str | None) -> str:
+        value = str(trigger_activation or "RisingEdge").strip().lower()
+        mapping = {
+            "risingedge": "RisingEdge",
+            "rising": "RisingEdge",
+            "上升沿": "RisingEdge",
+            "fallingedge": "FallingEdge",
+            "falling": "FallingEdge",
+            "下降沿": "FallingEdge",
+            "anyedge": "AnyEdge",
+            "any": "AnyEdge",
+            "任意沿": "AnyEdge",
+            "levelhigh": "LevelHigh",
+            "high": "LevelHigh",
+            "高电平": "LevelHigh",
+            "levellow": "LevelLow",
+            "low": "LevelLow",
+            "低电平": "LevelLow",
+        }
+        return mapping.get(value, "RisingEdge")
 
     def apply_exposure_settings(
         self,
@@ -734,10 +925,11 @@ class MvsCamera:
     def start(self) -> None:
         if self._grabbing:
             return
-        self._register_stream_callback()
+        if self._prefer_stream_callback or not self._supports_image_buffer():
+            self._register_stream_callback()
         ret = self._cam.MV_CC_StartGrabbing()
         if ret != 0:
-            raise MvsError(f"{self.info.label} 开始取流失败: 0x{ret:08x}")
+            raise MvsError(f"{self.info.label} 开始取流失败: {_format_mvs_error(ret)}")
         self._grabbing = True
 
     def stop(self) -> None:
@@ -745,7 +937,7 @@ class MvsCamera:
             return
         ret = self._cam.MV_CC_StopGrabbing()
         if ret != 0:
-            raise MvsError(f"{self.info.label} 停止取流失败: 0x{ret:08x}")
+            raise MvsError(f"{self.info.label} 停止取流失败: {_format_mvs_error(ret)}")
         self._grabbing = False
         self._clear_stream_frames()
 
@@ -761,6 +953,8 @@ class MvsCamera:
 
     def _clear_stream_frames(self) -> None:
         with self._stream_condition:
+            for packet in self._stream_frames:
+                packet.release_raw_data()
             self._stream_frames.clear()
             self._stream_condition.notify_all()
 
@@ -781,6 +975,8 @@ class MvsCamera:
                 packet = self._raw_packet_from_pointer(data_ptr, frame_info_ptr.contents)
                 with self._stream_condition:
                     if len(self._stream_frames) == self._stream_frames.maxlen:
+                        dropped = self._stream_frames.popleft()
+                        dropped.release_raw_data()
                         self._stream_dropped_frames += 1
                     self._stream_frames.append(packet)
                     self._stream_condition.notify()
@@ -794,16 +990,24 @@ class MvsCamera:
             LOGGER.info("%s: stream callback registration failed; using polling grab: %s", self.info.label, exc)
             return
         if ret != 0:
-            LOGGER.info("%s: stream callback registration returned 0x%08x; using polling grab.", self.info.label, ret)
+            LOGGER.info("%s: stream callback registration returned %s; using polling grab.", self.info.label, _format_mvs_error(ret))
             return
         self._stream_callback = callback
         self._stream_callback_enabled = True
         LOGGER.info("%s: image stream callback enabled.", self.info.label)
 
+    def _supports_image_buffer(self) -> bool:
+        return (
+            getattr(self._cam, "MV_CC_GetImageBuffer", None) is not None
+            and getattr(self._cam, "MV_CC_FreeImageBuffer", None) is not None
+            and sdk().get("MV_FRAME_OUT") is not None
+        )
+
     def _raw_packet_from_pointer(self, data_ptr: Any, frame_info: Any) -> RawFramePacket:
         frame_len = int(getattr(frame_info, "nFrameLen", 0) or 0)
+        data, release = self._copy_raw_buffer(data_ptr, frame_len)
         return RawFramePacket(
-            data=string_at(data_ptr, frame_len),
+            data=data,
             frame_len=frame_len,
             width=int(getattr(frame_info, "nWidth", 0) or 0),
             height=int(getattr(frame_info, "nHeight", 0) or 0),
@@ -811,12 +1015,46 @@ class MvsCamera:
             frame_number=self._frame_number_from_info(frame_info),
             host_timestamp=int(getattr(frame_info, "nHostTimeStamp", 0) or 0),
             camera_timestamp=self._camera_timestamp_from_info(frame_info),
+            _raw_release=release,
         )
+
+    def _copy_raw_buffer(self, data_ptr: Any, frame_len: int) -> tuple[bytearray, Callable[[], None] | None]:
+        frame_len = max(int(frame_len), 0)
+        if frame_len <= 0:
+            return bytearray(), None
+        buffer = self._acquire_raw_buffer(frame_len)
+        memmove((c_ubyte * frame_len).from_buffer(buffer), data_ptr, frame_len)
+        released = False
+
+        def release() -> None:
+            nonlocal released
+            if released:
+                return
+            released = True
+            self._release_raw_buffer(buffer)
+
+        return buffer, release
+
+    def _acquire_raw_buffer(self, min_size: int) -> bytearray:
+        min_size = max(int(min_size), 0)
+        with self._raw_buffer_pool_lock:
+            for _ in range(len(self._raw_buffer_pool)):
+                buffer = self._raw_buffer_pool.pop()
+                if len(buffer) >= min_size:
+                    return buffer
+        return bytearray(min_size)
+
+    def _release_raw_buffer(self, buffer: bytearray) -> None:
+        if self._raw_buffer_pool_limit <= 0:
+            return
+        with self._raw_buffer_pool_lock:
+            if len(self._raw_buffer_pool) < self._raw_buffer_pool_limit:
+                self._raw_buffer_pool.append(buffer)
 
     def trigger_software(self) -> None:
         ret = self._cam.MV_CC_SetCommandValue("TriggerSoftware")
         if ret != 0:
-            raise MvsError(f"{self.info.label} 软触发失败: 0x{ret:08x}")
+            raise MvsError(f"{self.info.label} 软触发失败: {_format_mvs_error(ret)}")
 
     def device_version(self) -> str | None:
         return self._try_get_string_any(("DeviceVersion", "DeviceFirmwareVersion", "FirmwareVersion"))
@@ -866,36 +1104,81 @@ class MvsCamera:
                 self._payload_size = payload_size
             return payload_size
 
-    def grab_frame(self, timeout_ms: int) -> Frame:
+    def grab_frame(self, timeout_ms: int, convert_image: bool = True) -> Frame:
         if self._stream_callback_enabled:
-            return self._grab_frame_from_stream(timeout_ms)
-        s = sdk()
+            return self._grab_frame_from_stream(timeout_ms, convert_image=convert_image)
         with self._grab_lock:
-            payload_size = self._payload_size_snapshot()
-            raw_buffer = (c_ubyte * payload_size)()
-            frame_info = s["MV_FRAME_OUT_INFO_EX"]()
-            memset(byref(frame_info), 0, sizeof(frame_info))
-            ret = self._cam.MV_CC_GetOneFrameTimeout(raw_buffer, payload_size, frame_info, timeout_ms)
-            if ret != 0:
-                if ret == 0x80000007:
-                    raise FrameTimeoutError(f"{self.info.label} 等待图像超时: 0x{ret:08x}")
-                raise MvsError(f"{self.info.label} 获取图像失败: 0x{ret:08x}")
+            frame = self._grab_frame_with_image_buffer(timeout_ms, convert_image=convert_image)
+            if frame is not None:
+                return frame
+            return self._grab_frame_with_timeout(timeout_ms, convert_image=convert_image)
 
-            return self._frame_from_packet(self._raw_packet_from_pointer(raw_buffer, frame_info))
+    def grab_raw_frame(self, timeout_ms: int) -> Frame:
+        return self.grab_frame(timeout_ms, convert_image=False)
 
-    def _grab_frame_from_stream(self, timeout_ms: int) -> Frame:
+    def _grab_frame_with_image_buffer(self, timeout_ms: int, convert_image: bool = True) -> Frame | None:
+        get_buffer = getattr(self._cam, "MV_CC_GetImageBuffer", None)
+        free_buffer = getattr(self._cam, "MV_CC_FreeImageBuffer", None)
+        frame_out_cls = sdk().get("MV_FRAME_OUT")
+        if get_buffer is None or free_buffer is None or frame_out_cls is None:
+            return None
+        frame_out = frame_out_cls()
+        memset(byref(frame_out), 0, sizeof(frame_out))
+        ret = get_buffer(frame_out, timeout_ms)
+        if ret != 0:
+            if ret == 0x80000007:
+                raise FrameTimeoutError(f"{self.info.label} 等待图像超时: {_format_mvs_error(ret)}")
+            LOGGER.debug("%s: MV_CC_GetImageBuffer failed (%s); falling back to GetOneFrameTimeout.", self.info.label, _format_mvs_error(ret))
+            return None
+        try:
+            frame_info = getattr(frame_out, "stFrameInfo", None)
+            data_ptr = getattr(frame_out, "pBufAddr", None)
+            if frame_info is None or not data_ptr:
+                LOGGER.debug("%s: MV_CC_GetImageBuffer returned empty frame; falling back.", self.info.label)
+                return None
+            return self._frame_from_packet(self._raw_packet_from_pointer(data_ptr, frame_info), convert_image=convert_image)
+        finally:
+            try:
+                free_buffer(frame_out)
+            except Exception as exc:
+                LOGGER.debug("%s: MV_CC_FreeImageBuffer failed: %s", self.info.label, exc, exc_info=True)
+
+    def _grab_frame_with_timeout(self, timeout_ms: int, convert_image: bool = True) -> Frame:
+        s = sdk()
+        payload_size = self._payload_size_snapshot()
+        raw_buffer = (c_ubyte * payload_size)()
+        frame_info = s["MV_FRAME_OUT_INFO_EX"]()
+        memset(byref(frame_info), 0, sizeof(frame_info))
+        ret = self._cam.MV_CC_GetOneFrameTimeout(raw_buffer, payload_size, frame_info, timeout_ms)
+        if ret != 0:
+            if ret == 0x80000007:
+                raise FrameTimeoutError(f"{self.info.label} 等待图像超时: {_format_mvs_error(ret)}")
+            raise MvsError(f"{self.info.label} 获取图像失败: {_format_mvs_error(ret)}")
+
+        return self._frame_from_packet(self._raw_packet_from_pointer(raw_buffer, frame_info), convert_image=convert_image)
+
+    def _grab_frame_from_stream(self, timeout_ms: int, convert_image: bool = True) -> Frame:
+        packets = self.pop_stream_packets(timeout_ms)
+        if not packets:
+            raise FrameTimeoutError(f"{self.info.label} waiting image stream timed out after {timeout_ms} ms")
+        packet = packets[-1]
+        for stale in packets[:-1]:
+            stale.release_raw_data()
+        return self._frame_from_packet(packet, convert_image=convert_image)
+
+    def pop_stream_packets(self, timeout_ms: int) -> list[RawFramePacket]:
         deadline = time.perf_counter() + max(timeout_ms, 1) / 1000.0
         with self._stream_condition:
             while self._grabbing:
                 if self._stream_frames:
-                    packet = self._stream_frames.pop()
+                    packets = list(self._stream_frames)
                     self._stream_frames.clear()
-                    return self._frame_from_packet(packet)
+                    return packets
                 remaining = deadline - time.perf_counter()
                 if remaining <= 0:
                     break
                 self._stream_condition.wait(remaining)
-        raise FrameTimeoutError(f"{self.info.label} waiting image stream timed out after {timeout_ms} ms")
+        return []
 
     def _camera_timestamp_from_info(self, frame_info: Any) -> int:
         high = int(getattr(frame_info, "nDevTimeStampHigh", 0) or 0)
@@ -908,21 +1191,56 @@ class MvsCamera:
         except AttributeError:
             return int(frame_info.stFrameInfo.nFrameNum)
 
-    def _frame_from_packet(self, packet: RawFramePacket) -> Frame:
+    def _frame_from_packet(self, packet: RawFramePacket, convert_image: bool = True) -> Frame:
+        pixel_type_name = self._pixel_type_name(packet.pixel_type)
+        raw_bit_depth = self._raw_bit_depth(pixel_type_name, packet)
         return Frame(
-            image=self._packet_to_image(packet),
+            image=self._packet_to_image(packet) if convert_image else None,
             frame_number=packet.frame_number,
             width=packet.width,
             height=packet.height,
             host_timestamp=packet.host_timestamp,
             camera_timestamp=packet.camera_timestamp,
+            raw_data=packet.data,
+            raw_frame_len=packet.frame_len,
+            pixel_type=packet.pixel_type,
+            pixel_type_name=pixel_type_name,
+            raw_bit_depth=raw_bit_depth,
+            raw_array_shape=self._raw_array_shape(pixel_type_name, packet, raw_bit_depth),
+            _raw_release=packet.take_release(),
         )
+
+    def _pixel_type_name(self, pixel_type: int) -> str:
+        names = sdk().get("PIXEL_TYPE_NAMES") or {}
+        return str(names.get(int(pixel_type), f"PixelType_0x{int(pixel_type) & 0xFFFFFFFF:08x}"))
+
+    def _raw_bit_depth(self, pixel_type_name: str, packet: RawFramePacket) -> int:
+        name = pixel_type_name.lower()
+        if "mono16" in name or "bayer" in name and "16" in name:
+            return 16
+        if "mono12" in name or "bayer" in name and "12" in name:
+            return 12
+        if "mono10" in name or "bayer" in name and "10" in name:
+            return 10
+        if packet.width > 0 and packet.height > 0 and packet.frame_len >= packet.width * packet.height * 2:
+            return 16
+        return 8
+
+    def _raw_array_shape(self, pixel_type_name: str, packet: RawFramePacket, raw_bit_depth: int) -> tuple[int, ...] | None:
+        if packet.width <= 0 or packet.height <= 0:
+            return None
+        name = pixel_type_name.lower()
+        if any(token in name for token in ("rgb", "bgr")) and packet.frame_len >= packet.width * packet.height * 3:
+            return (packet.height, packet.width, 3)
+        if raw_bit_depth > 8 or "mono" in name or "bayer" in name:
+            return (packet.height, packet.width)
+        return (packet.height, packet.width)
 
     def _packet_to_image(self, packet: RawFramePacket) -> Image.Image:
         s = sdk()
         expected_len = packet.width * packet.height
         if packet.pixel_type == s["PixelType_Gvsp_Mono8"] and packet.frame_len >= expected_len:
-            payload = packet.data if packet.frame_len == expected_len else memoryview(packet.data)[:expected_len]
+            payload = packet.data if len(packet.data) == expected_len else memoryview(packet.data)[:expected_len]
             return Image.frombytes("L", (packet.width, packet.height), payload)
         buffer_type = c_ubyte * len(packet.data)
         raw_buffer = buffer_type.from_buffer_copy(packet.data)
@@ -936,6 +1254,50 @@ class MvsCamera:
         frame_info.nFrameLen = packet.frame_len
         frame_info.enPixelType = packet.pixel_type
         return self._frame_to_image(raw_buffer, frame_info)
+
+    def save_packet_with_sdk(
+        self,
+        packet: RawFramePacket,
+        image_type: str = "bmp",
+        jpeg_quality: int = 95,
+    ) -> bytes | None:
+        save_param_cls = sdk().get("MV_SAVE_IMAGE_PARAM_EX")
+        save_func = getattr(self._cam, "MV_CC_SaveImageEx2", None) or getattr(self._cam, "MV_CC_SaveImageEx", None)
+        if save_param_cls is None or save_func is None:
+            return None
+        s = sdk()
+        image_type_value = s.get("MV_Image_Jpeg") if image_type.lower() in {"jpg", "jpeg"} else s.get("MV_Image_Bmp")
+        if image_type_value is None:
+            return None
+        src_buffer_type = c_ubyte * len(packet.data)
+        src_buffer = src_buffer_type.from_buffer_copy(packet.data)
+        dst_size = max(packet.width * packet.height * 4 + 4096, len(packet.data) * 4 + 4096, 1024 * 1024)
+        dst_buffer = (c_ubyte * dst_size)()
+        save_param = save_param_cls()
+        memset(byref(save_param), 0, sizeof(save_param))
+        save_param.enImageType = image_type_value
+        save_param.enPixelType = packet.pixel_type
+        save_param.nWidth = packet.width
+        save_param.nHeight = packet.height
+        save_param.nDataLen = packet.frame_len
+        save_param.pData = cast(src_buffer, POINTER(c_ubyte))
+        save_param.pImageBuffer = cast(dst_buffer, POINTER(c_ubyte))
+        save_param.nImageLen = dst_size
+        save_param.nBufferSize = dst_size
+        if hasattr(save_param, "nJpgQuality"):
+            save_param.nJpgQuality = max(min(int(jpeg_quality), 100), 1)
+        try:
+            ret = save_func(save_param)
+        except Exception as exc:
+            LOGGER.debug("%s: SDK image save call failed: %s", self.info.label, exc, exc_info=True)
+            return None
+        if ret != 0:
+            LOGGER.debug("%s: SDK image save returned %s.", self.info.label, _format_mvs_error(ret))
+            return None
+        output_len = int(getattr(save_param, "nImageLen", 0) or getattr(save_param, "nDstLen", 0) or 0)
+        if output_len <= 0 or output_len > dst_size:
+            return None
+        return string_at(dst_buffer, output_len)
 
     def _frame_to_image(self, raw_buffer: Any, frame_info: Any) -> Image.Image:
         s = sdk()
@@ -962,7 +1324,7 @@ class MvsCamera:
 
         ret = self._cam.MV_CC_ConvertPixelType(convert)
         if ret != 0:
-            raise MvsError(f"{self.info.label} 像素格式转换失败: 0x{ret:08x}")
+            raise MvsError(f"{self.info.label} 像素格式转换失败: {_format_mvs_error(ret)}")
 
         converted_len = int(convert.nDstLen)
         if converted_len < rgb_size:
@@ -975,7 +1337,7 @@ class MvsCamera:
         memset(byref(value), 0, sizeof(value))
         ret = self._cam.MV_CC_GetIntValue(key, value)
         if ret != 0:
-            raise MvsError(f"{self.info.label} 读取 {key} 失败: 0x{ret:08x}")
+            raise MvsError(f"{self.info.label} 读取 {key} 失败: {_format_mvs_error(ret)}")
         return int(value.nCurValue)
 
     def _get_int_info(self, key: str) -> IntNodeInfo:
@@ -984,7 +1346,7 @@ class MvsCamera:
         memset(byref(value), 0, sizeof(value))
         ret = self._cam.MV_CC_GetIntValue(key, value)
         if ret != 0:
-            raise MvsError(f"{self.info.label} 读取 {key} 范围失败: 0x{ret:08x}")
+            raise MvsError(f"{self.info.label} 读取 {key} 范围失败: {_format_mvs_error(ret)}")
         increment = int(getattr(value, "nInc", 1) or 1)
         return IntNodeInfo(
             current=int(value.nCurValue),
@@ -1009,7 +1371,7 @@ class MvsCamera:
     def _set_enum(self, key: str, value: int) -> None:
         ret = self._cam.MV_CC_SetEnumValue(key, int(value))
         if ret != 0:
-            raise MvsError(f"{self.info.label} 设置 {key}={value} 失败: 0x{ret:08x}")
+            raise MvsError(f"{self.info.label} 设置 {key}={value} 失败: {_format_mvs_error(ret)}")
 
     def _try_set_enum(self, key: str, value: int) -> bool:
         try:
@@ -1036,10 +1398,16 @@ class MvsCamera:
             return False
         return self._try_set_int(key, 1 if value else 0)
 
+    def _try_set_bool_any(self, keys: tuple[str, ...], value: bool) -> bool:
+        for key in keys:
+            if self._try_set_bool(key, value):
+                return True
+        return False
+
     def _set_float(self, key: str, value: float) -> None:
         ret = self._cam.MV_CC_SetFloatValue(key, float(value))
         if ret != 0:
-            raise MvsError(f"{self.info.label} 设置 {key}={value} 失败: 0x{ret:08x}")
+            raise MvsError(f"{self.info.label} 设置 {key}={value} 失败: {_format_mvs_error(ret)}")
 
     def _try_set_float(self, key: str, value: float) -> bool:
         try:
@@ -1204,9 +1572,9 @@ class StereoCameraSystem:
         self.right_info: CameraInfo | None = None
         self.trigger_source = str(config.get("trigger_source", "Software"))
         self.timeout_ms = int(config.get("frame_timeout_ms", 3000))
-        self.timestamp_reject_enabled = config_bool(config, "timestamp_reject_enabled", False, False)
+        self.timestamp_reject_enabled = config_bool(config, "timestamp_reject_enabled", True, False)
         self.max_camera_timestamp_delta = int(config.get("max_camera_timestamp_delta", 0) or 0)
-        self.max_host_timestamp_delta = int(config.get("max_host_timestamp_delta", 0) or 0)
+        self.max_host_timestamp_delta = int(config.get("max_host_timestamp_delta", DEFAULT_HOST_TIMESTAMP_DELTA_NS) or 0)
         if self.max_camera_timestamp_delta <= 0 and self.max_host_timestamp_delta <= 0:
             self.timestamp_reject_enabled = False
         self.require_hardware_trigger = config_bool(config, "require_hardware_trigger", False, False)
@@ -1215,15 +1583,24 @@ class StereoCameraSystem:
             config_float(config, "software_trigger_barrier_timeout_seconds", timeout_s),
             0.1,
         )
+        self.continuous_pair_buffer_size = max(config_int(config, "continuous_pair_buffer_size", 256), 1)
+        self.continuous_pair_match_timeout_ms = max(
+            config_int(config, "continuous_pair_match_timeout_ms", min(self.timeout_ms, 200)),
+            1,
+        )
         self.camera_timestamp_offset_samples = max(config_int(config, "camera_timestamp_offset_samples", 5), 1)
+        self.camera_timestamp_offset_window = max(
+            config_int(config, "camera_timestamp_offset_window", self.camera_timestamp_offset_samples * 4),
+            self.camera_timestamp_offset_samples,
+        )
         self._camera_timestamp_offset: int | None = None
-        self._camera_timestamp_offset_samples: list[int] = []
+        self._camera_timestamp_offset_samples: deque[int] = deque(maxlen=self.camera_timestamp_offset_window)
         self._capture_lock = threading.Lock()
         self._executor = ThreadPoolExecutor(max_workers=4, thread_name_prefix="mvss-capture")
 
     def connect(self) -> tuple[CameraInfo | None, CameraInfo | None]:
         self._camera_timestamp_offset = None
-        self._camera_timestamp_offset_samples = []
+        self._camera_timestamp_offset_samples = deque(maxlen=self.camera_timestamp_offset_window)
         left_info, right_info, dev_list = select_capture_devices(
             str(self.config.get("left_serial", "")).strip(),
             str(self.config.get("right_serial", "")).strip(),
@@ -1239,6 +1616,11 @@ class StereoCameraSystem:
                     continue
                 cam.open()
                 opened.append(cam)
+                cam.configure_streaming(
+                    stream_buffer_size=config_int(self.config, "stream_buffer_size", DEFAULT_STREAM_BUFFER_SIZE),
+                    raw_buffer_pool_size=config_int(self.config, "raw_buffer_pool_size", DEFAULT_RAW_BUFFER_POOL_SIZE),
+                    prefer_callback=self._normalized_system_trigger_source() == "continuous",
+                )
                 side = "left" if cam is left else "right"
                 cam.configure(
                     trigger_source=self.trigger_source,
@@ -1261,6 +1643,10 @@ class StereoCameraSystem:
                     roi_offset_y=int(self._roi_value(side, "offset_y", "roi_offset_y", 0) or 0),
                     chunk_data_enabled=config_bool(self.config, "chunk_data_enabled", False, False),
                     chunk_selectors=self.config.get("chunk_selectors"),
+                    acquisition_frame_rate=self._optional_float("acquisition_frame_rate"),
+                    trigger_delay_us=self._optional_float("trigger_delay_us"),
+                    line_debouncer_time_us=self._optional_float("line_debouncer_time_us"),
+                    trigger_activation=str(self.config.get("trigger_activation", "RisingEdge")),
                 )
                 cam.start()
         except Exception:
@@ -1491,21 +1877,32 @@ class StereoCameraSystem:
             self.trigger_source = trigger_source
             return warnings
 
-    def capture_pair(self, timeout_ms: int | None = None) -> tuple[Frame | None, Frame | None, float]:
+    def capture_pair(
+        self,
+        timeout_ms: int | None = None,
+        convert_image: bool = True,
+    ) -> tuple[Frame | None, Frame | None, float]:
         with self._capture_lock:
-            return self._capture_pair_locked(timeout_ms=timeout_ms)
+            return self._capture_pair_locked(timeout_ms=timeout_ms, convert_image=convert_image)
 
-    def _capture_pair_locked(self, timeout_ms: int | None = None) -> tuple[Frame | None, Frame | None, float]:
+    def _capture_pair_locked(
+        self,
+        timeout_ms: int | None = None,
+        convert_image: bool = True,
+    ) -> tuple[Frame | None, Frame | None, float]:
         cameras = self._connected_cameras()
         if not cameras:
             raise MvsError("相机尚未连接。")
         effective_timeout_ms = max(int(timeout_ms if timeout_ms is not None else self.timeout_ms), 1)
-        return self._capture_pair_with_executor(cameras, effective_timeout_ms)
+        if self._normalized_system_trigger_source() == "continuous":
+            return self._capture_pair_continuous(cameras, effective_timeout_ms, convert_image=convert_image)
+        return self._capture_pair_with_executor(cameras, effective_timeout_ms, convert_image=convert_image)
 
     def _capture_pair_with_executor(
         self,
         cameras: list[tuple[str, MvsCamera]],
         effective_timeout_ms: int,
+        convert_image: bool = True,
     ) -> tuple[Frame | None, Frame | None, float]:
         trigger_mode = self._normalized_system_trigger_source()
         if self.require_hardware_trigger and trigger_mode in {"software", "continuous"}:
@@ -1523,7 +1920,10 @@ class StereoCameraSystem:
 
         frames = dict(
             self._run_parallel(
-                [(name, lambda cam=cam: cam.grab_frame(effective_timeout_ms)) for name, cam in cameras],
+                [
+                    (name, lambda cam=cam: self._grab_camera_frame(cam, effective_timeout_ms, convert_image=convert_image))
+                    for name, cam in cameras
+                ],
                 effective_timeout_ms / 1000.0 + 0.2,
             )
         )
@@ -1532,6 +1932,102 @@ class StereoCameraSystem:
         if left is not None and right is not None:
             self._validate_frame_sync(left, right)
         return left, right, trigger_time
+
+    def _capture_pair_continuous(
+        self,
+        cameras: list[tuple[str, MvsCamera]],
+        effective_timeout_ms: int,
+        convert_image: bool = True,
+    ) -> tuple[Frame | None, Frame | None, float]:
+        if self.require_hardware_trigger:
+            raise MvsError("Hardware trigger is required, but trigger_source is Continuous.")
+        if any(not hasattr(cam, "_frame_from_packet") for _name, cam in cameras):
+            return self._capture_pair_with_executor(cameras, effective_timeout_ms, convert_image=convert_image)
+        trigger_time = time.time()
+        if len(cameras) == 1:
+            name, cam = cameras[0]
+            frame = self._grab_camera_frame(cam, effective_timeout_ms, convert_image=convert_image)
+            return (frame, None, trigger_time) if name == "left" else (None, frame, trigger_time)
+
+        packet_batches = dict(
+            self._run_parallel(
+                [(name, lambda cam=cam: self._continuous_packets_from_camera(cam, effective_timeout_ms)) for name, cam in cameras],
+                effective_timeout_ms / 1000.0 + 0.2,
+            )
+        )
+        left_packets = packet_batches.get("left") or []
+        right_packets = packet_batches.get("right") or []
+        if not left_packets or not right_packets:
+            self._release_packets(left_packets)
+            self._release_packets(right_packets)
+            raise FrameTimeoutError(f"continuous stream did not provide both stereo frames within {effective_timeout_ms} ms")
+
+        left_packet, right_packet = self._select_best_continuous_packet_pair(left_packets, right_packets)
+        for packet in left_packets:
+            if packet is not left_packet:
+                packet.release_raw_data()
+        for packet in right_packets:
+            if packet is not right_packet:
+                packet.release_raw_data()
+        left_cam = next(cam for name, cam in cameras if name == "left")
+        right_cam = next(cam for name, cam in cameras if name == "right")
+        left = left_cam._frame_from_packet(left_packet, convert_image=convert_image)
+        right = right_cam._frame_from_packet(right_packet, convert_image=convert_image)
+        self._validate_frame_sync(left, right)
+        return left, right, trigger_time
+
+    def _continuous_packets_from_camera(self, cam: MvsCamera, timeout_ms: int) -> list[RawFramePacket]:
+        if getattr(cam, "_stream_callback_enabled", False):
+            packets = cam.pop_stream_packets(min(timeout_ms, self.continuous_pair_match_timeout_ms))
+            if packets:
+                return packets[-self.continuous_pair_buffer_size :]
+        frame = self._grab_camera_frame(cam, timeout_ms, convert_image=False)
+        release = frame._raw_release
+        frame._raw_release = None
+        return [
+            RawFramePacket(
+                data=frame.raw_data or b"",
+                frame_len=frame.raw_frame_len,
+                width=frame.width,
+                height=frame.height,
+                pixel_type=frame.pixel_type,
+                frame_number=frame.frame_number,
+                host_timestamp=frame.host_timestamp,
+                camera_timestamp=frame.camera_timestamp,
+                _raw_release=release,
+            )
+        ]
+
+    def _select_best_continuous_packet_pair(
+        self,
+        left_packets: list[RawFramePacket],
+        right_packets: list[RawFramePacket],
+    ) -> tuple[RawFramePacket, RawFramePacket]:
+        best_left = left_packets[-1]
+        best_right = right_packets[-1]
+        best_delta: int | None = None
+        use_camera_timestamp = self.max_camera_timestamp_delta > 0 and self._camera_timestamp_offset is not None
+        for left in left_packets:
+            for right in right_packets:
+                if use_camera_timestamp:
+                    delta = abs((int(left.camera_timestamp) - int(right.camera_timestamp)) - int(self._camera_timestamp_offset or 0))
+                else:
+                    delta = abs(int(left.host_timestamp) - int(right.host_timestamp))
+                if best_delta is None or delta < best_delta:
+                    best_left = left
+                    best_right = right
+                    best_delta = delta
+        return best_left, best_right
+
+    def _release_packets(self, packets: list[RawFramePacket]) -> None:
+        for packet in packets:
+            packet.release_raw_data()
+
+    def _grab_camera_frame(self, cam: MvsCamera, timeout_ms: int, convert_image: bool = True) -> Frame:
+        try:
+            return cam.grab_frame(timeout_ms, convert_image=convert_image)
+        except TypeError:
+            return cam.grab_frame(timeout_ms)
 
     def _normalized_system_trigger_source(self) -> str:
         value = str(self.trigger_source).strip().lower()
@@ -1573,23 +2069,29 @@ class StereoCameraSystem:
             raise MvsError(message)
         return results
 
+    def _median_offset(self, values: deque[int] | list[int]) -> int:
+        sorted_offsets = sorted(values)
+        midpoint = len(sorted_offsets) // 2
+        if len(sorted_offsets) % 2:
+            return sorted_offsets[midpoint]
+        return int(round((sorted_offsets[midpoint - 1] + sorted_offsets[midpoint]) / 2))
+
+    def _observe_camera_timestamp_offset(self, raw_camera_delta: int) -> None:
+        self._camera_timestamp_offset_samples.append(int(raw_camera_delta))
+        if len(self._camera_timestamp_offset_samples) >= self.camera_timestamp_offset_samples:
+            self._camera_timestamp_offset = self._median_offset(self._camera_timestamp_offset_samples)
+
     def _validate_frame_sync(self, left: Frame, right: Frame) -> None:
         if not self.timestamp_reject_enabled:
             return
         issues: list[str] = []
+        raw_camera_delta: int | None = None
+        offset_sample_used_for_warmup = False
         if self.max_camera_timestamp_delta > 0:
             raw_camera_delta = int(left.camera_timestamp) - int(right.camera_timestamp)
             if self._camera_timestamp_offset is None:
-                self._camera_timestamp_offset_samples.append(raw_camera_delta)
-                if len(self._camera_timestamp_offset_samples) >= self.camera_timestamp_offset_samples:
-                    sorted_offsets = sorted(self._camera_timestamp_offset_samples)
-                    midpoint = len(sorted_offsets) // 2
-                    if len(sorted_offsets) % 2:
-                        self._camera_timestamp_offset = sorted_offsets[midpoint]
-                    else:
-                        self._camera_timestamp_offset = int(
-                            round((sorted_offsets[midpoint - 1] + sorted_offsets[midpoint]) / 2)
-                        )
+                self._observe_camera_timestamp_offset(raw_camera_delta)
+                offset_sample_used_for_warmup = True
             if self._camera_timestamp_offset is not None:
                 camera_delta = abs(raw_camera_delta - self._camera_timestamp_offset)
                 if camera_delta > self.max_camera_timestamp_delta:
@@ -1604,3 +2106,6 @@ class StereoCameraSystem:
                 issues.append(f"host timestamp delta {host_delta} exceeds {self.max_host_timestamp_delta}")
         if issues:
             raise FrameSyncError("Stereo frame rejected: " + "; ".join(issues))
+        # Keep the sliding offset adaptive, but only learn from pairs accepted by the current baseline.
+        if raw_camera_delta is not None and self._camera_timestamp_offset is not None and not offset_sample_used_for_warmup:
+            self._observe_camera_timestamp_offset(raw_camera_delta)

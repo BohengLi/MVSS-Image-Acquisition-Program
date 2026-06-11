@@ -9,6 +9,7 @@ from unittest.mock import patch
 
 import image_quality
 import mvs_camera
+import numpy as np
 from mvs_camera import Frame, MvsCamera, RawFramePacket, StereoCameraSystem
 import stereo_capture_only
 from stereo_capture_only import StereoCaptureOnlyApp
@@ -36,16 +37,18 @@ class _FakeGrabCamera:
     def __init__(self, label: str):
         self.info = type("Info", (), {"label": label})()
         self.grab_timeouts: list[int] = []
+        self.convert_image_values: list[object] = []
         self.trigger_count = 0
 
     def trigger_software(self) -> None:
         self.trigger_count += 1
 
-    def grab_frame(self, timeout_ms: int) -> Frame:
+    def grab_frame(self, timeout_ms: int, convert_image: bool = True) -> Frame:
         self.grab_timeouts.append(timeout_ms)
+        self.convert_image_values.append(convert_image)
         frame_number = len(self.grab_timeouts)
         return Frame(
-            image=object(),
+            image=object() if convert_image else None,
             frame_number=frame_number,
             width=1,
             height=1,
@@ -141,6 +144,61 @@ class ReliabilityFixTests(unittest.TestCase):
         self.assertEqual(seen["size"], (3, 2))
         self.assertIs(seen["data"], payload)
 
+    def test_frame_from_packet_keeps_raw_payload_metadata(self) -> None:
+        camera = MvsCamera.__new__(MvsCamera)
+        camera._packet_to_image = lambda _packet: object()
+        packet = RawFramePacket(b"123456", 6, 3, 2, 1, 9, 10, 11)
+
+        with patch.object(
+            mvs_camera,
+            "sdk",
+            return_value={"PIXEL_TYPE_NAMES": {1: "PixelType_Gvsp_Mono8"}},
+        ):
+            frame = camera._frame_from_packet(packet)
+
+        self.assertEqual(frame.raw_data, b"123456")
+        self.assertEqual(frame.raw_frame_len, 6)
+        self.assertEqual(frame.pixel_type_name, "PixelType_Gvsp_Mono8")
+        self.assertEqual(frame.raw_bit_depth, 8)
+        self.assertEqual(frame.raw_array_shape, (2, 3))
+
+    def test_frame_from_packet_can_skip_pil_conversion_for_raw_recording(self) -> None:
+        camera = MvsCamera.__new__(MvsCamera)
+        camera._packet_to_image = lambda _packet: self.fail("raw-only frame should not build PIL image")
+        packet = RawFramePacket(b"123456", 6, 3, 2, 1, 9, 10, 11)
+
+        with patch.object(
+            mvs_camera,
+            "sdk",
+            return_value={"PIXEL_TYPE_NAMES": {1: "PixelType_Gvsp_Mono8"}},
+        ):
+            frame = camera._frame_from_packet(packet, convert_image=False)
+
+        self.assertIsNone(frame.image)
+        self.assertEqual(frame.raw_data, b"123456")
+
+    def test_frame_raw_release_clears_payload_after_metadata_is_available(self) -> None:
+        released: list[bool] = []
+        frame = Frame(
+            image=None,
+            frame_number=1,
+            width=2,
+            height=3,
+            host_timestamp=4,
+            camera_timestamp=5,
+            raw_data=bytearray(b"123456"),
+            raw_frame_len=6,
+            _raw_release=lambda: released.append(True),
+        )
+        app = StereoCaptureOnlyApp.__new__(StereoCaptureOnlyApp)
+
+        meta = app._frame_meta(frame)
+        frame.release_raw_data()
+
+        self.assertEqual(meta["raw_frame_len"], 6)
+        self.assertIsNone(frame.raw_data)
+        self.assertEqual(released, [True])
+
     def test_chunk_settings_enable_timestamp_metadata_nodes(self) -> None:
         camera = MvsCamera.__new__(MvsCamera)
         camera.info = _Info()
@@ -206,7 +264,56 @@ class ReliabilityFixTests(unittest.TestCase):
         self.assertIs(queued["left"], left)
         self.assertIs(queued["right"], right)
 
-    def test_capture_priority_config_uses_sequence_and_disables_realtime_work(self) -> None:
+    def test_raw_mono16_frame_converts_to_video_frame_without_pil_path(self) -> None:
+        app = StereoCaptureOnlyApp.__new__(StereoCaptureOnlyApp)
+        raw = np.array([[0, 65535], [32768, 16384]], dtype=np.uint16).tobytes()
+        frame = Frame(
+            image=object(),
+            frame_number=1,
+            width=2,
+            height=2,
+            host_timestamp=0,
+            camera_timestamp=0,
+            raw_data=raw,
+            raw_frame_len=len(raw),
+            pixel_type_name="PixelType_Gvsp_Mono16",
+            raw_bit_depth=16,
+            raw_array_shape=(2, 2),
+        )
+
+        video_frame = app._raw_frame_to_video_frame(frame)
+
+        self.assertEqual(video_frame.shape, (2, 2, 3))
+        self.assertEqual(int(video_frame[0, 0, 0]), 0)
+        self.assertEqual(int(video_frame[0, 1, 0]), 255)
+
+    def test_high_bit_depth_frames_are_saved_as_raw_sidecar(self) -> None:
+        app = StereoCaptureOnlyApp.__new__(StereoCaptureOnlyApp)
+        app._config_snapshot = lambda: {"save_raw_frames": False}
+        raw = np.array([[0, 4095], [2048, 1024]], dtype=np.uint16).tobytes()
+        frame = Frame(
+            image=object(),
+            frame_number=1,
+            width=2,
+            height=2,
+            host_timestamp=0,
+            camera_timestamp=0,
+            raw_data=raw,
+            raw_frame_len=len(raw),
+            pixel_type_name="PixelType_Gvsp_Mono12",
+            raw_bit_depth=12,
+            raw_array_shape=(2, 2),
+        )
+
+        with tempfile.TemporaryDirectory() as tmp:
+            path = app._save_frame(frame, Path(tmp) / "left_000001.bmp", {"save_raw_frames": False})
+            saved = np.load(path)
+
+        self.assertEqual(path.suffix, ".npy")
+        self.assertEqual(saved.dtype, np.uint16)
+        self.assertEqual(saved.shape, (2, 2))
+
+    def test_capture_priority_config_uses_realtime_mp4_without_image_sequence(self) -> None:
         app = StereoCaptureOnlyApp.__new__(StereoCaptureOnlyApp)
 
         config = app._capture_priority_record_config(
@@ -219,20 +326,21 @@ class ReliabilityFixTests(unittest.TestCase):
                 "record_clone_frames_for_writer": True,
                 "record_checksum_during_capture": True,
                 "record_queue_max_items": 8,
+                "record_fps": 19.2,
                 "preview_quality_analysis_enabled": True,
                 "image_format": "jpg",
             }
         )
 
-        self.assertTrue(config["record_save_image_sequence"])
+        self.assertFalse(config["record_save_image_sequence"])
         self.assertTrue(config["auto_make_mp4"])
-        self.assertFalse(config["record_realtime_mp4"])
+        self.assertTrue(config["record_realtime_mp4"])
         self.assertFalse(config["record_preview_during_capture"])
         self.assertFalse(config["record_clone_frames_for_writer"])
         self.assertFalse(config["record_checksum_during_capture"])
         self.assertFalse(config["preview_quality_analysis_enabled"])
-        self.assertGreaterEqual(config["record_queue_max_items"], 64)
-        self.assertEqual(config["image_format"], "bmp")
+        self.assertGreaterEqual(config["record_queue_max_items"], 192)
+        self.assertEqual(config["image_format"], "jpg")
 
     def test_capture_priority_config_can_be_disabled(self) -> None:
         app = StereoCaptureOnlyApp.__new__(StereoCaptureOnlyApp)
@@ -319,6 +427,14 @@ class ReliabilityFixTests(unittest.TestCase):
         self.assertEqual(left.trigger_count, 1)
         self.assertEqual(right.trigger_count, 1)
 
+    def test_system_defaults_enable_host_timestamp_sync_threshold(self) -> None:
+        system = StereoCameraSystem({})
+
+        self.assertTrue(system.timestamp_reject_enabled)
+        self.assertEqual(system.max_camera_timestamp_delta, 0)
+        self.assertEqual(system.max_host_timestamp_delta, 10_000_000)
+        system.close()
+
     def test_continuous_capture_does_not_fire_software_trigger(self) -> None:
         system = StereoCameraSystem.__new__(StereoCameraSystem)
         system._capture_lock = threading.Lock()
@@ -337,6 +453,43 @@ class ReliabilityFixTests(unittest.TestCase):
         self.assertEqual(right.grab_timeouts, [250])
         self.assertEqual(left.trigger_count, 0)
         self.assertEqual(right.trigger_count, 0)
+
+    def test_continuous_raw_capture_skips_pil_conversion(self) -> None:
+        system = StereoCameraSystem.__new__(StereoCameraSystem)
+        system._capture_lock = threading.Lock()
+        system.trigger_source = "Continuous"
+        system.timeout_ms = 800
+        system.software_trigger_barrier_timeout_s = 1.0
+        system.require_hardware_trigger = False
+        system.timestamp_reject_enabled = False
+        left = _FakeGrabCamera("left")
+        right = _FakeGrabCamera("right")
+        system._connected_cameras = lambda: [("left", left), ("right", right)]
+
+        l_frame, r_frame, _trigger_time = system.capture_pair(timeout_ms=250, convert_image=False)
+
+        self.assertIsNone(l_frame.image)
+        self.assertIsNone(r_frame.image)
+        self.assertEqual(left.convert_image_values, [False])
+        self.assertEqual(right.convert_image_values, [False])
+
+    def test_continuous_packet_pair_uses_closest_host_timestamp(self) -> None:
+        system = StereoCameraSystem.__new__(StereoCameraSystem)
+        system.max_camera_timestamp_delta = 0
+        system._camera_timestamp_offset = None
+        left_packets = [
+            RawFramePacket(b"l1", 2, 1, 1, 1, 1, 100, 0),
+            RawFramePacket(b"l2", 2, 1, 1, 1, 2, 200, 0),
+        ]
+        right_packets = [
+            RawFramePacket(b"r1", 2, 1, 1, 1, 1, 130, 0),
+            RawFramePacket(b"r2", 2, 1, 1, 1, 2, 205, 0),
+        ]
+
+        left, right = system._select_best_continuous_packet_pair(left_packets, right_packets)
+
+        self.assertIs(left, left_packets[1])
+        self.assertIs(right, right_packets[1])
 
     def test_preview_analysis_accepts_unlimited_preview_fps(self) -> None:
         app = StereoCaptureOnlyApp.__new__(StereoCaptureOnlyApp)
@@ -367,6 +520,57 @@ class ReliabilityFixTests(unittest.TestCase):
             self.assertTrue(app._should_analyze_preview_frame(2, config))
             self.assertFalse(app._should_analyze_preview_frame(3, config))
             self.assertTrue(app._should_analyze_preview_frame(4, config))
+
+    def test_configured_preview_fps_clamps_zero_to_default(self) -> None:
+        self.assertEqual(stereo_capture_only.configured_preview_fps({"preview_fps": 0}), 15.0)
+
+    def test_record_queue_size_keeps_ten_seconds_of_target_fps(self) -> None:
+        self.assertGreaterEqual(
+            stereo_capture_only.configured_record_queue_size({"record_queue_max_items": 64, "record_fps": 19.2}),
+            192,
+        )
+
+    def test_camera_timestamp_offset_uses_sliding_median_after_valid_pairs(self) -> None:
+        system = StereoCameraSystem.__new__(StereoCameraSystem)
+        system.timestamp_reject_enabled = True
+        system.max_camera_timestamp_delta = 20
+        system.max_host_timestamp_delta = 0
+        system.camera_timestamp_offset_samples = 3
+        system._camera_timestamp_offset_samples = mvs_camera.deque(maxlen=3)
+        system._camera_timestamp_offset = None
+
+        for delta in (100, 102, 104):
+            system._validate_frame_sync(
+                Frame(object(), 1, 1, 1, 0, 1000 + delta),
+                Frame(object(), 1, 1, 1, 0, 1000),
+            )
+        self.assertEqual(system._camera_timestamp_offset, 102)
+
+        for delta in (110, 112, 114):
+            system._validate_frame_sync(
+                Frame(object(), 1, 1, 1, 0, 1000 + delta),
+                Frame(object(), 1, 1, 1, 0, 1000),
+            )
+        self.assertEqual(system._camera_timestamp_offset, 112)
+        self.assertEqual(list(system._camera_timestamp_offset_samples), [110, 112, 114])
+
+    def test_camera_timestamp_offset_rejects_outlier_without_learning_it(self) -> None:
+        system = StereoCameraSystem.__new__(StereoCameraSystem)
+        system.timestamp_reject_enabled = True
+        system.max_camera_timestamp_delta = 5
+        system.max_host_timestamp_delta = 0
+        system.camera_timestamp_offset_samples = 3
+        system._camera_timestamp_offset_samples = mvs_camera.deque([100, 101, 102], maxlen=3)
+        system._camera_timestamp_offset = 101
+
+        with self.assertRaises(mvs_camera.FrameSyncError):
+            system._validate_frame_sync(
+                Frame(object(), 1, 1, 1, 0, 2000),
+                Frame(object(), 1, 1, 1, 0, 1000),
+            )
+
+        self.assertEqual(system._camera_timestamp_offset, 101)
+        self.assertEqual(list(system._camera_timestamp_offset_samples), [100, 101, 102])
 
     def test_record_status_text_accepts_unlimited_target_fps(self) -> None:
         app = StereoCaptureOnlyApp.__new__(StereoCaptureOnlyApp)

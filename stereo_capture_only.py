@@ -56,6 +56,12 @@ except Exception as exc:
         height: int
         host_timestamp: int
         camera_timestamp: int
+        raw_data: bytes | None = None
+        raw_frame_len: int = 0
+        pixel_type: int = 0
+        pixel_type_name: str = ""
+        raw_bit_depth: int = 8
+        raw_array_shape: tuple[int, ...] | None = None
 
     class MvsError(RuntimeError):  # type: ignore[no-redef]
         pass
@@ -146,8 +152,10 @@ QUALITY_MONITOR_HIGH_RES_MIN_HEIGHT = 380
 FramePair = tuple[CameraFrame | None, CameraFrame | None]
 LOGGER = logging.getLogger("mvss_capture")
 UI_QUEUE_EVENT = "<<MvssUiQueue>>"
-DEFAULT_HOST_TIMESTAMP_DELTA_NS = 0
+DEFAULT_HOST_TIMESTAMP_DELTA_NS = 10_000_000
 _CONFIG_MISSING = object()
+DEFAULT_PREVIEW_FPS = 15.0
+DEFAULT_RECORD_QUEUE_SECONDS = 10.0
 
 
 class UiEventQueue(Queue[tuple[str, object]]):
@@ -395,6 +403,17 @@ def optional_positive_fps(text: object) -> float | None:
     return fps if fps > 0 else None
 
 
+def configured_preview_fps(config: dict) -> float:
+    return optional_positive_fps(config.get("preview_fps", DEFAULT_PREVIEW_FPS)) or DEFAULT_PREVIEW_FPS
+
+
+def configured_record_queue_size(config: dict, fps: float | None = None) -> int:
+    target_fps = fps if fps is not None and fps > 0 else configured_record_output_fps(config)
+    required = int(round(max(target_fps, 0.1) * DEFAULT_RECORD_QUEUE_SECONDS))
+    configured = config_int(config, "record_queue_max_items", required)
+    return max(configured, required, 1)
+
+
 def optional_config_text(config: dict, key: str, default: str = "") -> str:
     value = config.get(key, default)
     return "" if value is None else str(value)
@@ -447,6 +466,17 @@ def format_duration(seconds: float) -> str:
 def image_estimated_bytes(image: Image.Image) -> int:
     channels = 1 if image.mode in {"1", "L", "P"} else len(image.getbands())
     return image.width * image.height * max(channels, 1)
+
+
+def frame_raw_estimated_bytes(frame: CameraFrame | None) -> int:
+    if frame is None:
+        return 0
+    raw_len = int(getattr(frame, "raw_frame_len", 0) or 0)
+    if raw_len > 0:
+        return raw_len
+    if getattr(frame, "image", None) is None:
+        return int(getattr(frame, "width", 0) or 0) * int(getattr(frame, "height", 0) or 0)
+    return image_estimated_bytes(frame.image)
 
 
 def format_bytes(value: object) -> str:
@@ -730,7 +760,7 @@ class ZoomImagePane(Frame):
         self.title_var.set(text)
 
     def set_frame(self, frame: CameraFrame) -> None:
-        self._last_image = frame.image
+        self._last_image = frame.image if getattr(frame, "image", None) is not None else None
         self.info_var.set(
             f"{frame.width}x{frame.height}  Frame:{frame.frame_number}  CamTS:{frame.camera_timestamp}"
         )
@@ -2661,8 +2691,8 @@ class StereoCaptureOnlyApp:
                         raise MvsError("在线标定需要左右相机同时采集到图像。")
                     ext = image_extension(self.config)
                     key = f"{index + 1:02d}_{safe_filename(position)}"
-                    left_path = self._save_image(left.image, left_dir / f"{key}_left.{ext}")
-                    right_path = self._save_image(right.image, right_dir / f"{key}_right.{ext}")
+                    left_path = self._save_frame(left, left_dir / f"{key}_left.{ext}")
+                    right_path = self._save_frame(right, right_dir / f"{key}_right.{ext}")
                     capture = {
                         "index": index + 1,
                         "position": position,
@@ -3037,8 +3067,8 @@ class StereoCaptureOnlyApp:
         self.status_var.set("正在停止实时采集...")
 
     def _preview_loop(self, generation: int, config_snapshot: dict) -> None:
-        fps = optional_positive_fps(config_snapshot.get("preview_fps", 15.0))
-        interval = 1.0 / fps if fps is not None else 0.0
+        fps = configured_preview_fps(config_snapshot)
+        interval = 1.0 / fps
         timeout_ms = self._preview_capture_timeout_ms(config_snapshot)
         next_time = time.perf_counter()
         had_error = False
@@ -3135,6 +3165,15 @@ class StereoCaptureOnlyApp:
                 self.photo_button.configure(state=NORMAL)
                 return
             left, right, trigger_time = latest
+            if (left is not None and getattr(left, "image", None) is None) or (
+                right is not None and getattr(right, "image", None) is None
+            ):
+                try:
+                    left, right, trigger_time = self._require_camera_system().capture_pair(convert_image=True)
+                except Exception as exc:
+                    self.ui_queue.put(("error", exc))
+                    self.photo_button.configure(state=NORMAL)
+                    return
             left_copy = self._clone_frame(left)
             right_copy = self._clone_frame(right)
             metrics = self._quality_metrics_for_pair(left_copy, right_copy)
@@ -3312,9 +3351,9 @@ class StereoCaptureOnlyApp:
             left_path = left_dir / f"ev_{ev:+.1f}_left.{ext}"
             right_path = right_dir / f"ev_{ev:+.1f}_right.{ext}"
             if isinstance(left, CameraFrame):
-                left_path = self._save_image(left.image, left_path)
+                left_path = self._save_frame(left, left_path)
             if isinstance(right, CameraFrame):
-                right_path = self._save_image(right.image, right_path)
+                right_path = self._save_frame(right, right_path)
             bracket_meta.append(
                 {
                     "index": index,
@@ -3567,14 +3606,98 @@ class StereoCaptureOnlyApp:
         rgb = np.array(image)
         return cv2.cvtColor(rgb, cv2.COLOR_RGB2BGR)
 
+    def _frame_to_video_frame(self, frame: CameraFrame) -> np.ndarray:
+        raw_frame = self._raw_frame_to_video_frame(frame)
+        if raw_frame is not None:
+            return raw_frame
+        if getattr(frame, "image", None) is None:
+            raise RuntimeError("raw-only frame cannot be converted to video with the current pixel format")
+        return self._image_to_video_frame(frame.image)
+
+    def _release_frame_raw(self, frame: CameraFrame | None) -> None:
+        if frame is not None and hasattr(frame, "release_raw_data"):
+            frame.release_raw_data()
+
+    def _release_unsaved_record_frames(
+        self,
+        left: CameraFrame | None,
+        right: CameraFrame | None,
+        *,
+        queued_for_writer: bool,
+    ) -> None:
+        if queued_for_writer:
+            return
+        self._release_frame_raw(left)
+        self._release_frame_raw(right)
+
+    def _raw_frame_to_video_frame(self, frame: CameraFrame) -> np.ndarray | None:
+        raw_data = getattr(frame, "raw_data", None)
+        width = int(getattr(frame, "width", 0) or 0)
+        height = int(getattr(frame, "height", 0) or 0)
+        if not raw_data or width <= 0 or height <= 0:
+            return None
+        pixel_name = str(getattr(frame, "pixel_type_name", "") or "").lower()
+        raw_len = int(getattr(frame, "raw_frame_len", 0) or len(raw_data))
+        if "rgb" in pixel_name and raw_len >= width * height * 3:
+            rgb = np.frombuffer(raw_data, dtype=np.uint8, count=width * height * 3).reshape((height, width, 3))
+            return cv2.cvtColor(rgb, cv2.COLOR_RGB2BGR)
+        if "bgr" in pixel_name and raw_len >= width * height * 3:
+            return np.frombuffer(raw_data, dtype=np.uint8, count=width * height * 3).reshape((height, width, 3)).copy()
+        if ("mono16" in pixel_name or "mono12" in pixel_name or "mono10" in pixel_name) and raw_len >= width * height * 2:
+            gray16 = np.frombuffer(raw_data, dtype="<u2", count=width * height).reshape((height, width))
+            bit_depth = max(int(getattr(frame, "raw_bit_depth", 16) or 16), 9)
+            scale = 255.0 / float((1 << min(bit_depth, 16)) - 1)
+            gray8 = np.clip(gray16.astype(np.float32) * scale, 0, 255).astype(np.uint8)
+            return cv2.cvtColor(gray8, cv2.COLOR_GRAY2BGR)
+        if "mono8" in pixel_name and raw_len >= width * height:
+            gray = np.frombuffer(raw_data, dtype=np.uint8, count=width * height).reshape((height, width))
+            return cv2.cvtColor(gray, cv2.COLOR_GRAY2BGR)
+        if "bayer" in pixel_name:
+            bayer = self._raw_bayer_to_8bit(frame, raw_data, raw_len, width, height, pixel_name)
+            if bayer is None:
+                return None
+            return cv2.cvtColor(bayer, self._bayer_color_code(pixel_name))
+        return None
+
+    def _raw_bayer_to_8bit(
+        self,
+        frame: CameraFrame,
+        raw_data: bytes,
+        raw_len: int,
+        width: int,
+        height: int,
+        pixel_name: str,
+    ) -> np.ndarray | None:
+        if raw_len >= width * height * 2 and any(token in pixel_name for token in ("16", "12", "10")):
+            bayer16 = np.frombuffer(raw_data, dtype="<u2", count=width * height).reshape((height, width))
+            bit_depth = max(int(getattr(frame, "raw_bit_depth", 16) or 16), 9)
+            scale = 255.0 / float((1 << min(bit_depth, 16)) - 1)
+            return np.clip(bayer16.astype(np.float32) * scale, 0, 255).astype(np.uint8)
+        if raw_len >= width * height:
+            return np.frombuffer(raw_data, dtype=np.uint8, count=width * height).reshape((height, width))
+        return None
+
+    def _bayer_color_code(self, pixel_name: str) -> int:
+        if "bayerrg" in pixel_name:
+            return cv2.COLOR_BayerRG2BGR
+        if "bayerbg" in pixel_name:
+            return cv2.COLOR_BayerBG2BGR
+        if "bayergb" in pixel_name:
+            return cv2.COLOR_BayerGB2BGR
+        return cv2.COLOR_BayerGR2BGR
+
     def _record_loop_v2(self, config_snapshot: dict) -> None:
         config_snapshot = self._capture_priority_record_config(config_snapshot)
-        self._require_camera_system()
+        camera_system = self._require_camera_system()
         record_dir = self._require_record_dir()
         capture_fps = optional_positive_fps(config_snapshot.get("record_fps", 5.0))
         output_fps_setting = config_float(config_snapshot, "record_output_fps_when_unlimited", 30.0)
         fps = capture_fps or max(output_fps_setting, 0.1)
+        capture_mode = str(getattr(camera_system, "trigger_source", config_snapshot.get("trigger_source", ""))).strip().lower()
+        continuous_capture = capture_mode in {"continuous", "freerun", "free-run", "free run", "off", "none", "trigger off", "no trigger"}
         interval = 1.0 / capture_fps if capture_fps is not None else 0.0
+        acquisition_interval = 0.0 if continuous_capture else interval
+        save_interval = 1.0 / fps if fps > 0 else 0.0
         ext = image_extension(config_snapshot)
         save_image_sequence = config_bool(config_snapshot, "record_save_image_sequence", False, False)
         auto_make_mp4 = config_bool(config_snapshot, "auto_make_mp4", True, True)
@@ -3595,7 +3718,7 @@ class StereoCaptureOnlyApp:
             for side in ("left", "right"):
                 (record_dir / self._record_segment_dir(side, 1)).mkdir(parents=True, exist_ok=True)
 
-        queue_size = max(config_int(config_snapshot, "record_queue_max_items", max(8, int(fps * 2))), 1)
+        queue_size = configured_record_queue_size(config_snapshot, fps)
         image_queue: Queue[dict | None] | None = Queue(maxsize=queue_size) if save_image_sequence else None
         video_queue: Queue[dict | None] | None = Queue(maxsize=queue_size) if auto_make_mp4 and realtime_mp4_enabled else None
         meta_writer = RecordMetaWriter(record_dir / "frames.meta.json", config_int(config_snapshot, "record_meta_flush_every", 32))
@@ -3603,6 +3726,7 @@ class StereoCaptureOnlyApp:
         writer_errors_lock = threading.Lock()
         video_outputs: dict[str, list[str]] = {"left": [], "right": []}
         next_time = time.perf_counter()
+        next_save_time = time.perf_counter()
         last_status_time = 0.0
         max_seconds = max(config_float(config_snapshot, "record_max_seconds", 0.0), 0.0)
         make_mp4_after = auto_make_mp4 and save_image_sequence
@@ -3652,16 +3776,17 @@ class StereoCaptureOnlyApp:
 
                 loop_start = time.perf_counter()
                 try:
-                    left, right, trigger_time = self._require_camera_system().capture_pair()
+                    convert_for_preview = bool(self.previewing) or save_image_sequence
+                    left, right, trigger_time = self._require_camera_system().capture_pair(convert_image=convert_for_preview)
                 except FrameTimeoutError as exc:
                     consecutive_timeouts = self._record_timeout_observed()
                     self._handle_capture_exception(exc, "record", consecutive_timeouts)
-                    next_time = time.perf_counter() + interval if interval > 0 else time.perf_counter()
+                    next_time = time.perf_counter() + acquisition_interval if acquisition_interval > 0 else time.perf_counter()
                     continue
                 except Exception as exc:
                     self._add_record_errors()
                     if self._handle_capture_exception(exc, "record", 0):
-                        next_time = time.perf_counter() + interval if interval > 0 else time.perf_counter()
+                        next_time = time.perf_counter() + acquisition_interval if acquisition_interval > 0 else time.perf_counter()
                         continue
                     raise
                 self._reset_record_timeouts()
@@ -3670,7 +3795,15 @@ class StereoCaptureOnlyApp:
                 with self._record_last_frame_lock:
                     self._record_last_frame_pair = (left, right, trigger_time)
 
-                if self._should_record_save_frame(record_count):
+                should_sample_for_output = True
+                if continuous_capture and save_interval > 0:
+                    now_for_sample = time.perf_counter()
+                    should_sample_for_output = now_for_sample >= next_save_time
+                    if should_sample_for_output:
+                        while next_save_time <= now_for_sample:
+                            next_save_time += save_interval
+
+                if should_sample_for_output and self._should_record_save_frame(record_count):
                     saved_index, segment_index = self._next_saved_frame_index()
                     item = {
                         "index": record_count,
@@ -3689,7 +3822,10 @@ class StereoCaptureOnlyApp:
                     if make_mp4_after and not queued:
                         self._record_skipped("record_output_queue_unavailable", record_count)
                 else:
+                    queued = False
                     self._record_skipped("write_skip_strategy", record_count)
+                if not self.previewing and not save_image_sequence:
+                    self._release_unsaved_record_frames(left, right, queued_for_writer=queued)
 
                 if self.previewing:
                     self._preview_frame_counter += 1
@@ -3719,12 +3855,12 @@ class StereoCaptureOnlyApp:
                 if writer_error is not None:
                     raise writer_error
 
-                if interval > 0:
-                    next_time += interval
+                if acquisition_interval > 0:
+                    next_time += acquisition_interval
                     sleep_s = next_time - time.perf_counter()
                     if sleep_s > 0:
                         time.sleep(sleep_s)
-                    elif time.perf_counter() - loop_start > interval * 2:
+                    elif time.perf_counter() - loop_start > acquisition_interval * 2:
                         next_time = time.perf_counter()
         except Exception as exc:
             self.ui_queue.put(("error", exc))
@@ -4186,12 +4322,18 @@ class StereoCaptureOnlyApp:
         if frame is None:
             return None
         return CameraFrame(
-            image=frame.image.copy(),
+            image=frame.image.copy() if getattr(frame, "image", None) is not None else None,
             frame_number=frame.frame_number,
             width=frame.width,
             height=frame.height,
             host_timestamp=frame.host_timestamp,
             camera_timestamp=frame.camera_timestamp,
+            raw_data=getattr(frame, "raw_data", None),
+            raw_frame_len=int(getattr(frame, "raw_frame_len", 0) or 0),
+            pixel_type=int(getattr(frame, "pixel_type", 0) or 0),
+            pixel_type_name=str(getattr(frame, "pixel_type_name", "") or ""),
+            raw_bit_depth=int(getattr(frame, "raw_bit_depth", 8) or 8),
+            raw_array_shape=getattr(frame, "raw_array_shape", None),
         )
 
     def _record_image_writer_loop(
@@ -4269,9 +4411,9 @@ class StereoCaptureOnlyApp:
                 if frame is None:
                     continue
                 path = record_dir / self._record_segment_dir(side, segment_index) / f"{side}_{name}"
-                path = self._save_image(frame.image, path, config_snapshot)
+                path = self._save_frame(frame, path, config_snapshot)
                 paths[side] = str(path)
-                bytes_written += path.stat().st_size if path.exists() else image_estimated_bytes(frame.image)
+                bytes_written += path.stat().st_size if path.exists() else frame_raw_estimated_bytes(frame)
                 if checksum_during_capture:
                     checksums[side] = self._file_checksum(path, config_snapshot)
             elapsed = time.perf_counter() - started
@@ -4333,27 +4475,45 @@ class StereoCaptureOnlyApp:
                     segment_index = int(item["segment_index"])
                     saved_index = int(item["saved_index"])
                     paths: dict[str, str | None] = {"left": None, "right": None}
+                    raw_paths: dict[str, str | None] = {"left": None, "right": None}
+                    frame_meta: dict[str, dict | None] = {"left": None, "right": None}
+                    raw_sidecar_bytes = 0
                     for side in ("left", "right"):
                         frame = item.get(side)
                         if frame is None:
                             continue
+                        frame_meta[side] = self._frame_meta(frame)
                         key = (side, segment_index)
                         if key not in writers:
                             path = self._record_segment_video_path(side, segment_index)
-                            writer, codec_name = self._create_video_writer_v2(path, fps, frame.image, config_snapshot)
+                            writer, codec_name = self._create_video_writer_v2(path, fps, frame, config_snapshot)
                             writers[key] = writer
                             video_outputs[side].append(str(path))
                             if codec_name != str(config_snapshot.get("video_codec", "mp4v")):
                                 self._set_record_write_warning(f"Video codec fallback: {codec_name}")
-                        writers[key].write(self._image_to_video_frame(frame.image))
+                        writers[key].write(self._frame_to_video_frame(frame))
                         paths[side] = str(self._record_segment_video_path(side, segment_index))
+                        if self._should_save_raw_frame(frame, config_snapshot):
+                            raw_path = (
+                                self._require_record_dir()
+                                / "raw"
+                                / side
+                                / f"part_{segment_index:03d}"
+                                / f"{side}_{saved_index:06d}.npy"
+                            )
+                            raw_path.parent.mkdir(parents=True, exist_ok=True)
+                            raw_path = self._save_raw_frame(frame, raw_path)
+                            raw_paths[side] = str(raw_path)
+                            raw_sidecar_bytes += raw_path.stat().st_size if raw_path.exists() else frame_raw_estimated_bytes(frame)
+                        if write_frame_meta and hasattr(frame, "release_raw_data"):
+                            frame.release_raw_data()
                     elapsed = time.perf_counter() - started
                     lag = elapsed / interval if interval > 0 else 0.0
                     if write_frame_meta:
                         bytes_written = max(
                             self._record_video_segment_bytes(segment_index, video_outputs),
                             self._estimate_video_segment_bytes(saved_index, segment_index, config_snapshot),
-                        )
+                        ) + raw_sidecar_bytes
                         self._observe_record_write_lag(lag)
                         self._mark_record_video_saved(
                             saved_index,
@@ -4369,12 +4529,14 @@ class StereoCaptureOnlyApp:
                                 "saved_index": saved_index,
                                 "segment_index": segment_index,
                                 "trigger_time": item["trigger_time"],
-                                "left_frame": self._frame_meta(item["left"]) if item.get("left") is not None else None,
-                                "right_frame": self._frame_meta(item["right"]) if item.get("right") is not None else None,
+                                "left_frame": frame_meta["left"],
+                                "right_frame": frame_meta["right"],
                                 "left_path": None,
                                 "right_path": None,
                                 "left_video_path": paths["left"],
                                 "right_video_path": paths["right"],
+                                "left_raw_path": raw_paths["left"],
+                                "right_raw_path": raw_paths["right"],
                                 "left_checksum": None,
                                 "right_checksum": None,
                                 "checksum_algorithm": None,
@@ -4397,10 +4559,18 @@ class StereoCaptureOnlyApp:
         self,
         path: Path,
         fps: float,
-        image: Image.Image,
+        frame_or_image: CameraFrame | Image.Image,
         config_snapshot: dict,
     ) -> tuple[cv2.VideoWriter, str]:
-        width, height = image.size
+        if isinstance(frame_or_image, Image.Image):
+            width, height = frame_or_image.size
+        else:
+            width = int(getattr(frame_or_image, "width", 0) or 0)
+            height = int(getattr(frame_or_image, "height", 0) or 0)
+            if (width <= 0 or height <= 0) and getattr(frame_or_image, "image", None) is not None:
+                width, height = frame_or_image.image.size
+        if width <= 0 or height <= 0:
+            raise RuntimeError("invalid video frame size")
         codec = str(config_snapshot.get("video_codec", "mp4v")).strip() or "mp4v"
         candidates = self._opencv_fourcc_candidates(codec, config_bool(config_snapshot, "use_nvenc", False, False))
         for candidate, fourcc_text in candidates:
@@ -5156,7 +5326,7 @@ class StereoCaptureOnlyApp:
             "auto_reconnect_initial_delay_seconds": 1.0,
             "auto_reconnect_max_delay_seconds": 16.0,
             "consecutive_timeout_alert_threshold": 3,
-            "preview_fps": 0.0,
+            "preview_fps": DEFAULT_PREVIEW_FPS,
             "frame_timeout_ms": 800,
             "preview_frame_timeout_ms": 300,
             "roi_restart_settle_seconds": 0.20,
@@ -5171,7 +5341,7 @@ class StereoCaptureOnlyApp:
             "close_thread_join_timeout_seconds": 10.0,
             "close_total_thread_join_timeout_seconds": 10.0,
             "software_trigger_barrier_timeout_seconds": 1.0,
-            "record_queue_max_items": 64,
+            "record_queue_max_items": 200,
             "record_queue_put_timeout_seconds": 0.05,
             "record_output_fps_when_unlimited": 30.0,
             "ffmpeg_sequence_gap_warning_threshold": 300,
@@ -5182,7 +5352,7 @@ class StereoCaptureOnlyApp:
             "record_capture_priority_mode": True,
             "record_preview_during_capture": False,
             "record_preview_fps": 2.0,
-            "record_realtime_mp4": False,
+            "record_realtime_mp4": True,
             "record_clone_frames_for_writer": False,
             "record_drop_frames_on_write_lag": False,
             "record_checksum_during_capture": False,
@@ -5192,12 +5362,23 @@ class StereoCaptureOnlyApp:
             "record_disk_benchmark_seconds": 3.0,
             "record_disk_benchmark_margin": 1.25,
             "record_preflight_prompt_enabled": True,
-            "timestamp_reject_enabled": False,
+            "timestamp_reject_enabled": True,
             "max_camera_timestamp_delta": 0,
             "max_host_timestamp_delta": DEFAULT_HOST_TIMESTAMP_DELTA_NS,
             "camera_timestamp_offset_samples": 5,
+            "camera_timestamp_offset_window": 64,
+            "stream_buffer_size": 256,
+            "raw_buffer_pool_size": 64,
+            "continuous_pair_buffer_size": 256,
+            "continuous_pair_match_timeout_ms": 200,
             "chunk_data_enabled": True,
             "chunk_selectors": ["Timestamp", "FrameCounter", "ExposureTime", "Gain"],
+            "require_hardware_trigger": False,
+            "acquisition_frame_rate": None,
+            "trigger_delay_us": 0.0,
+            "line_debouncer_time_us": 0.0,
+            "trigger_activation": "RisingEdge",
+            "save_raw_frames": False,
         }
         for key, value in defaults.items():
             self.config.setdefault(key, value)
@@ -5294,21 +5475,23 @@ class StereoCaptureOnlyApp:
         if not config_bool(snapshot, "record_capture_priority_mode", True, True):
             return snapshot
 
-        snapshot["record_save_image_sequence"] = True
-        snapshot["record_realtime_mp4"] = False
+        snapshot["record_save_image_sequence"] = False
+        snapshot["auto_make_mp4"] = True
+        snapshot["record_realtime_mp4"] = True
         snapshot["record_preview_during_capture"] = False
         snapshot["record_clone_frames_for_writer"] = False
         snapshot["record_checksum_during_capture"] = False
         snapshot["record_split_interval_seconds"] = 0
         snapshot["record_split_size_gb"] = 0.0
-        snapshot["record_queue_max_items"] = max(config_int(snapshot, "record_queue_max_items", 64), 64)
+        snapshot["record_queue_max_items"] = configured_record_queue_size(
+            snapshot,
+            optional_positive_fps(snapshot.get("record_fps", 0.0)) or None,
+        )
         snapshot["preview_quality_analysis_enabled"] = False
         snapshot["focus_peaking_overlay_interval_seconds"] = max(
             config_float(snapshot, "focus_peaking_overlay_interval_seconds", 0.20),
             1.0,
         )
-        if str(snapshot.get("image_format", "bmp")).lower().strip() in {"jpg", "jpeg", "png"}:
-            snapshot["image_format"] = "bmp"
         return snapshot
 
     def _collect_record_config_for_preflight(self) -> dict[str, object] | None:
@@ -5519,8 +5702,8 @@ class StereoCaptureOnlyApp:
     def _analyze_preview_frames(self, left: CameraFrame | None, right: CameraFrame | None, frame_index: int) -> dict[str, object]:
         roi = self._focus_roi()
         method = str(self.config.get("focus_method", "laplacian"))
-        left_image = left.image if left is not None else None
-        right_image = right.image if right is not None else None
+        left_image = left.image if left is not None and getattr(left, "image", None) is not None else None
+        right_image = right.image if right is not None and getattr(right, "image", None) is not None else None
         metrics: dict[str, object] = {
             "focus": focus_pair_metrics(left_image, right_image, roi, method),
             "focus_roi": roi,
@@ -7454,9 +7637,9 @@ Output {esc('MP4 + image sequence' if config_bool(config_snapshot, 'record_save_
         group_right = right_dir / f"{capture_id}_right.{ext}"
 
         if left is not None:
-            group_left = self._save_image(left.image, group_left)
+            group_left = self._save_frame(left, group_left)
         if right is not None:
-            group_right = self._save_image(right.image, group_right)
+            group_right = self._save_frame(right, group_right)
         quality_metrics = self._quality_metrics_for_pair(left, right)
         focus = quality_metrics.get("focus") if isinstance(quality_metrics.get("focus"), dict) else {}
         left_exposure = quality_metrics.get("left_exposure") if isinstance(quality_metrics.get("left_exposure"), dict) else None
@@ -7496,6 +7679,50 @@ Output {esc('MP4 + image sequence' if config_bool(config_snapshot, 'record_save_
         )
         self.project_manager.register_session(mode, group_dir, group_dir / "meta.json", {"manifest": manifest})
         return group_dir
+
+    def _save_frame(self, frame: CameraFrame, path: Path, config_snapshot: dict | None = None) -> Path:
+        config_snapshot = config_snapshot or self._config_snapshot()
+        if self._should_save_raw_frame(frame, config_snapshot):
+            return self._save_raw_frame(frame, path)
+        if getattr(frame, "image", None) is None:
+            return self._save_raw_frame(frame, path)
+        return self._save_image(frame.image, path, config_snapshot)
+
+    def _should_save_raw_frame(self, frame: CameraFrame, config_snapshot: dict) -> bool:
+        if config_bool(config_snapshot, "save_raw_frames", False, False):
+            return getattr(frame, "raw_data", None) is not None
+        pixel_name = str(getattr(frame, "pixel_type_name", "") or "").lower()
+        bit_depth = int(getattr(frame, "raw_bit_depth", 8) or 8)
+        return bool(getattr(frame, "raw_data", None)) and (bit_depth > 8 or "bayer" in pixel_name)
+
+    def _save_raw_frame(self, frame: CameraFrame, path: Path) -> Path:
+        raw_data = getattr(frame, "raw_data", None)
+        if raw_data is None:
+            if getattr(frame, "image", None) is None:
+                raise MvsError("raw-only frame has no raw payload to save")
+            return self._save_image(frame.image, path)
+        raw_path = path.with_suffix(".npy")
+        width = int(getattr(frame, "width", 0) or 0)
+        height = int(getattr(frame, "height", 0) or 0)
+        bit_depth = int(getattr(frame, "raw_bit_depth", 8) or 8)
+        pixel_name = str(getattr(frame, "pixel_type_name", "") or "").lower()
+        raw_len = int(getattr(frame, "raw_frame_len", 0) or len(raw_data))
+        try:
+            if width > 0 and height > 0 and raw_len >= width * height * 2 and bit_depth > 8:
+                array = np.frombuffer(raw_data, dtype="<u2", count=width * height).reshape((height, width)).copy()
+            elif width > 0 and height > 0 and raw_len >= width * height and ("mono" in pixel_name or "bayer" in pixel_name):
+                array = np.frombuffer(raw_data, dtype=np.uint8, count=width * height).reshape((height, width)).copy()
+            else:
+                array = np.frombuffer(raw_data, dtype=np.uint8).copy()
+            np.save(raw_path, array)
+        except Exception as exc:
+            LOGGER.exception("原始帧保存失败: %s", raw_path)
+            try:
+                raw_path.unlink(missing_ok=True)
+            except OSError:
+                LOGGER.warning("原始帧保存失败后清理残留文件失败: %s", raw_path, exc_info=True)
+            raise MvsError(f"原始帧保存失败：{raw_path}；{exc}") from exc
+        return raw_path
 
     def _save_image(self, image: Image.Image, path: Path, config_snapshot: dict | None = None) -> Path:
         config_snapshot = config_snapshot or self._config_snapshot()
@@ -7596,6 +7823,15 @@ Output {esc('MP4 + image sequence' if config_bool(config_snapshot, 'record_save_
             "record_max_seconds",
             "chunk_data_enabled",
             "chunk_selectors",
+            "timestamp_reject_enabled",
+            "max_camera_timestamp_delta",
+            "max_host_timestamp_delta",
+            "require_hardware_trigger",
+            "acquisition_frame_rate",
+            "trigger_delay_us",
+            "line_debouncer_time_us",
+            "trigger_activation",
+            "save_raw_frames",
         )
         snapshot = {key: config_snapshot.get(key) for key in keys}
         snapshot["image_format"] = image_extension(config_snapshot)
@@ -7636,6 +7872,11 @@ Output {esc('MP4 + image sequence' if config_bool(config_snapshot, 'record_save_
             "height": frame.height,
             "host_timestamp": frame.host_timestamp,
             "camera_timestamp": frame.camera_timestamp,
+            "pixel_type": int(getattr(frame, "pixel_type", 0) or 0),
+            "pixel_type_name": str(getattr(frame, "pixel_type_name", "") or ""),
+            "raw_frame_len": int(getattr(frame, "raw_frame_len", 0) or 0),
+            "raw_bit_depth": int(getattr(frame, "raw_bit_depth", 8) or 8),
+            "raw_array_shape": list(getattr(frame, "raw_array_shape", None) or []),
         }
 
     def _show_error(self, exc: object) -> None:
