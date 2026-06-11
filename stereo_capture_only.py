@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 import hashlib
+import csv
+import html
 import json
 import logging
 import os
@@ -8,11 +10,13 @@ from logging.handlers import RotatingFileHandler
 import shutil
 import subprocess
 import sys
+import tempfile
 import threading
 import time
 import ctypes
 import traceback
 from dataclasses import asdict, dataclass
+from collections import deque
 from pathlib import Path
 from queue import Empty, Full, Queue
 from tkinter import BOTH, BOTTOM, DISABLED, LEFT, NORMAL, RIGHT, TOP, X, BooleanVar, Canvas, Frame, StringVar, Tk, Toplevel, filedialog, messagebox
@@ -82,9 +86,23 @@ except Exception:  # pragma: no cover - non-Windows fallback
     winsound = None
 
 
-BASE_DIR = Path(__file__).resolve().parent
+def _runtime_dir() -> Path:
+    if getattr(sys, "frozen", False):
+        return Path(sys.executable).resolve().parent
+    return Path(__file__).resolve().parent
+
+
+def _resource_dir() -> Path:
+    bundle_dir = getattr(sys, "_MEIPASS", None)
+    return Path(bundle_dir).resolve() if bundle_dir else Path(__file__).resolve().parent
+
+
+BASE_DIR = _runtime_dir()
+RESOURCE_DIR = _resource_dir()
 CONFIG_PATH = BASE_DIR / "config.json"
+DEFAULT_CONFIG_PATH = RESOURCE_DIR / "config.json"
 LOG_DIR = BASE_DIR / "logs"
+BIAODING_DIR = BASE_DIR.parent / "MVSS_Biaoding_CalibrationOnly"
 CAPTURE_WIDTH = 5472
 CAPTURE_HEIGHT = 3648
 
@@ -303,8 +321,20 @@ def load_config() -> dict:
         with CONFIG_PATH.open("r", encoding="utf-8") as fh:
             payload = json.load(fh)
     except FileNotFoundError:
-        LOGGER.warning("config.json not found at %s; starting with defaults.", CONFIG_PATH)
-        payload = {}
+        try:
+            with DEFAULT_CONFIG_PATH.open("r", encoding="utf-8") as fh:
+                payload = json.load(fh)
+        except FileNotFoundError:
+            LOGGER.warning("config.json not found at %s; starting with defaults.", CONFIG_PATH)
+            payload = {}
+        except (OSError, UnicodeDecodeError, json.JSONDecodeError) as exc:
+            LOGGER.warning("Default config.json at %s could not be loaded: %s", DEFAULT_CONFIG_PATH, exc)
+            payload = {}
+        if payload:
+            try:
+                save_config(payload)
+            except OSError:
+                LOGGER.warning("Could not create writable config.json at %s.", CONFIG_PATH, exc_info=True)
     except (OSError, UnicodeDecodeError, json.JSONDecodeError) as exc:
         backup_path: Path | None = None
         if CONFIG_PATH.exists():
@@ -335,6 +365,12 @@ def save_config(config: dict) -> None:
 
 def timestamp_ms() -> str:
     return time.strftime("%Y%m%d_%H%M%S_") + f"{int((time.time() % 1) * 1000):03d}"
+
+
+def safe_filename(text: object) -> str:
+    value = str(text).strip()
+    cleaned = "".join(ch if ch.isalnum() or ch in "._-" else "_" for ch in value)
+    return cleaned.strip("._") or "item"
 
 
 def optional_float_text(text: str) -> float | None:
@@ -396,6 +432,20 @@ def format_duration(seconds: float) -> str:
 def image_estimated_bytes(image: Image.Image) -> int:
     channels = 1 if image.mode in {"1", "L", "P"} else len(image.getbands())
     return image.width * image.height * max(channels, 1)
+
+
+def format_bytes(value: object) -> str:
+    try:
+        size = float(value)
+    except (TypeError, ValueError):
+        return "--"
+    units = ("B", "KB", "MB", "GB", "TB")
+    for unit in units:
+        if abs(size) < 1024.0 or unit == units[-1]:
+            digits = 0 if unit == "B" else 2
+            return f"{size:.{digits}f} {unit}"
+        size /= 1024.0
+    return f"{size:.2f} TB"
 
 
 def setup_logging(config: dict) -> None:
@@ -558,9 +608,10 @@ class DualCameraStrip(Frame):
 
 
 class ZoomImagePane(Frame):
-    def __init__(self, master: Tk | Frame, title: str, reset_command=None, roi_callback=None):
+    def __init__(self, master: Tk | Frame, title: str, reset_command=None, roi_callback=None, side: str = ""):
         super().__init__(master, bg=BORDER_COLOR)
         self.title_var = StringVar(value=title)
+        self.side = side
         self.info_var = StringVar(value="未连接")
         self.zoom_var = StringVar(value="100%")
         self._image_ref: ImageTk.PhotoImage | None = None
@@ -754,7 +805,7 @@ class ZoomImagePane(Frame):
         source_width, source_height = self._last_image.size
         scale = min(target_width / max(source_width, 1), target_height / max(source_height, 1), 1.0)
         display_size = (max(1, int(source_width * scale)), max(1, int(source_height * scale)))
-        image = self._last_image.resize(display_size, Image.Resampling.LANCZOS)
+        image = self._last_image.resize(display_size, Image.Resampling.BILINEAR)
         image = image.convert("RGB")
         if self._focus_peaking_enabled and self._focus_peaking_overlay is not None:
             overlay = self._focus_peaking_overlay
@@ -1085,7 +1136,7 @@ class ZoomImagePane(Frame):
         self.canvas.coords(self._roi_rect_id, x0, y0, x1, y1)
         roi = self._canvas_rect_to_image_roi(x0, y0, x1, y1)
         if roi is not None:
-            self.roi_callback(roi)
+            self.roi_callback(roi, self.side)
 
     def _point_inside_rendered_image(self, x: float, y: float) -> bool:
         if self._render_bounds is None:
@@ -1314,10 +1365,44 @@ class StereoCaptureOnlyApp:
             self.config.update(values)
             snapshot = dict(self.config)
         if save:
-            with CONFIG_PATH.open("w", encoding="utf-8") as fh:
-                json.dump(snapshot, fh, ensure_ascii=False, indent=2)
-                fh.write("\n")
+            save_config(snapshot)
         return snapshot
+
+    def _start_background_thread(self, target, name: str, *, report_errors: bool = True) -> threading.Thread:
+        def runner() -> None:
+            try:
+                target()
+            except Exception as exc:
+                LOGGER.exception("Background thread %s failed.", name)
+                if report_errors and not self._closing:
+                    try:
+                        self.ui_queue.put(("error", exc))
+                    except Exception:
+                        pass
+            finally:
+                self._forget_background_thread(threading.current_thread())
+
+        thread = threading.Thread(target=runner, name=name, daemon=True)
+        with self._background_threads_lock:
+            self._background_threads.append(thread)
+        thread.start()
+        return thread
+
+    def _forget_background_thread(self, thread: threading.Thread) -> None:
+        if not hasattr(self, "_background_threads_lock"):
+            return
+        with self._background_threads_lock:
+            try:
+                self._background_threads.remove(thread)
+            except ValueError:
+                pass
+
+    def _background_threads_snapshot(self) -> list[threading.Thread]:
+        if not hasattr(self, "_background_threads_lock"):
+            return []
+        with self._background_threads_lock:
+            self._background_threads = [thread for thread in self._background_threads if thread.is_alive()]
+            return list(self._background_threads)
 
     def __init__(self, root: Tk):
         self.root = root
@@ -1349,6 +1434,8 @@ class StereoCaptureOnlyApp:
         self.ui_queue: Queue[tuple[str, object]] = UiEventQueue(self._notify_ui_queue)
 
         self._state_lock = threading.RLock()
+        self._background_threads_lock = threading.Lock()
+        self._background_threads: list[threading.Thread] = []
         self._trigger_source_cache = str(self.config.get("trigger_source", "Software"))
         self.previewing = False
         self.preview_thread: threading.Thread | None = None
@@ -1357,15 +1444,18 @@ class StereoCaptureOnlyApp:
         self.interval_thread: threading.Thread | None = None
         self.interval_stop_event = threading.Event()
         self.interval_count = 0
+        self.photo_count = 0
         self.recording = False
         self.record_thread: threading.Thread | None = None
         self.record_dir: Path | None = None
+        self._resume_preview_after_recording = False
         self._closing = False
         self._record_stats_lock = threading.RLock()
         self.record_count = 0
         self.record_saved_count = 0
         self._record_next_saved_index = 0
         self.record_started_at: float | None = None
+        self.record_started_wall_time: float | None = None
         self.record_stop_reason = "manual"
         self._record_last_frame_pair: tuple[CameraFrame | None, CameraFrame | None, float] | None = None
         self._record_last_frame_lock = threading.Lock()
@@ -1378,6 +1468,9 @@ class StereoCaptureOnlyApp:
         self._record_segment_start_time = 0.0
         self._record_segment_start_saved = 0
         self._record_segment_sizes: dict[int, int] = {}
+        self._record_video_segment_sizes: dict[int, int] = {}
+        self._record_first_trigger_time: float | None = None
+        self._record_second_stats: dict[int, dict[str, object]] = {}
         self._record_skipped_frames: list[dict[str, object]] = []
         self._record_skipped_count = 0
         self._record_skip_reasons: dict[str, int] = {}
@@ -1387,6 +1480,7 @@ class StereoCaptureOnlyApp:
         self._record_reconnect_count = 0
         self._record_disk_warning_count = 0
         self._record_disk_benchmark: dict[str, object] | None = None
+        self._record_preflight_plan: dict[str, object] = {}
         self._record_last_disk_check = 0.0
         self._record_disk_usage_start = 0
         self._record_summary: dict[str, object] = {}
@@ -1424,6 +1518,7 @@ class StereoCaptureOnlyApp:
         self._magnifier_locked = False
         self._magnifier_roi_frac = clamp_roi_frac(self.config.get("focus_roi"))
         self._magnifier_zoom = 1
+        self._magnifier_image_refs: list[ImageTk.PhotoImage] = []
         self._stereo_blink_phase = 0
         self._last_rectified_overlay_key: tuple[int | None, int | None] | None = None
         self._last_rectified_overlay_image: Image.Image | None = None
@@ -1433,6 +1528,7 @@ class StereoCaptureOnlyApp:
         self._last_temperature_poll = 0.0
         self._focus_history: list[tuple[float, float]] = []
         self._focus_peak_score = 0.0
+        self._calibration_wizard: dict[str, object] = {}
 
         self.status_var = StringVar(value="准备就绪。请先连接相机。")
         self.save_dir_var = StringVar(value=str(self.config.get("save_dir", "captures")))
@@ -1452,6 +1548,16 @@ class StereoCaptureOnlyApp:
             self.config["roi_offset_x"] = 0
         if self.config.get("roi_offset_y") in (None, ""):
             self.config["roi_offset_y"] = 0
+        for side in ("left", "right"):
+            for field, fallback in (
+                ("width", self.config.get("roi_width", CAPTURE_WIDTH)),
+                ("height", self.config.get("roi_height", CAPTURE_HEIGHT)),
+                ("offset_x", self.config.get("roi_offset_x", 0)),
+                ("offset_y", self.config.get("roi_offset_y", 0)),
+            ):
+                key = f"{side}_roi_{field}"
+                if self.config.get(key) in (None, ""):
+                    self.config[key] = fallback
 
     def _ensure_config_section(self, key: str) -> dict[str, object]:
         section = self.config.get(key)
@@ -1479,15 +1585,23 @@ class StereoCaptureOnlyApp:
         self.balance_red_var = StringVar(value=optional_config_text(self.config, "balance_ratio_red", ""))
         self.balance_green_var = StringVar(value=optional_config_text(self.config, "balance_ratio_green", ""))
         self.balance_blue_var = StringVar(value=optional_config_text(self.config, "balance_ratio_blue", ""))
-        self.roi_width_var = StringVar(value=str(self.config.get("roi_width", CAPTURE_WIDTH)))
-        self.roi_height_var = StringVar(value=str(self.config.get("roi_height", CAPTURE_HEIGHT)))
-        self.roi_offset_x_var = StringVar(value=str(self.config.get("roi_offset_x", 0)))
-        self.roi_offset_y_var = StringVar(value=str(self.config.get("roi_offset_y", 0)))
+        self.left_roi_width_var = StringVar(value=str(self.config.get("left_roi_width", self.config.get("roi_width", CAPTURE_WIDTH))))
+        self.left_roi_height_var = StringVar(value=str(self.config.get("left_roi_height", self.config.get("roi_height", CAPTURE_HEIGHT))))
+        self.left_roi_offset_x_var = StringVar(value=str(self.config.get("left_roi_offset_x", self.config.get("roi_offset_x", 0))))
+        self.left_roi_offset_y_var = StringVar(value=str(self.config.get("left_roi_offset_y", self.config.get("roi_offset_y", 0))))
+        self.right_roi_width_var = StringVar(value=str(self.config.get("right_roi_width", self.config.get("roi_width", CAPTURE_WIDTH))))
+        self.right_roi_height_var = StringVar(value=str(self.config.get("right_roi_height", self.config.get("roi_height", CAPTURE_HEIGHT))))
+        self.right_roi_offset_x_var = StringVar(value=str(self.config.get("right_roi_offset_x", self.config.get("roi_offset_x", 0))))
+        self.right_roi_offset_y_var = StringVar(value=str(self.config.get("right_roi_offset_y", self.config.get("roi_offset_y", 0))))
         self.interval_seconds_var = StringVar(value=optional_config_text(self.config, "interval_capture_seconds", "5.0"))
         self.interval_limit_var = StringVar(value=optional_config_text(self.config, "interval_capture_count", ""))
+        self.photo_count_var = StringVar(value="拍照次数 0")
         self.record_fps_var = StringVar(value=str(self.config.get("record_fps", 5.0)))
         self.record_max_seconds_var = StringVar(value=optional_config_text(self.config, "record_max_seconds", "0"))
         exposure_monitor = self._ensure_config_section("exposure_monitor")
+        self.preview_quality_analysis_var = BooleanVar(
+            value=config_bool(self.config, "preview_quality_analysis_enabled", True, True)
+        )
         self.focus_peaking_var = BooleanVar(value=False)
         self.zebra_var = BooleanVar(value=bool(exposure_monitor.get("zebra_enabled", False)))
         self.histogram_enabled_var = BooleanVar(value=bool(exposure_monitor.get("histogram_enabled", True)))
@@ -1519,6 +1633,7 @@ class StereoCaptureOnlyApp:
         self.calibration_status_var = StringVar(value="标定板覆盖: --")
         self.stereo_preview_mode_var = StringVar(value="正常预览")
         self.guide_mode_var = StringVar(value="关闭")
+        self.mp4_progress_var = StringVar(value="MP4 --")
         self._focus_peaking_enabled_setting = bool(self.focus_peaking_var.get())
         self._histogram_enabled_setting = bool(self.histogram_enabled_var.get())
 
@@ -1551,12 +1666,18 @@ class StereoCaptureOnlyApp:
         self.record_button = ttk.Button(
             actions, text="开始录像", command=self.toggle_recording, state=DISABLED, style="Record.TButton"
         )
+        self.record_preflight_button = ttk.Button(
+            actions, text="录像评估", command=self.show_record_preflight_wizard, style="Utility.TButton"
+        )
         self.refresh_button = ttk.Button(actions, text="刷新设备", command=self.refresh_devices, style="Utility.TButton")
         self.choose_save_dir_button = ttk.Button(
             actions, text="保存路径", command=self.choose_save_dir, style="Utility.TButton"
         )
         self.project_export_button = ttk.Button(
             actions, text="项目/导出", command=self.show_project_export_popup, style="Utility.TButton"
+        )
+        self.calibration_wizard_button = ttk.Button(
+            actions, text="标定向导", command=self.show_calibration_wizard, style="Utility.TButton"
         )
         self.exit_button = ttk.Button(actions, text="退出", command=self.close, style="Danger.TButton")
 
@@ -1567,9 +1688,11 @@ class StereoCaptureOnlyApp:
             self.hdr_button,
             self.interval_button,
             self.record_button,
+            self.record_preflight_button,
             self.refresh_button,
             self.choose_save_dir_button,
             self.project_export_button,
+            self.calibration_wizard_button,
         ):
             button.pack(side=LEFT, padx=(0, 5), pady=0)
         self.exit_button.pack(side=RIGHT, pady=0)
@@ -1614,6 +1737,12 @@ class StereoCaptureOnlyApp:
         self._labeled_entry(interval_panel, "录像fps", self.record_fps_var, 7, 0, 6)
 
         self._labeled_entry(interval_panel, "时长s", self.record_max_seconds_var, 7, 0, 8)
+        ttk.Label(interval_panel, textvariable=self.photo_count_var, style="Panel.TLabel").grid(
+            row=0, column=10, padx=(10, 4), pady=2, sticky="w"
+        )
+        ttk.Button(interval_panel, text="复位", command=self.reset_photo_count, width=5).grid(
+            row=0, column=11, padx=(0, 4), pady=2
+        )
 
         info = ttk.Frame(toolbar, style="InfoBar.TFrame", padding=(8, 4))
         info.pack(side=TOP, fill=X, pady=(5, 0))
@@ -1627,6 +1756,14 @@ class StereoCaptureOnlyApp:
         )
         ttk.Label(info, text="保存路径", style="InfoLabel.TLabel").pack(side=LEFT, padx=(0, 4))
         ttk.Label(info, textvariable=self.save_dir_var, style="InfoValue.TLabel").pack(side=LEFT, fill=X, expand=True)
+        self.mp4_progress_label = ttk.Label(info, textvariable=self.mp4_progress_var, style="InfoValue.TLabel")
+        self.mp4_progress = ttk.Progressbar(
+            info,
+            mode="determinate",
+            maximum=100,
+            length=180,
+            style="Green.Horizontal.TProgressbar",
+        )
 
         content = DualCameraStrip(
             self.root,
@@ -1639,8 +1776,8 @@ class StereoCaptureOnlyApp:
         self.camera_strip = content
         content.pack(side=TOP, fill=X)
         content.pack_propagate(False)
-        self.left_pane = ZoomImagePane(content, "左相机", roi_callback=self.set_roi_from_preview)
-        self.right_pane = ZoomImagePane(content, "右相机", roi_callback=self.set_roi_from_preview)
+        self.left_pane = ZoomImagePane(content, "左相机", roi_callback=self.set_roi_from_preview, side="left")
+        self.right_pane = ZoomImagePane(content, "右相机", roi_callback=self.set_roi_from_preview, side="right")
         self.camera_side_panel = ttk.Frame(content, style="Toolbar.TFrame")
         content.set_children(self.left_pane, self.right_pane)
         content.set_sidebar(self.camera_side_panel)
@@ -1728,16 +1865,22 @@ class StereoCaptureOnlyApp:
         ttk.Label(roi_panel, text="ROI", style="Panel.TLabel").grid(
             row=0, column=0, columnspan=4, padx=(0, 5), pady=1, sticky="w"
         )
-        self._labeled_entry(roi_panel, "W", self.roi_width_var, 6, 1, 0)
-        self._labeled_entry(roi_panel, "H", self.roi_height_var, 6, 1, 2)
-        self._labeled_entry(roi_panel, "X", self.roi_offset_x_var, 5, 2, 0)
-        self._labeled_entry(roi_panel, "Y", self.roi_offset_y_var, 5, 2, 2)
+        ttk.Label(roi_panel, text="左", style="Panel.TLabel").grid(row=1, column=0, padx=(0, 3), pady=1, sticky="w")
+        self._labeled_entry(roi_panel, "W", self.left_roi_width_var, 6, 1, 1)
+        self._labeled_entry(roi_panel, "H", self.left_roi_height_var, 6, 1, 3)
+        self._labeled_entry(roi_panel, "X", self.left_roi_offset_x_var, 5, 2, 1)
+        self._labeled_entry(roi_panel, "Y", self.left_roi_offset_y_var, 5, 2, 3)
+        ttk.Label(roi_panel, text="右", style="Panel.TLabel").grid(row=3, column=0, padx=(0, 3), pady=1, sticky="w")
+        self._labeled_entry(roi_panel, "W", self.right_roi_width_var, 6, 3, 1)
+        self._labeled_entry(roi_panel, "H", self.right_roi_height_var, 6, 3, 3)
+        self._labeled_entry(roi_panel, "X", self.right_roi_offset_x_var, 5, 4, 1)
+        self._labeled_entry(roi_panel, "Y", self.right_roi_offset_y_var, 5, 4, 3)
         self.edit_roi_button = ttk.Button(roi_panel, text="框选ROI", command=self.toggle_roi_edit_mode)
-        self.edit_roi_button.grid(row=3, column=0, columnspan=2, padx=(0, 6), pady=(4, 1), sticky="ew")
+        self.edit_roi_button.grid(row=5, column=0, columnspan=2, padx=(0, 6), pady=(4, 1), sticky="ew")
         self.reset_roi_button = ttk.Button(roi_panel, text="重置", command=self.reset_roi_settings)
-        self.reset_roi_button.grid(row=3, column=2, padx=(0, 6), pady=(4, 1), sticky="ew")
+        self.reset_roi_button.grid(row=5, column=2, padx=(0, 6), pady=(4, 1), sticky="ew")
         self.apply_roi_button = ttk.Button(roi_panel, text="应用", command=self.apply_roi_settings, state=DISABLED)
-        self.apply_roi_button.grid(row=3, column=3, padx=(0, 6), pady=(4, 1), sticky="ew")
+        self.apply_roi_button.grid(row=5, column=3, padx=(0, 6), pady=(4, 1), sticky="ew")
         self.param_panel_body.pack(side=TOP, fill=X, pady=(5, 0))
 
         self.quality_panel = ttk.Frame(self.root, style="Toolbar.TFrame", padding=(12, 0, 12, 0))
@@ -2136,6 +2279,11 @@ class StereoCaptureOnlyApp:
         self.left_pane.bind_external("<MouseWheel>", self._on_magnifier_wheel)
         self.left_pane.bind_external("<Button-4>", self._on_magnifier_wheel)
         self.left_pane.bind_external("<Button-5>", self._on_magnifier_wheel)
+        self.right_pane.bind_external("<Motion>", self._on_magnifier_motion)
+        self.right_pane.bind_external("<ButtonPress-1>", self._on_magnifier_click)
+        self.right_pane.bind_external("<MouseWheel>", self._on_magnifier_wheel)
+        self.right_pane.bind_external("<Button-4>", self._on_magnifier_wheel)
+        self.right_pane.bind_external("<Button-5>", self._on_magnifier_wheel)
         self._update_quality_optional_sections()
 
     def _build_exposure_panel(self, panel: ttk.LabelFrame) -> None:
@@ -2169,6 +2317,12 @@ class StereoCaptureOnlyApp:
         top = ttk.Frame(panel, style="Panel.TFrame")
         top.pack(side=TOP, fill=X)
         self.validation_panel_body = top
+        ttk.Checkbutton(
+            top,
+            text="质量分析",
+            variable=self.preview_quality_analysis_var,
+            command=self._sync_quality_toggles,
+        ).pack(side=LEFT, padx=(0, 6))
         self.validation_collapse_button = ttk.Button(top, text="校验", width=5, state=DISABLED)
         ttk.Label(top, text="预览模式", style="CompactPanel.TLabel").pack(side=LEFT, padx=(0, 4))
         ttk.OptionMenu(
@@ -2209,6 +2363,7 @@ class StereoCaptureOnlyApp:
         top.pack(side=TOP, fill=X)
         ttk.Button(top, text="新建项目", command=self.create_new_project).pack(side=LEFT, padx=(0, 4))
         ttk.Button(top, text="重载标定", command=self.reload_calibration).pack(side=LEFT, padx=(0, 4))
+        ttk.Button(top, text="标定向导", command=self.show_calibration_wizard).pack(side=LEFT, padx=(0, 4))
         ttk.Checkbutton(top, text="HDR", variable=self.hdr_enabled_var).pack(side=LEFT)
 
         body = ttk.Frame(panel, style="Panel.TFrame")
@@ -2345,6 +2500,306 @@ class StereoCaptureOnlyApp:
         self.project_id_var.set(self.project_manager.current_project_id)
         self.status_var.set(f"新建项目：{project_dir}")
 
+    def _calibration_wizard_settings(self) -> dict[str, object]:
+        wizard = self._ensure_config_section("calibration_wizard")
+        positions = wizard.get("positions")
+        if not isinstance(positions, list) or not positions:
+            positions = ["左上", "上中", "右上", "左中", "中心", "右中", "左下", "下中", "右下"]
+            wizard["positions"] = positions
+        return {
+            "pattern": str(wizard.get("pattern", "chessboard")),
+            "columns": int(wizard.get("columns", 9) or 9),
+            "rows": int(wizard.get("rows", 6) or 6),
+            "square_size_mm": float(wizard.get("square_size_mm", 40.0) or 40.0),
+            "marker_size_mm": float(wizard.get("marker_size_mm", 30.0) or 30.0),
+            "aruco_dictionary": str(wizard.get("aruco_dictionary", "DICT_5X5_1000")),
+            "min_pairs": int(wizard.get("min_pairs", max(len(positions), 6)) or max(len(positions), 6)),
+            "positions": [str(item) for item in positions],
+        }
+
+    def show_calibration_wizard(self) -> None:
+        popup = getattr(self, "_calibration_wizard_popup", None)
+        if popup is not None and popup.winfo_exists():
+            popup.lift()
+            popup.focus_force()
+            return
+
+        settings = self._calibration_wizard_settings()
+        session_dir = self.project_manager.output_root_for_mode("calibration") / f"calibration_capture_{timestamp_ms()}"
+        left_dir = session_dir / "left"
+        right_dir = session_dir / "right"
+        left_dir.mkdir(parents=True, exist_ok=True)
+        right_dir.mkdir(parents=True, exist_ok=True)
+        positions = list(settings["positions"])
+
+        popup = Toplevel(self.root)
+        self._calibration_wizard_popup = popup
+        popup.title("标定采集与在线标定")
+        popup.configure(bg=BG_COLOR)
+        popup.transient(self.root)
+        popup.geometry("+%d+%d" % (self.root.winfo_rootx() + 140, self.root.winfo_rooty() + 96))
+        popup.protocol("WM_DELETE_WINDOW", popup.destroy)
+
+        state = {
+            "session_dir": session_dir,
+            "left_dir": left_dir,
+            "right_dir": right_dir,
+            "settings": settings,
+            "positions": positions,
+            "captures": [],
+            "running": False,
+        }
+        self._calibration_wizard = state
+
+        container = ttk.LabelFrame(popup, text="标定向导", padding=(12, 10))
+        container.pack(side=TOP, fill=BOTH, expand=True, padx=12, pady=12)
+        title_var = StringVar(value="请将棋盘格/标定板移动到左上位置")
+        status_var = StringVar(value=f"已采集 0 / {len(positions)} 组；目录：{session_dir}")
+        result_var = StringVar(value="重投影误差：--")
+        ttk.Label(container, textvariable=title_var, style="Panel.TLabel", font=(FONT_FAMILY, 12, "bold")).pack(
+            side=TOP, fill=X
+        )
+        ttk.Label(container, textvariable=status_var, style="Panel.TLabel").pack(side=TOP, fill=X, pady=(6, 0))
+        ttk.Label(container, textvariable=result_var, style="Panel.TLabel").pack(side=TOP, fill=X, pady=(4, 8))
+
+        grid = ttk.Frame(container, style="Panel.TFrame")
+        grid.pack(side=TOP, fill=X)
+        position_labels: list[ttk.Label] = []
+        for index, name in enumerate(positions):
+            label = ttk.Label(grid, text=f"{index + 1}. {name}", style="Panel.TLabel", padding=(8, 5))
+            label.grid(row=index // 3, column=index % 3, sticky="ew", padx=3, pady=3)
+            position_labels.append(label)
+        for column in range(3):
+            grid.grid_columnconfigure(column, weight=1)
+
+        config_panel = ttk.Frame(container, style="Panel.TFrame")
+        config_panel.pack(side=TOP, fill=X, pady=(10, 0))
+        pattern_var = StringVar(value=str(settings["pattern"]))
+        columns_var = StringVar(value=str(settings["columns"]))
+        rows_var = StringVar(value=str(settings["rows"]))
+        square_var = StringVar(value=str(settings["square_size_mm"]))
+        marker_var = StringVar(value=str(settings["marker_size_mm"]))
+        min_pairs_var = StringVar(value=str(settings["min_pairs"]))
+        dictionary_var = StringVar(value=str(settings["aruco_dictionary"]))
+        ttk.Label(config_panel, text="类型").grid(row=0, column=0, padx=(0, 4), pady=3, sticky="w")
+        ttk.OptionMenu(config_panel, pattern_var, pattern_var.get(), "chessboard", "charuco", "charuco_legacy", "circles", "acircles").grid(
+            row=0, column=1, padx=(0, 8), pady=3, sticky="w"
+        )
+        self._labeled_entry(config_panel, "列", columns_var, 6, 0, 2)
+        self._labeled_entry(config_panel, "行", rows_var, 6, 0, 4)
+        self._labeled_entry(config_panel, "格mm", square_var, 8, 0, 6)
+        self._labeled_entry(config_panel, "码mm", marker_var, 8, 1, 0)
+        self._labeled_entry(config_panel, "最少组", min_pairs_var, 8, 1, 2)
+        ttk.Label(config_panel, text="字典", style="Panel.TLabel").grid(row=1, column=4, padx=(4, 1), pady=1, sticky="e")
+        ttk.Entry(config_panel, textvariable=dictionary_var, width=18).grid(row=1, column=5, columnspan=3, padx=(0, 2), pady=1, sticky="ew")
+
+        buttons = ttk.Frame(container, style="Panel.TFrame")
+        buttons.pack(side=BOTTOM, fill=X, pady=(12, 0))
+        capture_button = ttk.Button(buttons, text="采集当前位置", style="Accent.TButton")
+        calibrate_button = ttk.Button(buttons, text="开始在线标定", state=DISABLED)
+        open_button = ttk.Button(buttons, text="打开目录", command=lambda: self._open_path(session_dir))
+        close_button = ttk.Button(buttons, text="关闭", command=popup.destroy)
+        capture_button.pack(side=LEFT, padx=(0, 6))
+        calibrate_button.pack(side=LEFT, padx=(0, 6))
+        open_button.pack(side=LEFT, padx=(0, 6))
+        close_button.pack(side=RIGHT)
+
+        def refresh() -> None:
+            count = len(state["captures"])
+            next_name = positions[min(count, len(positions) - 1)] if positions else "当前位置"
+            title_var.set(f"请将棋盘格/标定板移动到 {next_name} 位置")
+            status_var.set(f"已采集 {count} / {len(positions)} 组；目录：{session_dir}")
+            for idx, label in enumerate(position_labels):
+                if idx < count:
+                    label.configure(text=f"{idx + 1}. {positions[idx]}  已采集")
+                elif idx == count:
+                    label.configure(text=f"{idx + 1}. {positions[idx]}  当前")
+                else:
+                    label.configure(text=f"{idx + 1}. {positions[idx]}")
+            try:
+                min_pairs_value = int(min_pairs_var.get() or 0)
+            except ValueError:
+                min_pairs_value = len(positions)
+            calibrate_button.configure(state=NORMAL if count >= min_pairs_value and not state["running"] else DISABLED)
+
+        def capture_current() -> None:
+            if self.camera_system is None:
+                messagebox.showwarning("相机未连接", "请先连接双目相机。")
+                return
+            if self.recording or self.interval_capturing:
+                messagebox.showwarning("正在采集", "录像或定时拍照进行中，暂不能进行在线标定采集。")
+                return
+            index = len(state["captures"])
+            position = positions[index] if index < len(positions) else f"补充{index + 1}"
+            capture_button.configure(state=DISABLED)
+            self.status_var.set(f"正在采集标定样本：{position}")
+
+            def worker() -> None:
+                try:
+                    left, right, trigger_time = self._require_camera_system().capture_pair()
+                    if left is None or right is None:
+                        raise MvsError("在线标定需要左右相机同时采集到图像。")
+                    ext = image_extension(self.config)
+                    key = f"{index + 1:02d}_{safe_filename(position)}"
+                    left_path = self._save_image(left.image, left_dir / f"{key}_left.{ext}")
+                    right_path = self._save_image(right.image, right_dir / f"{key}_right.{ext}")
+                    capture = {
+                        "index": index + 1,
+                        "position": position,
+                        "trigger_time": trigger_time,
+                        "left": str(left_path),
+                        "right": str(right_path),
+                        "left_frame": self._frame_meta(left),
+                        "right_frame": self._frame_meta(right),
+                    }
+                    state["captures"].append(capture)
+                    self._write_calibration_wizard_manifest(state)
+                    self.ui_queue.put(("calibration_wizard_capture_done", (refresh, capture_button, position)))
+                except Exception as exc:
+                    self.ui_queue.put(("error", exc))
+                    self.ui_queue.put(("calibration_wizard_capture_idle", capture_button))
+
+            self._start_background_thread(worker, "calibration-capture")
+
+        def run_calibration() -> None:
+            if state["running"]:
+                return
+            try:
+                updated_settings = {
+                    "pattern": pattern_var.get().strip(),
+                    "columns": int(columns_var.get()),
+                    "rows": int(rows_var.get()),
+                    "square_size_mm": float(square_var.get()),
+                    "marker_size_mm": float(marker_var.get() or 0.0),
+                    "aruco_dictionary": dictionary_var.get().strip() or "DICT_5X5_1000",
+                    "min_pairs": int(min_pairs_var.get()),
+                }
+                if updated_settings["columns"] <= 0 or updated_settings["rows"] <= 0 or updated_settings["square_size_mm"] <= 0:
+                    raise ValueError("标定板列、行、格尺寸必须大于 0。")
+                if len(state["captures"]) < updated_settings["min_pairs"]:
+                    raise ValueError("有效采集组数少于最少组数。")
+            except ValueError as exc:
+                messagebox.showerror("标定参数错误", str(exc))
+                return
+            state["settings"].update(updated_settings)
+            wizard_cfg = self._ensure_config_section("calibration_wizard")
+            wizard_cfg.update(updated_settings)
+            save_config(self.config)
+            state["running"] = True
+            capture_button.configure(state=DISABLED)
+            calibrate_button.configure(state=DISABLED)
+            result_var.set("正在后台标定，请稍候...")
+            self.status_var.set("正在执行在线标定...")
+
+            def worker() -> None:
+                try:
+                    result, export_info = self._run_online_calibration_from_wizard(state)
+                    self.ui_queue.put(("calibration_wizard_done", (result, export_info, result_var, capture_button, calibrate_button, refresh)))
+                except Exception as exc:
+                    self.ui_queue.put(("error", exc))
+                    self.ui_queue.put(("calibration_wizard_failed", (result_var, capture_button, calibrate_button, refresh)))
+
+            self._start_background_thread(worker, "calibration-run")
+
+        capture_button.configure(command=capture_current)
+        calibrate_button.configure(command=run_calibration)
+        refresh()
+        popup.update_idletasks()
+        width = max(760, container.winfo_reqwidth() + 32)
+        height = max(500, container.winfo_reqheight() + 36)
+        popup.geometry(f"{width}x{height}+{self.root.winfo_rootx() + 140}+{self.root.winfo_rooty() + 96}")
+
+    def _write_calibration_wizard_manifest(self, state: dict[str, object]) -> None:
+        session_dir = Path(str(state["session_dir"]))
+        payload = {
+            "mode": "calibration_wizard_capture",
+            "created_at": time.strftime("%Y-%m-%dT%H:%M:%S%z"),
+            "settings": state.get("settings", {}),
+            "positions": state.get("positions", []),
+            "captures": state.get("captures", []),
+        }
+        with (session_dir / "calibration_capture_meta.json").open("w", encoding="utf-8") as fh:
+            json.dump(payload, fh, ensure_ascii=False, indent=2, default=json_metadata_default)
+            fh.write("\n")
+
+    def _import_biaoding_api(self):
+        if not BIAODING_DIR.exists():
+            raise RuntimeError(f"标定程序目录不存在：{BIAODING_DIR}")
+        biaoding_path = str(BIAODING_DIR)
+        if biaoding_path not in sys.path:
+            sys.path.insert(0, biaoding_path)
+        elif sys.path[0] != biaoding_path:
+            sys.path.remove(biaoding_path)
+            sys.path.insert(0, biaoding_path)
+        try:
+            from calibration import calibrate_stereo_from_folders
+            from biaoding_app import export_capture_calibration
+        except Exception as exc:
+            raise RuntimeError(f"无法加载标定程序接口：{exc}") from exc
+        return calibrate_stereo_from_folders, export_capture_calibration
+
+    def _run_online_calibration_from_wizard(self, state: dict[str, object]) -> tuple[dict[str, object], dict[str, object]]:
+        calibrate_stereo_from_folders, export_capture_calibration = self._import_biaoding_api()
+        session_dir = Path(str(state["session_dir"]))
+        left_dir = Path(str(state["left_dir"]))
+        right_dir = Path(str(state["right_dir"]))
+        settings = state.get("settings", {})
+        if not isinstance(settings, dict):
+            raise RuntimeError("标定向导设置不可用。")
+        output_dir = session_dir / "result"
+        marker_value = settings.get("marker_size_mm")
+        try:
+            marker_size = float(marker_value) if marker_value not in (None, "") else None
+        except (TypeError, ValueError):
+            marker_size = None
+        if marker_size is not None and marker_size <= 0:
+            marker_size = None
+        result = calibrate_stereo_from_folders(
+            left_dir,
+            right_dir,
+            output_dir,
+            pattern=str(settings.get("pattern", "chessboard")),
+            columns=int(settings.get("columns", 9) or 9),
+            rows=int(settings.get("rows", 6) or 6),
+            square_size_mm=float(settings.get("square_size_mm", 40.0) or 40.0),
+            marker_size_mm=marker_size,
+            aruco_dictionary=str(settings.get("aruco_dictionary", "DICT_5X5_1000")),
+            min_pairs=int(settings.get("min_pairs", 6) or 6),
+            auto_resize_mismatched=False,
+        )
+        export_info = export_capture_calibration(
+            result,
+            BASE_DIR / "calib",
+            capture_app_dir=BASE_DIR,
+            update_capture_config=True,
+        )
+        calibration_cfg = self._ensure_config_section("calibration")
+        calibration_cfg.update(
+            {
+                "enabled": True,
+                "left_intrinsics": "calib/left.yaml",
+                "right_intrinsics": "calib/right.yaml",
+                "stereo_params": "calib/stereo.yaml",
+            }
+        )
+        save_config(self.config)
+        self.project_manager.register_session(
+            "calibration",
+            session_dir,
+            output_dir / "calibration_result.json",
+            {"export": export_info},
+        )
+        return result, export_info
+
+    def _open_path(self, path: Path) -> None:
+        try:
+            if sys.platform == "win32":
+                os.startfile(str(path))  # type: ignore[attr-defined]
+            else:
+                subprocess.Popen(["xdg-open", str(path)])
+        except Exception as exc:
+            self.status_var.set(f"无法打开：{path}；{exc}")
+
     def toggle_fullscreen(self) -> None:
         current = bool(self.root.attributes("-fullscreen"))
         self.root.attributes("-fullscreen", not current)
@@ -2406,7 +2861,7 @@ class StereoCaptureOnlyApp:
             zebra_enabled=self.zebra_var.get(),
             guide_mode=guide_mode,
             focus_roi_frac=focus_roi,
-            magnifier_rect_frac=None,
+            magnifier_rect_frac=self._magnifier_roi_frac if self.magnifier_enabled_var.get() else None,
         )
         mode = self.stereo_preview_mode_var.get()
         if mode == "红蓝立体" and left is not None and right is not None:
@@ -2461,11 +2916,16 @@ class StereoCaptureOnlyApp:
         return image
 
     def _ensure_preview_thread_after_recording(self) -> None:
-        if self.camera_system is None or not self.previewing or self.recording or self.interval_capturing:
+        if self.camera_system is None or self.recording or self.interval_capturing:
+            return
+        if not (self.previewing or self._resume_preview_after_recording):
             return
         if not self.camera_system.has_ready_camera():
             self.status_var.set("录像结束后未重启预览：相机连接不可用，请重新连接相机。")
             return
+        self._resume_preview_after_recording = False
+        self.previewing = True
+        self.preview_button.configure(text="停止采集")
         self._reset_stats()
         self._start_preview_thread()
 
@@ -2496,7 +2956,7 @@ class StereoCaptureOnlyApp:
             except Exception as exc:
                 self.ui_queue.put(("error", exc))
 
-        threading.Thread(target=worker, daemon=True).start()
+        self._start_background_thread(worker, "refresh-devices")
 
     def connect_cameras(self) -> None:
         try:
@@ -2521,7 +2981,7 @@ class StereoCaptureOnlyApp:
                 self.ui_queue.put(("error", exc))
                 self.ui_queue.put(("connect_failed", None))
 
-        threading.Thread(target=worker, daemon=True).start()
+        self._start_background_thread(worker, "connect-cameras")
 
     def toggle_preview(self) -> None:
         if self.previewing:
@@ -2559,6 +3019,7 @@ class StereoCaptureOnlyApp:
     def _preview_loop(self, generation: int, config_snapshot: dict) -> None:
         fps = max(float(config_snapshot.get("preview_fps", 15.0)), 0.1)
         interval = 1.0 / fps
+        timeout_ms = self._preview_capture_timeout_ms(config_snapshot)
         next_time = time.perf_counter()
         had_error = False
         consecutive_timeouts = 0
@@ -2566,9 +3027,10 @@ class StereoCaptureOnlyApp:
         try:
             while self.previewing and not self.recording and not self.interval_capturing:
                 try:
-                    left, right, _trigger_time = self._require_camera_system().capture_pair()
+                    left, right, _trigger_time = self._require_camera_system().capture_pair(timeout_ms=timeout_ms)
                 except FrameTimeoutError as exc:
                     consecutive_timeouts += 1
+                    self.ui_queue.put(("preview_stats_reset", None))
                     self._handle_capture_exception(exc, "preview", consecutive_timeouts)
                     now = time.perf_counter()
                     if now - self._last_preview_status_time >= 1.0:
@@ -2586,8 +3048,9 @@ class StereoCaptureOnlyApp:
                 if self.previewing:
                     self._preview_frame_counter += 1
                     self._poll_camera_temperatures()
-                    analysis = self._analyze_preview_frames(left, right, self._preview_frame_counter)
-                    self.ui_queue.put(("quality_metrics", analysis))
+                    if self._should_analyze_preview_frame(self._preview_frame_counter, config_snapshot):
+                        analysis = self._analyze_preview_frames(left, right, self._preview_frame_counter)
+                        self.ui_queue.put(("quality_metrics", analysis))
                     self.ui_queue.put(("frames", (left, right)))
                 now = time.perf_counter()
                 if now - self._last_preview_status_time >= 1.0:
@@ -2606,6 +3069,29 @@ class StereoCaptureOnlyApp:
             self.ui_queue.put(("error", exc))
         finally:
             self.ui_queue.put(("preview_done", (had_error, generation)))
+
+    def _preview_capture_timeout_ms(self, config_snapshot: dict | None = None) -> int:
+        config_snapshot = config_snapshot or self._config_snapshot()
+        frame_timeout_ms = max(config_int(config_snapshot, "frame_timeout_ms", 3000), 1)
+        default_timeout_ms = min(frame_timeout_ms, 500)
+        preview_timeout_ms = max(config_int(config_snapshot, "preview_frame_timeout_ms", default_timeout_ms), 1)
+        return min(preview_timeout_ms, frame_timeout_ms)
+
+    def _should_analyze_preview_frame(self, frame_index: int, config_snapshot: dict | None = None) -> bool:
+        config_snapshot = config_snapshot or self._config_snapshot()
+        zebra_enabled = bool(self.zebra_var.get()) if hasattr(self, "zebra_var") else False
+        analysis_required = (
+            config_bool(config_snapshot, "preview_quality_analysis_enabled", True, True)
+            or bool(getattr(self, "_histogram_enabled_setting", False))
+            or bool(getattr(self, "_focus_peaking_enabled_setting", False))
+            or zebra_enabled
+        )
+        if not analysis_required:
+            return False
+        fps = max(config_float(config_snapshot, "preview_fps", 15.0), 0.1)
+        analysis_fps = max(config_float(config_snapshot, "preview_analysis_fps", 1.0), 0.1)
+        every_n = max(int(round(fps / analysis_fps)), 1)
+        return frame_index <= 1 or frame_index % every_n == 0
 
     def capture_photo(self) -> None:
         if self.camera_system is None or self.interval_capturing:
@@ -2640,13 +3126,13 @@ class StereoCaptureOnlyApp:
                         quality_report=quality_report,
                     )
                     self.ui_queue.put(("shutter_flash", None))
-                    self.ui_queue.put(("photo_done", photo_dir))
+                    self.ui_queue.put(("photo_done", ("photo", photo_dir)))
                 except Exception as exc:
                     self.ui_queue.put(("error", exc))
                 finally:
                     self.ui_queue.put(("capture_idle", None))
 
-            threading.Thread(target=record_snapshot_worker, daemon=True).start()
+            self._start_background_thread(record_snapshot_worker, "record-snapshot")
             return
 
         if not self.previewing:
@@ -2669,7 +3155,7 @@ class StereoCaptureOnlyApp:
                     self.ui_queue.put(("error", exc))
                     self.ui_queue.put(("capture_idle", None))
 
-            threading.Thread(target=precheck_worker, daemon=True).start()
+            self._start_background_thread(precheck_worker, "photo-precheck")
             return
 
         allow_capture, quality_report = self._capture_quality_gate_allows(metrics)
@@ -2689,13 +3175,13 @@ class StereoCaptureOnlyApp:
                 if self.previewing:
                     self.ui_queue.put(("frames", (left, right)))
                 self.ui_queue.put(("shutter_flash", None))
-                self.ui_queue.put(("photo_done", photo_dir))
+                self.ui_queue.put(("photo_done", ("photo", photo_dir)))
             except Exception as exc:
                 self.ui_queue.put(("error", exc))
             finally:
                 self.ui_queue.put(("capture_idle", None))
 
-        threading.Thread(target=worker, daemon=True).start()
+        self._start_background_thread(worker, "capture-photo")
 
     def capture_hdr_bracket(self) -> None:
         if self.camera_system is None or self.recording or self.interval_capturing:
@@ -2740,7 +3226,7 @@ class StereoCaptureOnlyApp:
                         self.ui_queue.put(("frames", (left, right)))
                 group_dir = self._save_hdr_bracket(captures, original_exposure)
                 self.ui_queue.put(("shutter_flash", None))
-                self.ui_queue.put(("photo_done", group_dir))
+                self.ui_queue.put(("photo_done", ("hdr", group_dir)))
             except Exception as exc:
                 self.ui_queue.put(("error", exc))
             finally:
@@ -2755,7 +3241,7 @@ class StereoCaptureOnlyApp:
                     LOGGER.info("failed to restore exposure after HDR bracket: %s", exc)
                 self.ui_queue.put(("capture_idle", None))
 
-        threading.Thread(target=worker, daemon=True).start()
+        self._start_background_thread(worker, "hdr-bracket")
 
     def _parse_hdr_ev_offsets(self) -> list[float]:
         raw = self.hdr_sequence_var.get().replace(";", ",").split(",")
@@ -2783,14 +3269,18 @@ class StereoCaptureOnlyApp:
         capture_id = timestamp_ms()
         group_dir = self.project_manager.output_root_for_mode("photos") / f"{capture_id}_hdr"
         group_dir.mkdir(parents=True, exist_ok=True)
+        left_dir = group_dir / "left"
+        right_dir = group_dir / "right"
+        left_dir.mkdir(parents=True, exist_ok=True)
+        right_dir.mkdir(parents=True, exist_ok=True)
         ext = image_extension(self.config)
         bracket_meta: list[dict[str, object]] = []
         for index, item in enumerate(captures, start=1):
             ev = float(item["ev_offset"])
             left = item.get("left")
             right = item.get("right")
-            left_path = group_dir / f"ev_{ev:+.1f}_left.{ext}"
-            right_path = group_dir / f"ev_{ev:+.1f}_right.{ext}"
+            left_path = left_dir / f"ev_{ev:+.1f}_left.{ext}"
+            right_path = right_dir / f"ev_{ev:+.1f}_right.{ext}"
             if isinstance(left, CameraFrame):
                 left_path = self._save_image(left.image, left_path)
             if isinstance(right, CameraFrame):
@@ -2963,12 +3453,34 @@ class StereoCaptureOnlyApp:
         except ValueError:
             self.status_var.set("录像前请先检查相机参数：曝光、增益、ROI 必须为数字。")
             return
-        config_snapshot = self._update_config(record_updates)
+        config_snapshot = self._capture_priority_record_config({**self._config_snapshot(), **record_updates})
+        persisted_updates = {key: config_snapshot[key] for key in config_snapshot if key in record_updates}
+        persisted_updates.update(
+            {
+                key: config_snapshot[key]
+                for key in (
+                    "record_save_image_sequence",
+                    "auto_make_mp4",
+                    "record_realtime_mp4",
+                    "record_preview_during_capture",
+                    "record_clone_frames_for_writer",
+                    "record_checksum_during_capture",
+                    "record_queue_max_items",
+                    "preview_quality_analysis_enabled",
+                    "image_format",
+                )
+                if key in config_snapshot
+            }
+        )
+        config_snapshot = self._update_config(persisted_updates)
         if not self._check_disk_space_for_recording(config_snapshot):
             return
         self._reset_stats()
-        display_enabled = self.previewing
-        if display_enabled:
+        display_enabled = self.previewing and config_bool(
+            config_snapshot, "record_preview_during_capture", False, False
+        )
+        self._resume_preview_after_recording = self.previewing and not display_enabled
+        if self.previewing:
             self.previewing = False
             if self.preview_thread and self.preview_thread.is_alive():
                 self.preview_thread.join(timeout=3)
@@ -2977,7 +3489,6 @@ class StereoCaptureOnlyApp:
         record_started_at = time.perf_counter()
         self._reset_record_stats(record_started_at)
         self._reset_record_write_state()
-        self._record_disk_benchmark = None
         self._record_last_disk_check = 0.0
         self._record_disk_usage_start = self._disk_used_bytes(resolve_output_root(self.config))
         with self._record_last_frame_lock:
@@ -3004,7 +3515,7 @@ class StereoCaptureOnlyApp:
 
     def _require_camera_system(self) -> StereoCameraSystem:
         if self.camera_system is None:
-            raise RuntimeError("camera system is not initialized")
+            raise MvsError("camera system is not initialized")
         return self.camera_system
 
     def _require_record_dir(self) -> Path:
@@ -3027,16 +3538,34 @@ class StereoCaptureOnlyApp:
         return cv2.cvtColor(rgb, cv2.COLOR_RGB2BGR)
 
     def _record_loop_v2(self, config_snapshot: dict) -> None:
+        config_snapshot = self._capture_priority_record_config(config_snapshot)
         self._require_camera_system()
         record_dir = self._require_record_dir()
         fps = max(float(config_snapshot.get("record_fps", 5.0)), 0.1)
         interval = 1.0 / fps
         ext = image_extension(config_snapshot)
-        for side in ("left", "right"):
-            (record_dir / self._record_segment_dir(side, 1)).mkdir(parents=True, exist_ok=True)
+        save_image_sequence = config_bool(config_snapshot, "record_save_image_sequence", False, False)
+        auto_make_mp4 = config_bool(config_snapshot, "auto_make_mp4", True, True)
+        realtime_mp4_enabled = config_bool(
+            config_snapshot,
+            "record_realtime_mp4",
+            not save_image_sequence,
+            not save_image_sequence,
+        )
+        if not save_image_sequence and not auto_make_mp4:
+            LOGGER.warning("Recording has no enabled output; forcing realtime MP4 output.")
+            auto_make_mp4 = True
+            realtime_mp4_enabled = True
+        elif not save_image_sequence and auto_make_mp4 and not realtime_mp4_enabled:
+            LOGGER.warning("Realtime MP4 is required when image sequence output is disabled; enabling it.")
+            realtime_mp4_enabled = True
+        if save_image_sequence:
+            for side in ("left", "right"):
+                (record_dir / self._record_segment_dir(side, 1)).mkdir(parents=True, exist_ok=True)
 
-        image_queue: Queue[dict | None] = Queue(maxsize=max(8, int(fps * 4)))
-        video_queue: Queue[dict | None] = Queue(maxsize=max(8, int(fps * 4)))
+        queue_size = max(config_int(config_snapshot, "record_queue_max_items", max(8, int(fps * 2))), 1)
+        image_queue: Queue[dict | None] | None = Queue(maxsize=queue_size) if save_image_sequence else None
+        video_queue: Queue[dict | None] | None = Queue(maxsize=queue_size) if auto_make_mp4 and realtime_mp4_enabled else None
         meta_writer = RecordMetaWriter(record_dir / "frames.meta.json", config_int(config_snapshot, "record_meta_flush_every", 32))
         writer_errors: list[Exception] = []
         writer_errors_lock = threading.Lock()
@@ -3044,25 +3573,36 @@ class StereoCaptureOnlyApp:
         next_time = time.perf_counter()
         last_status_time = 0.0
         max_seconds = max(config_float(config_snapshot, "record_max_seconds", 0.0), 0.0)
-        auto_make_mp4 = config_bool(config_snapshot, "auto_make_mp4", True, True)
-        make_mp4_after = auto_make_mp4 and shutil.which("ffmpeg") is not None
-        use_realtime_mp4 = auto_make_mp4 and not make_mp4_after
+        make_mp4_after = auto_make_mp4 and save_image_sequence
+        use_realtime_mp4 = auto_make_mp4 and realtime_mp4_enabled and not make_mp4_after
         mp4_generation = "ffmpeg_after_recording" if make_mp4_after else "opencv_realtime" if use_realtime_mp4 else "disabled"
         if not auto_make_mp4:
             LOGGER.info("MP4 generation disabled by auto_make_mp4=false; recording %s sequence only.", ext.upper())
 
-        workers = [
-            threading.Thread(
-                target=self._record_image_writer_loop,
-                args=(image_queue, meta_writer, interval, ext, writer_errors, writer_errors_lock, config_snapshot),
-                daemon=True,
+        workers: list[threading.Thread] = []
+        if save_image_sequence and image_queue is not None:
+            workers.append(
+                threading.Thread(
+                    target=self._record_image_writer_loop,
+                    args=(image_queue, meta_writer, interval, ext, writer_errors, writer_errors_lock, config_snapshot),
+                    daemon=True,
+                )
             )
-        ]
-        if use_realtime_mp4:
+        if use_realtime_mp4 and video_queue is not None:
             workers.append(
                 threading.Thread(
                     target=self._record_video_writer_loop,
-                    args=(video_queue, fps, video_outputs, writer_errors, writer_errors_lock, config_snapshot),
+                    args=(
+                        video_queue,
+                        meta_writer,
+                        fps,
+                        interval,
+                        video_outputs,
+                        writer_errors,
+                        writer_errors_lock,
+                        config_snapshot,
+                        not save_image_sequence,
+                    ),
                     daemon=True,
                 )
             )
@@ -3094,6 +3634,7 @@ class StereoCaptureOnlyApp:
                     raise
                 self._reset_record_timeouts()
                 record_count = self._increment_record_count()
+                self._record_capture_observed(record_count, trigger_time)
                 with self._record_last_frame_lock:
                     self._record_last_frame_pair = (left, right, trigger_time)
 
@@ -3107,19 +3648,29 @@ class StereoCaptureOnlyApp:
                         "left": left,
                         "right": right,
                     }
-                    self._put_record_item(image_queue, item)
-                    if use_realtime_mp4:
-                        self._put_record_item(video_queue, item)
+                    queued = False
+                    if save_image_sequence and image_queue is not None:
+                        clone_frames = config_bool(config_snapshot, "record_clone_frames_for_writer", False, False)
+                        queued = self._put_record_item(image_queue, item, clone_frames=clone_frames) or queued
+                    if use_realtime_mp4 and video_queue is not None:
+                        queued = self._put_record_item(video_queue, item, clone_frames=False) or queued
+                    if make_mp4_after and not queued:
+                        self._record_skipped("record_output_queue_unavailable", record_count)
                 else:
                     self._record_skipped("write_skip_strategy", record_count)
 
                 if self.previewing:
                     self._preview_frame_counter += 1
-                    analysis = self._analyze_preview_frames(left, right, self._preview_frame_counter)
-                    self.ui_queue.put(("quality_metrics", analysis))
-                    self.ui_queue.put(("frames", (left, right)))
+                    record_preview_fps = max(config_float(config_snapshot, "record_preview_fps", 2.0), 0.1)
+                    display_every_n = max(int(round(fps / record_preview_fps)), 1)
+                    display_this_frame = self._preview_frame_counter % display_every_n == 0
+                    if display_this_frame and self._should_analyze_preview_frame(self._preview_frame_counter, config_snapshot):
+                        analysis = self._analyze_preview_frames(left, right, self._preview_frame_counter)
+                        self.ui_queue.put(("quality_metrics", analysis))
+                    if display_this_frame:
+                        self.ui_queue.put(("frames", (left, right)))
                 else:
-                    self.ui_queue.put(("record_stats", (left, right)))
+                    self._update_stats(left, right)
 
                 now = time.perf_counter()
                 if now - last_status_time >= 0.5:
@@ -3146,8 +3697,10 @@ class StereoCaptureOnlyApp:
             self.ui_queue.put(("error", exc))
         finally:
             self.recording = False
-            queues: list[Queue] = [image_queue]
-            if use_realtime_mp4:
+            queues: list[Queue] = []
+            if image_queue is not None:
+                queues.append(image_queue)
+            if video_queue is not None:
                 queues.append(video_queue)
             self._stop_record_workers(tuple(queues), workers, config_snapshot)
             meta_writer.close()
@@ -3165,6 +3718,8 @@ class StereoCaptureOnlyApp:
                 config_snapshot,
             )
             summary = self._build_record_summary(record_dir, fps, output_fps, frames_snapshot)
+            reports = self._write_record_reports(record_dir, summary, frames_snapshot, config_snapshot)
+            summary["record_reports"] = reports
             write_lag, _write_warning, skip_every_n, skip_keep_frames = self._record_write_state_snapshot()
             stats = self._record_stats_snapshot()
             camera_system = self.camera_system
@@ -3182,13 +3737,14 @@ class StereoCaptureOnlyApp:
                 "reconnect_count": stats["reconnect_count"],
                 "disk_warning_count": stats["disk_warning_count"],
                 "image_format": ext,
+                "record_save_image_sequence": save_image_sequence,
                 "video_format": "mp4" if auto_make_mp4 else None,
                 "video_codec": config_snapshot.get("video_codec", "mp4v"),
                 "video_bitrate_kbps": config_int(config_snapshot, "video_bitrate_kbps", 8000),
                 "video_quality_crf": config_int(config_snapshot, "video_quality_crf", 23),
                 "video_preset": config_snapshot.get("video_preset", "medium"),
                 "use_nvenc": config_bool(config_snapshot, "use_nvenc", False, False),
-                "auto_make_mp4": config_bool(config_snapshot, "auto_make_mp4", True, True),
+                "auto_make_mp4": auto_make_mp4,
                 "mp4_generation": mp4_generation,
                 "record_split_interval_seconds": config_float(config_snapshot, "record_split_interval_seconds", 600.0),
                 "record_split_size_gb": config_float(config_snapshot, "record_split_size_gb", 4.0),
@@ -3212,6 +3768,7 @@ class StereoCaptureOnlyApp:
                     "manifest_csv": str(record_dir / "exports" / "file_manifest.csv"),
                     "summary_json": str(record_dir / "exports" / "capture_summary.json"),
                 },
+                "record_reports": reports,
                 "frames": frames_snapshot,
                 "summary": summary,
             }
@@ -3243,11 +3800,15 @@ class StereoCaptureOnlyApp:
             self.record_saved_count = 0
             self._record_next_saved_index = 0
             self.record_started_at = started_at
+            self.record_started_wall_time = time.time()
             self.record_stop_reason = "manual"
             self._record_split_index = 1
             self._record_segment_start_time = started_at
             self._record_segment_start_saved = 0
             self._record_segment_sizes = {}
+            self._record_video_segment_sizes = {}
+            self._record_first_trigger_time = None
+            self._record_second_stats = {}
             self._record_skipped_frames = []
             self._record_skipped_count = 0
             self._record_skip_reasons = {}
@@ -3271,6 +3832,14 @@ class StereoCaptureOnlyApp:
                 "reconnect_count": self._record_reconnect_count,
                 "disk_warning_count": self._record_disk_warning_count,
                 "record_started_at": self.record_started_at,
+                "record_started_wall_time": self.record_started_wall_time,
+                "per_second": [
+                    {
+                        **{key: val for key, val in value.items() if key != "drop_reasons"},
+                        "drop_reasons": dict(value.get("drop_reasons", {})),
+                    }
+                    for _key, value in sorted(self._record_second_stats.items())
+                ],
                 "stop_reason": self.record_stop_reason,
             }
 
@@ -3283,6 +3852,74 @@ class StereoCaptureOnlyApp:
             self.record_count += 1
             return self.record_count
 
+    def _record_second_index_locked(self, trigger_time: object | None = None) -> int:
+        if trigger_time not in (None, ""):
+            try:
+                value = float(trigger_time)
+            except (TypeError, ValueError):
+                value = None
+            if value is not None:
+                if self._record_first_trigger_time is None:
+                    self._record_first_trigger_time = value
+                return int(max(value - self._record_first_trigger_time, 0.0))
+        if self.record_started_at is None:
+            return 0
+        return int(max(time.perf_counter() - self.record_started_at, 0.0))
+
+    def _record_second_bucket_locked(self, second: int) -> dict[str, object]:
+        bucket = self._record_second_stats.get(second)
+        if bucket is None:
+            bucket = {
+                "second": int(second),
+                "captured_frames": 0,
+                "saved_frames": 0,
+                "skipped_frames": 0,
+                "timeout_count": 0,
+                "error_count": 0,
+                "first_frame_index": None,
+                "last_frame_index": None,
+                "first_saved_index": None,
+                "last_saved_index": None,
+                "saved_bytes": 0,
+                "write_seconds_total": 0.0,
+                "write_samples": 0,
+                "drop_reasons": {},
+            }
+            self._record_second_stats[second] = bucket
+        return bucket
+
+    def _record_capture_observed(self, frame_index: int, trigger_time: object | None) -> None:
+        with self._record_stats_lock:
+            second = self._record_second_index_locked(trigger_time)
+            bucket = self._record_second_bucket_locked(second)
+            bucket["captured_frames"] = int(bucket.get("captured_frames", 0) or 0) + 1
+            if bucket.get("first_frame_index") is None:
+                bucket["first_frame_index"] = int(frame_index)
+            bucket["last_frame_index"] = int(frame_index)
+
+    def _record_save_observed(
+        self,
+        saved_index: int,
+        frame_index: int | None,
+        trigger_time: object | None,
+        bytes_written: int,
+        write_seconds: float,
+    ) -> None:
+        with self._record_stats_lock:
+            second = self._record_second_index_locked(trigger_time)
+            bucket = self._record_second_bucket_locked(second)
+            bucket["saved_frames"] = int(bucket.get("saved_frames", 0) or 0) + 1
+            if bucket.get("first_saved_index") is None:
+                bucket["first_saved_index"] = int(saved_index)
+            bucket["last_saved_index"] = int(saved_index)
+            bucket["saved_bytes"] = int(bucket.get("saved_bytes", 0) or 0) + max(int(bytes_written), 0)
+            bucket["write_seconds_total"] = float(bucket.get("write_seconds_total", 0.0) or 0.0) + max(
+                float(write_seconds), 0.0
+            )
+            bucket["write_samples"] = int(bucket.get("write_samples", 0) or 0) + 1
+            if frame_index is not None and bucket.get("last_frame_index") is None:
+                bucket["last_frame_index"] = int(frame_index)
+
     def _next_saved_frame_index(self) -> tuple[int, int]:
         with self._record_stats_lock:
             self._record_next_saved_index += 1
@@ -3292,6 +3929,11 @@ class StereoCaptureOnlyApp:
         with self._record_stats_lock:
             self._record_timeout_count += 1
             self._record_consecutive_timeouts += 1
+            bucket = self._record_second_bucket_locked(self._record_second_index_locked())
+            bucket["timeout_count"] = int(bucket.get("timeout_count", 0) or 0) + 1
+            reasons = bucket.setdefault("drop_reasons", {})
+            if isinstance(reasons, dict):
+                reasons["timeout"] = int(reasons.get("timeout", 0) or 0) + 1
             return self._record_consecutive_timeouts
 
     def _reset_record_timeouts(self) -> None:
@@ -3303,6 +3945,11 @@ class StereoCaptureOnlyApp:
             return
         with self._record_stats_lock:
             self._record_error_count += count
+            bucket = self._record_second_bucket_locked(self._record_second_index_locked())
+            bucket["error_count"] = int(bucket.get("error_count", 0) or 0) + count
+            reasons = bucket.setdefault("drop_reasons", {})
+            if isinstance(reasons, dict):
+                reasons["error"] = int(reasons.get("error", 0) or 0) + count
 
     def _add_record_reconnect(self) -> None:
         with self._record_stats_lock:
@@ -3320,10 +3967,63 @@ class StereoCaptureOnlyApp:
         with self._record_stats_lock:
             return self.record_started_at
 
-    def _mark_record_saved(self, saved_index: int, segment_index: int, bytes_written: int) -> None:
+    def _mark_record_saved(
+        self,
+        saved_index: int,
+        segment_index: int,
+        bytes_written: int,
+        frame_index: int | None = None,
+        trigger_time: object | None = None,
+        write_seconds: float = 0.0,
+    ) -> None:
         with self._record_stats_lock:
             self.record_saved_count = max(self.record_saved_count, saved_index)
             self._record_segment_sizes[segment_index] = self._record_segment_sizes.get(segment_index, 0) + bytes_written
+        self._record_save_observed(saved_index, frame_index, trigger_time, bytes_written, write_seconds)
+
+    def _mark_record_video_saved(
+        self,
+        saved_index: int,
+        segment_index: int,
+        segment_bytes: int,
+        frame_index: int | None = None,
+        trigger_time: object | None = None,
+        write_seconds: float = 0.0,
+    ) -> None:
+        with self._record_stats_lock:
+            previous = self._record_video_segment_sizes.get(segment_index, 0)
+            current = max(int(segment_bytes), previous)
+            delta_bytes = max(current - previous, 0)
+            self._record_video_segment_sizes[segment_index] = current
+            self._record_segment_sizes[segment_index] = current
+            self.record_saved_count = max(self.record_saved_count, saved_index)
+        self._record_save_observed(saved_index, frame_index, trigger_time, delta_bytes, write_seconds)
+
+    def _record_video_segment_bytes(self, segment_index: int, video_outputs: dict[str, list[str]] | None = None) -> int:
+        total = 0
+        for side in ("left", "right"):
+            paths = list((video_outputs or {}).get(side, []))
+            expected = self._record_segment_video_path(side, segment_index)
+            if str(expected) not in paths:
+                paths.append(str(expected))
+            for raw_path in paths:
+                path = Path(raw_path)
+                if path.name != expected.name or not path.exists():
+                    continue
+                try:
+                    total += path.stat().st_size
+                except OSError:
+                    continue
+        return total
+
+    def _estimate_video_segment_bytes(self, saved_index: int, segment_index: int, config_snapshot: dict) -> int:
+        bitrate_kbps = max(config_int(config_snapshot, "video_bitrate_kbps", 8000), 1)
+        with self._record_stats_lock:
+            segment_first_saved = self._record_segment_start_saved + 1 if segment_index == self._record_split_index else saved_index
+        frames_in_segment = max(int(saved_index) - int(segment_first_saved) + 1, 1)
+        fps = max(config_float(config_snapshot, "record_fps", 5.0), 0.1)
+        per_side_bytes = frames_in_segment * bitrate_kbps * 1000 / 8 / fps
+        return max(int(per_side_bytes * 2), 1)
 
     def _record_segment_snapshot(self) -> tuple[int, float, int, Path | None]:
         with self._record_stats_lock:
@@ -3422,22 +4122,30 @@ class StereoCaptureOnlyApp:
                     self._record_skipped(reason, int(item.get("index", 0) or 0))
                 queue.task_done()
 
-    def _put_record_item(self, queue: Queue, item: dict) -> None:
+    def _put_record_item(self, queue: Queue, item: dict, *, clone_frames: bool = True) -> bool:
+        frame_index = int(item.get("index", 0) or 0)
+        if not self.recording:
+            self._record_skipped("recording_stopped_before_queue", frame_index)
+            return False
+        if queue.full():
+            warning = self._raise_record_write_lag(2.1, "写入队列已满，已丢弃当前录像帧以保护内存")
+            self._notify_warning("record_queue_full", warning)
+            self._record_skipped("record_queue_full", frame_index)
+            self.ui_queue.put(("record_progress", None))
+            return False
         queued = dict(item)
-        queued["left"] = self._clone_frame(item.get("left"))
-        queued["right"] = self._clone_frame(item.get("right"))
-        queued_ok = False
-        while self.recording:
-            try:
-                queue.put(queued, timeout=0.25)
-                queued_ok = True
-                return
-            except Full:
-                warning = self._raise_record_write_lag(2.1, "写入队列拥堵，正在等待磁盘")
-                self._notify_warning("record_queue_full", warning)
-                self.ui_queue.put(("record_progress", None))
-        if not queued_ok:
-            self._record_skipped("recording_stopped_before_queue", int(item.get("index", 0) or 0))
+        if clone_frames:
+            queued["left"] = self._clone_frame(item.get("left"))
+            queued["right"] = self._clone_frame(item.get("right"))
+        try:
+            queue.put_nowait(queued)
+            return True
+        except Full:
+            warning = self._raise_record_write_lag(2.1, "写入队列已满，已丢弃当前录像帧以保护内存")
+            self._notify_warning("record_queue_full", warning)
+            self._record_skipped("record_queue_full", frame_index)
+            self.ui_queue.put(("record_progress", None))
+            return False
 
     def _clone_frame(self, frame: CameraFrame | None) -> CameraFrame | None:
         if frame is None:
@@ -3516,6 +4224,7 @@ class StereoCaptureOnlyApp:
         paths: dict[str, str | None] = {"left": None, "right": None}
         checksums: dict[str, str | None] = {"left": None, "right": None}
         bytes_written = 0
+        checksum_during_capture = config_bool(config_snapshot, "record_checksum_during_capture", False, False)
         try:
             saved_index = int(item["saved_index"])
             segment_index = int(item["segment_index"])
@@ -3528,11 +4237,19 @@ class StereoCaptureOnlyApp:
                 path = self._save_image(frame.image, path, config_snapshot)
                 paths[side] = str(path)
                 bytes_written += path.stat().st_size if path.exists() else image_estimated_bytes(frame.image)
-                checksums[side] = self._file_checksum(path, config_snapshot)
+                if checksum_during_capture:
+                    checksums[side] = self._file_checksum(path, config_snapshot)
             elapsed = time.perf_counter() - started
             lag = elapsed / interval if interval > 0 else 0.0
             self._observe_record_write_lag(lag)
-            self._mark_record_saved(saved_index, segment_index, bytes_written)
+            self._mark_record_saved(
+                saved_index,
+                segment_index,
+                bytes_written,
+                frame_index=int(item.get("index", 0) or 0),
+                trigger_time=item.get("trigger_time"),
+                write_seconds=elapsed,
+            )
             self._poll_camera_temperatures()
             meta_writer.append(
                 {
@@ -3546,7 +4263,7 @@ class StereoCaptureOnlyApp:
                     "right_path": paths["right"],
                     "left_checksum": checksums["left"],
                     "right_checksum": checksums["right"],
-                    "checksum_algorithm": self._checksum_algorithm(config_snapshot),
+                    "checksum_algorithm": self._checksum_algorithm(config_snapshot) if checksum_during_capture else None,
                     "temperatures_c": dict(self._latest_temperatures),
                     "write_seconds": elapsed,
                     "write_lag": lag,
@@ -3560,11 +4277,14 @@ class StereoCaptureOnlyApp:
     def _record_video_writer_loop(
         self,
         writer_queue: Queue[dict | None],
+        meta_writer: RecordMetaWriter,
         fps: float,
+        interval: float,
         video_outputs: dict[str, list[str]],
         writer_errors: list[Exception],
         writer_errors_lock: threading.Lock,
         config_snapshot: dict,
+        write_frame_meta: bool = False,
     ) -> None:
         writers: dict[tuple[str, int], cv2.VideoWriter] = {}
         try:
@@ -3574,7 +4294,10 @@ class StereoCaptureOnlyApp:
                     writer_queue.task_done()
                     break
                 try:
+                    started = time.perf_counter()
                     segment_index = int(item["segment_index"])
+                    saved_index = int(item["saved_index"])
+                    paths: dict[str, str | None] = {"left": None, "right": None}
                     for side in ("left", "right"):
                         frame = item.get(side)
                         if frame is None:
@@ -3586,8 +4309,46 @@ class StereoCaptureOnlyApp:
                             writers[key] = writer
                             video_outputs[side].append(str(path))
                             if codec_name != str(config_snapshot.get("video_codec", "mp4v")):
-                                self._set_record_write_warning(f"编码器回退到 {codec_name}")
+                                self._set_record_write_warning(f"Video codec fallback: {codec_name}")
                         writers[key].write(self._image_to_video_frame(frame.image))
+                        paths[side] = str(self._record_segment_video_path(side, segment_index))
+                    elapsed = time.perf_counter() - started
+                    lag = elapsed / interval if interval > 0 else 0.0
+                    if write_frame_meta:
+                        bytes_written = max(
+                            self._record_video_segment_bytes(segment_index, video_outputs),
+                            self._estimate_video_segment_bytes(saved_index, segment_index, config_snapshot),
+                        )
+                        self._observe_record_write_lag(lag)
+                        self._mark_record_video_saved(
+                            saved_index,
+                            segment_index,
+                            bytes_written,
+                            frame_index=int(item.get("index", 0) or 0),
+                            trigger_time=item.get("trigger_time"),
+                            write_seconds=elapsed,
+                        )
+                        meta_writer.append(
+                            {
+                                "index": item["index"],
+                                "saved_index": saved_index,
+                                "segment_index": segment_index,
+                                "trigger_time": item["trigger_time"],
+                                "left_frame": self._frame_meta(item["left"]) if item.get("left") is not None else None,
+                                "right_frame": self._frame_meta(item["right"]) if item.get("right") is not None else None,
+                                "left_path": None,
+                                "right_path": None,
+                                "left_video_path": paths["left"],
+                                "right_video_path": paths["right"],
+                                "left_checksum": None,
+                                "right_checksum": None,
+                                "checksum_algorithm": None,
+                                "temperatures_c": dict(self._latest_temperatures),
+                                "write_seconds": elapsed,
+                                "write_lag": lag,
+                            }
+                        )
+                        self._advance_record_segment_if_needed(segment_index, config_snapshot)
                 except Exception as exc:
                     self._append_writer_error(writer_errors, writer_errors_lock, exc)
                     self.recording = False
@@ -3686,6 +4447,15 @@ class StereoCaptureOnlyApp:
         self.left_pane.flash_shutter()
         self.right_pane.flash_shutter()
 
+    def reset_photo_count(self) -> None:
+        self.photo_count = 0
+        self.photo_count_var.set("拍照次数 0")
+        self.status_var.set("同步拍照计数已复位。")
+
+    def _increment_photo_count(self) -> None:
+        self.photo_count += 1
+        self.photo_count_var.set(f"拍照次数 {self.photo_count}")
+
     def _set_recording_indicator(self, active: bool) -> None:
         self.left_pane.set_recording(active)
         self.right_pane.set_recording(active)
@@ -3721,11 +4491,12 @@ class StereoCaptureOnlyApp:
             self.focus_roi_button.configure(text="框选对焦ROI")
             self.status_var.set("对焦 ROI 框选模式已关闭。")
 
-    def set_roi_from_preview(self, roi: tuple[int, int, int, int]) -> None:
+    def set_roi_from_preview(self, roi: tuple[int, int, int, int], side: str = "left") -> None:
         if self.focus_roi_editing:
             x, y, width, height = roi
-            image_width = self._last_left_frame_obj.width if self._last_left_frame_obj is not None else CAPTURE_WIDTH
-            image_height = self._last_left_frame_obj.height if self._last_left_frame_obj is not None else CAPTURE_HEIGHT
+            source_frame = self._last_right_frame_obj if side == "right" else self._last_left_frame_obj
+            image_width = source_frame.width if source_frame is not None else CAPTURE_WIDTH
+            image_height = source_frame.height if source_frame is not None else CAPTURE_HEIGHT
             focus_roi = roi_from_pixels(x, y, width, height, image_width, image_height)
             self.config["focus_roi"] = focus_roi
             self._magnifier_roi_frac = focus_roi
@@ -3745,20 +4516,32 @@ class StereoCaptureOnlyApp:
             )
             return
         offset_x, offset_y, width, height = roi
-        self.roi_width_var.set(str(width))
-        self.roi_height_var.set(str(height))
-        self.roi_offset_x_var.set(str(offset_x))
-        self.roi_offset_y_var.set(str(offset_y))
-        self.status_var.set(f"已从预览框选 ROI：W={width}, H={height}, X={offset_x}, Y={offset_y}。")
+        side = "right" if side == "right" else "left"
+        if side == "left":
+            self.left_roi_width_var.set(str(width))
+            self.left_roi_height_var.set(str(height))
+            self.left_roi_offset_x_var.set(str(offset_x))
+            self.left_roi_offset_y_var.set(str(offset_y))
+        else:
+            self.right_roi_width_var.set(str(width))
+            self.right_roi_height_var.set(str(height))
+            self.right_roi_offset_x_var.set(str(offset_x))
+            self.right_roi_offset_y_var.set(str(offset_y))
+        label = "左" if side == "left" else "右"
+        self.status_var.set(f"已从{label}相机预览框选 ROI：W={width}, H={height}, X={offset_x}, Y={offset_y}。")
         self._set_roi_edit_mode(False)
         if self.camera_system is not None:
             self.apply_roi_settings()
 
     def reset_roi_settings(self) -> None:
-        self.roi_width_var.set(str(CAPTURE_WIDTH))
-        self.roi_height_var.set(str(CAPTURE_HEIGHT))
-        self.roi_offset_x_var.set("0")
-        self.roi_offset_y_var.set("0")
+        self.left_roi_width_var.set(str(CAPTURE_WIDTH))
+        self.left_roi_height_var.set(str(CAPTURE_HEIGHT))
+        self.left_roi_offset_x_var.set("0")
+        self.left_roi_offset_y_var.set("0")
+        self.right_roi_width_var.set(str(CAPTURE_WIDTH))
+        self.right_roi_height_var.set(str(CAPTURE_HEIGHT))
+        self.right_roi_offset_x_var.set("0")
+        self.right_roi_offset_y_var.set("0")
         self.left_pane.clear_roi_rectangle()
         self.right_pane.clear_roi_rectangle()
         self._set_roi_edit_mode(False)
@@ -3820,7 +4603,7 @@ class StereoCaptureOnlyApp:
             finally:
                 self.ui_queue.put(("param_idle", None))
 
-        threading.Thread(target=worker, daemon=True).start()
+        self._start_background_thread(worker, "apply-gain")
 
     def apply_exposure_settings(self) -> None:
         if self.camera_system is None:
@@ -3853,7 +4636,7 @@ class StereoCaptureOnlyApp:
             finally:
                 self.ui_queue.put(("param_idle", None))
 
-        threading.Thread(target=worker, daemon=True).start()
+        self._start_background_thread(worker, "apply-exposure")
 
     def apply_white_balance_settings(self) -> None:
         if self.camera_system is None:
@@ -3886,16 +4669,26 @@ class StereoCaptureOnlyApp:
             finally:
                 self.ui_queue.put(("param_idle", None))
 
-        threading.Thread(target=worker, daemon=True).start()
+        self._start_background_thread(worker, "apply-white-balance")
 
     def apply_roi_settings(self, restart_stream: bool = True) -> None:
         if self.camera_system is None:
             return
         try:
-            width = optional_int_text(self.roi_width_var.get()) or CAPTURE_WIDTH
-            height = optional_int_text(self.roi_height_var.get()) or CAPTURE_HEIGHT
-            offset_x = int(self.roi_offset_x_var.get() or 0)
-            offset_y = int(self.roi_offset_y_var.get() or 0)
+            rois = {
+                "left": (
+                    optional_int_text(self.left_roi_width_var.get()) or CAPTURE_WIDTH,
+                    optional_int_text(self.left_roi_height_var.get()) or CAPTURE_HEIGHT,
+                    int(self.left_roi_offset_x_var.get() or 0),
+                    int(self.left_roi_offset_y_var.get() or 0),
+                ),
+                "right": (
+                    optional_int_text(self.right_roi_width_var.get()) or CAPTURE_WIDTH,
+                    optional_int_text(self.right_roi_height_var.get()) or CAPTURE_HEIGHT,
+                    int(self.right_roi_offset_x_var.get() or 0),
+                    int(self.right_roi_offset_y_var.get() or 0),
+                ),
+            }
         except ValueError:
             self.status_var.set("ROI 参数必须是整数。")
             return
@@ -3904,28 +4697,36 @@ class StereoCaptureOnlyApp:
 
         def worker() -> None:
             try:
-                result = self.camera_system.apply_roi_settings(width, height, offset_x, offset_y, restart_stream=restart_stream)
-                actual_width, actual_height, actual_offset_x, actual_offset_y = result.actual_roi or (
-                    width,
-                    height,
-                    offset_x,
-                    offset_y,
-                )
+                results, warnings = self.camera_system.apply_side_roi_settings(rois, restart_stream=restart_stream)
+                actual: dict[str, tuple[int, int, int, int]] = {}
+                for side, requested in rois.items():
+                    result = results.get(side)
+                    actual[side] = result.actual_roi if result is not None and result.actual_roi else requested
+                left_width, left_height, left_offset_x, left_offset_y = actual["left"]
+                right_width, right_height, right_offset_x, right_offset_y = actual["right"]
                 self._update_config(
                     {
-                        "roi_width": actual_width,
-                        "roi_height": actual_height,
-                        "roi_offset_x": actual_offset_x,
-                        "roi_offset_y": actual_offset_y,
+                        "roi_width": left_width,
+                        "roi_height": left_height,
+                        "roi_offset_x": left_offset_x,
+                        "roi_offset_y": left_offset_y,
+                        "left_roi_width": left_width,
+                        "left_roi_height": left_height,
+                        "left_roi_offset_x": left_offset_x,
+                        "left_roi_offset_y": left_offset_y,
+                        "right_roi_width": right_width,
+                        "right_roi_height": right_height,
+                        "right_roi_offset_x": right_offset_x,
+                        "right_roi_offset_y": right_offset_y,
                     }
                 )
-                self.ui_queue.put(("roi_applied", (actual_width, actual_height, actual_offset_x, actual_offset_y, list(result))))
+                self.ui_queue.put(("roi_applied", (actual, list(warnings))))
             except Exception as exc:
                 self.ui_queue.put(("error", exc))
             finally:
                 self.ui_queue.put(("param_idle", None))
 
-        threading.Thread(target=worker, daemon=True).start()
+        self._start_background_thread(worker, "apply-roi")
 
     def apply_trigger_settings(self) -> None:
         if self.camera_system is None:
@@ -3952,14 +4753,36 @@ class StereoCaptureOnlyApp:
             finally:
                 self.ui_queue.put(("param_idle", None))
 
-        threading.Thread(target=worker, daemon=True).start()
+        self._start_background_thread(worker, "apply-trigger")
 
     def process_ui_queue(self) -> None:
         with self._ui_queue_event_lock:
             self._ui_queue_event_pending = False
+        pending_frames: object | None = None
+        pending_quality_metrics: object | None = None
+        deferred: deque[tuple[str, object]] = deque()
         try:
             while True:
                 kind, payload = self.ui_queue.get_nowait()
+                if kind == "frames":
+                    pending_frames = payload
+                    continue
+                if kind == "quality_metrics":
+                    pending_quality_metrics = payload
+                    continue
+                deferred.append((kind, payload))
+        except Empty:
+            pass
+
+        if pending_quality_metrics is not None:
+            self._apply_quality_metrics(pending_quality_metrics)
+        if pending_frames is not None:
+            left, right = pending_frames
+            self._display_frames(left, right)
+
+        try:
+            while deferred:
+                kind, payload = deferred.popleft()
                 if kind == "status":
                     self.status_var.set(str(payload))
                 elif kind == "devices_refreshed":
@@ -3980,7 +4803,7 @@ class StereoCaptureOnlyApp:
                         connected_names.append(f"右: {right_info.label}")
                     self._last_device_status = f"当前已连接 {count} 台相机：" + "；".join(connected_names)
                     self.status_var.set(
-                        f"{mode_text}连接成功。当前 ROI：{self.config.get('roi_width')}x{self.config.get('roi_height')}。"
+                        f"{mode_text}连接成功。当前 ROI：左 {self.config.get('left_roi_width', self.config.get('roi_width'))}x{self.config.get('left_roi_height', self.config.get('roi_height'))}；右 {self.config.get('right_roi_width', self.config.get('roi_width'))}x{self.config.get('right_roi_height', self.config.get('roi_height'))}。"
                     )
                     if count >= 2 and config_bool(self.config, "timestamp_reject_enabled", False, False):
                         cam_delta = int(self.config.get("max_camera_timestamp_delta", 0) or 0)
@@ -3998,11 +4821,6 @@ class StereoCaptureOnlyApp:
                     self._schedule_focus_drift_check()
                 elif kind == "connect_failed":
                     self.connect_button.configure(state=NORMAL)
-                elif kind == "frames":
-                    left, right = payload
-                    self._display_frames(left, right)
-                elif kind == "quality_metrics":
-                    self._apply_quality_metrics(payload)
                 elif kind == "temperature":
                     self._update_temperature_display(payload if isinstance(payload, dict) else {})
                 elif kind == "focus_reference_check":
@@ -4021,24 +4839,105 @@ class StereoCaptureOnlyApp:
                     left, right = payload
                     self._update_stats(left, right)
                     self._update_performance_display()
+                elif kind == "preview_stats_reset":
+                    self._reset_stats()
                 elif kind == "record_progress":
                     self._update_performance_display()
+                elif kind == "mp4_progress":
+                    if isinstance(payload, dict):
+                        percent = float(payload.get("percent", 0.0) or 0.0)
+                        message = str(payload.get("message", "MP4 --"))
+                        self._set_mp4_progress(percent, message, visible=True)
                 elif kind == "shutter_flash":
                     self._flash_shutter_feedback()
                 elif kind == "photo_done":
-                    self.status_var.set(f"拍照完成：{payload}")
-                elif kind == "roi_applied":
-                    width, height, offset_x, offset_y, warnings = payload
-                    self.roi_width_var.set(str(width))
-                    self.roi_height_var.set(str(height))
-                    self.roi_offset_x_var.set(str(offset_x))
-                    self.roi_offset_y_var.set(str(offset_y))
-                    self.status_var.set(
-                        self._format_apply_result(
-                            f"实际应用 ROI：W={width}, H={height}, X={offset_x}, Y={offset_y}",
-                            warnings,
-                        )
+                    mode, path = payload if isinstance(payload, tuple) and len(payload) == 2 else ("photo", payload)
+                    if mode == "photo":
+                        self._increment_photo_count()
+                    self.status_var.set(f"拍照完成：{path}")
+                elif kind == "calibration_wizard_capture_done":
+                    refresh, button, position = payload
+                    if callable(refresh):
+                        refresh()
+                    try:
+                        button.configure(state=NORMAL)
+                    except Exception:
+                        pass
+                    self.status_var.set(f"标定样本已采集：{position}")
+                elif kind == "calibration_wizard_capture_idle":
+                    try:
+                        payload.configure(state=NORMAL)
+                    except Exception:
+                        pass
+                elif kind == "calibration_wizard_done":
+                    result, export_info, result_var, capture_button, calibrate_button, refresh = payload
+                    self._calibration_wizard["running"] = False
+                    self.reload_calibration()
+                    stereo = result.get("stereo", {}) if isinstance(result, dict) else {}
+                    left = result.get("left", {}) if isinstance(result, dict) else {}
+                    right = result.get("right", {}) if isinstance(result, dict) else {}
+                    stereo_rms = float(stereo.get("rms_reprojection_error_px", 0.0) or 0.0) if isinstance(stereo, dict) else 0.0
+                    baseline = float(stereo.get("baseline_mm", 0.0) or 0.0) if isinstance(stereo, dict) else 0.0
+                    left_rms = float(left.get("rms_reprojection_error_px", 0.0) or 0.0) if isinstance(left, dict) else 0.0
+                    right_rms = float(right.get("rms_reprojection_error_px", 0.0) or 0.0) if isinstance(right, dict) else 0.0
+                    result_var.set(
+                        f"重投影误差：左 {left_rms:.4f}px，右 {right_rms:.4f}px，双目 {stereo_rms:.4f}px；基线 {baseline:.3f} mm"
                     )
+                    try:
+                        capture_button.configure(state=NORMAL)
+                        calibrate_button.configure(state=NORMAL)
+                    except Exception:
+                        pass
+                    if callable(refresh):
+                        refresh()
+                    self.status_var.set(f"在线标定完成，已导出到 {export_info.get('directory', BASE_DIR / 'calib')}")
+                elif kind == "calibration_wizard_failed":
+                    result_var, capture_button, calibrate_button, refresh = payload
+                    self._calibration_wizard["running"] = False
+                    result_var.set("标定失败，请查看错误信息或补采更多角度。")
+                    try:
+                        capture_button.configure(state=NORMAL)
+                        calibrate_button.configure(state=NORMAL)
+                    except Exception:
+                        pass
+                    if callable(refresh):
+                        refresh()
+                elif kind == "roi_applied":
+                    self._reset_stats()
+                    if isinstance(payload, tuple) and len(payload) == 2 and isinstance(payload[0], dict):
+                        actual, warnings = payload
+                        left = actual.get("left", (CAPTURE_WIDTH, CAPTURE_HEIGHT, 0, 0))
+                        right = actual.get("right", (CAPTURE_WIDTH, CAPTURE_HEIGHT, 0, 0))
+                        self.left_roi_width_var.set(str(left[0]))
+                        self.left_roi_height_var.set(str(left[1]))
+                        self.left_roi_offset_x_var.set(str(left[2]))
+                        self.left_roi_offset_y_var.set(str(left[3]))
+                        self.right_roi_width_var.set(str(right[0]))
+                        self.right_roi_height_var.set(str(right[1]))
+                        self.right_roi_offset_x_var.set(str(right[2]))
+                        self.right_roi_offset_y_var.set(str(right[3]))
+                        self.status_var.set(
+                            self._format_apply_result(
+                                f"实际应用 ROI：左 W={left[0]},H={left[1]},X={left[2]},Y={left[3]}；右 W={right[0]},H={right[1]},X={right[2]},Y={right[3]}",
+                                list(warnings),
+                            )
+                        )
+                    else:
+                        width, height, offset_x, offset_y, warnings = payload
+                        self.left_roi_width_var.set(str(width))
+                        self.left_roi_height_var.set(str(height))
+                        self.left_roi_offset_x_var.set(str(offset_x))
+                        self.left_roi_offset_y_var.set(str(offset_y))
+                        self.right_roi_width_var.set(str(width))
+                        self.right_roi_height_var.set(str(height))
+                        self.right_roi_offset_x_var.set(str(offset_x))
+                        self.right_roi_offset_y_var.set(str(offset_y))
+                        self.status_var.set(
+                            self._format_apply_result(
+                                f"实际应用 ROI：W={width}, H={height}, X={offset_x}, Y={offset_y}",
+                                warnings,
+                            )
+                        )
                 elif kind == "capture_idle":
                     if self.camera_system is not None and not self.interval_capturing:
                         self._set_capture_buttons(NORMAL)
@@ -4072,6 +4971,7 @@ class StereoCaptureOnlyApp:
                 elif kind == "record_done":
                     record_dir, video_names, summary = payload
                     self.recording = False
+                    self._hide_mp4_progress()
                     self.record_button.configure(text="开始录像")
                     self.preview_button.configure(text="停止采集" if self.previewing else "开始采集")
                     self._set_recording_indicator(False)
@@ -4079,7 +4979,12 @@ class StereoCaptureOnlyApp:
                     self._last_video_sides = list(video_names)
                     self._ensure_preview_thread_after_recording()
                     videos = "、".join(self._last_video_sides) if self._last_video_sides else "未生成 MP4，仅保存 BMP 序列"
-                    self.status_var.set(f"录像完成：{record_dir}，{videos}；{self._format_record_summary(summary)}")
+                    report_note = ""
+                    if isinstance(summary, dict):
+                        reports = summary.get("record_reports")
+                        if isinstance(reports, dict) and reports.get("html"):
+                            report_note = f"；报告 {Path(str(reports['html'])).name}"
+                    self.status_var.set(f"录像完成：{record_dir}，{videos}；{self._format_record_summary(summary)}{report_note}")
                 elif kind == "param_idle":
                     if self.camera_system is not None:
                         self._set_parameter_buttons(NORMAL)
@@ -4113,9 +5018,13 @@ class StereoCaptureOnlyApp:
             self.hdr_button.configure(state=DISABLED)
             self.interval_button.configure(state=DISABLED)
             self.record_button.configure(state=DISABLED)
+            self.record_preflight_button.configure(state=NORMAL)
+            self.calibration_wizard_button.configure(state=NORMAL)
             return
 
         self.connect_button.configure(state=DISABLED)
+        self.record_preflight_button.configure(state=DISABLED if self.recording or self.interval_capturing else NORMAL)
+        self.calibration_wizard_button.configure(state=DISABLED if self.recording or self.interval_capturing else NORMAL)
         if self.recording:
             self.preview_button.configure(state=state)
             self.photo_button.configure(state=state)
@@ -4147,6 +5056,24 @@ class StereoCaptureOnlyApp:
         self.apply_wb_button.configure(state=state)
         self.apply_roi_button.configure(state=state)
         self.apply_trigger_button.configure(state=state)
+
+    def _set_mp4_progress(self, percent: float, message: str, *, visible: bool = True) -> None:
+        if not hasattr(self, "mp4_progress"):
+            return
+        if visible and not self.mp4_progress.winfo_ismapped():
+            self.mp4_progress_label.pack(side=LEFT, padx=(12, 4))
+            self.mp4_progress.pack(side=LEFT, padx=(0, 4))
+        value = min(max(float(percent), 0.0), 100.0)
+        self.mp4_progress.configure(value=value)
+        self.mp4_progress_var.set(message)
+
+    def _hide_mp4_progress(self) -> None:
+        if not hasattr(self, "mp4_progress"):
+            return
+        self.mp4_progress.pack_forget()
+        self.mp4_progress_label.pack_forget()
+        self.mp4_progress.configure(value=0)
+        self.mp4_progress_var.set("MP4 --")
 
     def _ensure_quality_config_defaults(self) -> None:
         self.config.setdefault("focus_roi", dict(DEFAULT_FOCUS_ROI))
@@ -4190,6 +5117,10 @@ class StereoCaptureOnlyApp:
             "auto_reconnect_initial_delay_seconds": 1.0,
             "auto_reconnect_max_delay_seconds": 16.0,
             "consecutive_timeout_alert_threshold": 3,
+            "preview_frame_timeout_ms": 500,
+            "roi_restart_settle_seconds": 0.20,
+            "roi_warmup_frames": 2,
+            "roi_warmup_timeout_ms": 800,
             "record_checksum_algorithm": "sha256",
             "record_disk_check_interval_seconds": 10.0,
             "record_disk_warning_minutes": 2.0,
@@ -4197,13 +5128,27 @@ class StereoCaptureOnlyApp:
             "record_stop_on_low_disk": True,
             "record_writer_stop_timeout_seconds": 10.0,
             "close_thread_join_timeout_seconds": 10.0,
+            "close_total_thread_join_timeout_seconds": 10.0,
+            "software_trigger_barrier_timeout_seconds": 4.0,
+            "record_queue_max_items": 64,
+            "ffmpeg_sequence_gap_warning_threshold": 300,
             "record_writer_batch_size": 4,
             "record_meta_flush_every": 32,
+            "preview_quality_analysis_enabled": True,
+            "preview_analysis_fps": 1.0,
+            "record_capture_priority_mode": True,
+            "record_preview_during_capture": False,
+            "record_preview_fps": 2.0,
+            "record_realtime_mp4": False,
+            "record_clone_frames_for_writer": False,
+            "record_drop_frames_on_write_lag": False,
+            "record_checksum_during_capture": False,
             "focus_peaking_overlay_interval_seconds": 0.20,
             "record_disk_benchmark_enabled": True,
             "record_disk_benchmark_size_mb": 512.0,
             "record_disk_benchmark_seconds": 3.0,
             "record_disk_benchmark_margin": 1.25,
+            "record_preflight_prompt_enabled": True,
             "timestamp_reject_enabled": False,
             "max_camera_timestamp_delta": 0,
             "max_host_timestamp_delta": DEFAULT_HOST_TIMESTAMP_DELTA_NS,
@@ -4231,6 +5176,28 @@ class StereoCaptureOnlyApp:
         calibration.setdefault("stereo_params", "calib/stereo.yaml")
         calibration.setdefault("rectified_overlay_alpha", 0.5)
         calibration.setdefault("rectified_line_interval_px", 120)
+        wizard = self._ensure_config_section("calibration_wizard")
+        wizard.setdefault("pattern", "chessboard")
+        wizard.setdefault("columns", 9)
+        wizard.setdefault("rows", 6)
+        wizard.setdefault("square_size_mm", 40.0)
+        wizard.setdefault("marker_size_mm", 30.0)
+        wizard.setdefault("aruco_dictionary", "DICT_5X5_1000")
+        wizard.setdefault("min_pairs", 9)
+        wizard.setdefault(
+            "positions",
+            [
+                "左上",
+                "上中",
+                "右上",
+                "左中",
+                "中心",
+                "右中",
+                "左下",
+                "下中",
+                "右下",
+            ],
+        )
         temperature = self._ensure_config_section("temperature_monitor")
         temperature.setdefault("enabled", True)
         temperature.setdefault("interval_seconds", 30.0)
@@ -4255,15 +5222,230 @@ class StereoCaptureOnlyApp:
             return "full"
         return "off"
 
+    def _record_roi_sizes_from_config(self, config_snapshot: dict) -> tuple[tuple[int, int], tuple[int, int]]:
+        left_size = (
+            int(config_snapshot.get("left_roi_width", config_snapshot.get("roi_width", CAPTURE_WIDTH)) or CAPTURE_WIDTH),
+            int(config_snapshot.get("left_roi_height", config_snapshot.get("roi_height", CAPTURE_HEIGHT)) or CAPTURE_HEIGHT),
+        )
+        right_size = (
+            int(config_snapshot.get("right_roi_width", config_snapshot.get("roi_width", CAPTURE_WIDTH)) or CAPTURE_WIDTH),
+            int(config_snapshot.get("right_roi_height", config_snapshot.get("roi_height", CAPTURE_HEIGHT)) or CAPTURE_HEIGHT),
+        )
+        return left_size, right_size
+
+    def _record_pair_bytes_from_config(self, config_snapshot: dict) -> int:
+        if not config_bool(config_snapshot, "record_save_image_sequence", False, False):
+            bitrate_kbps = max(config_int(config_snapshot, "video_bitrate_kbps", 8000), 1)
+            fps = max(config_float(config_snapshot, "record_fps", 5.0), 0.1)
+            return max(int((bitrate_kbps * 1000 / 8) / fps) * 2, 1)
+        left_size, right_size = self._record_roi_sizes_from_config(config_snapshot)
+        return estimate_frame_bytes(config_snapshot, left_size[0], left_size[1]) + estimate_frame_bytes(
+            config_snapshot, right_size[0], right_size[1]
+        )
+
+    def _capture_priority_record_config(self, config_snapshot: dict) -> dict:
+        snapshot = dict(config_snapshot)
+        if not config_bool(snapshot, "record_capture_priority_mode", True, True):
+            return snapshot
+
+        snapshot["record_save_image_sequence"] = True
+        snapshot["record_realtime_mp4"] = False
+        snapshot["record_preview_during_capture"] = False
+        snapshot["record_clone_frames_for_writer"] = False
+        snapshot["record_checksum_during_capture"] = False
+        snapshot["record_split_interval_seconds"] = 0
+        snapshot["record_split_size_gb"] = 0.0
+        snapshot["record_queue_max_items"] = max(config_int(snapshot, "record_queue_max_items", 64), 64)
+        snapshot["preview_quality_analysis_enabled"] = False
+        snapshot["focus_peaking_overlay_interval_seconds"] = max(
+            config_float(snapshot, "focus_peaking_overlay_interval_seconds", 0.20),
+            1.0,
+        )
+        if str(snapshot.get("image_format", "bmp")).lower().strip() in {"jpg", "jpeg", "png"}:
+            snapshot["image_format"] = "bmp"
+        return snapshot
+
+    def _collect_record_config_for_preflight(self) -> dict[str, object] | None:
+        self._ensure_recording_config_defaults()
+        try:
+            fps = max(float(self.record_fps_var.get()), 0.1)
+            max_seconds = max(float(self.record_max_seconds_var.get() or 0), 0.0)
+            updates: dict[str, object] = {"record_fps": fps, "record_max_seconds": max_seconds}
+            updates.update(self._current_parameter_config())
+        except ValueError as exc:
+            self.status_var.set(f"录像评估失败：{exc}")
+            messagebox.showerror("录像评估失败", f"请先检查 FPS、时长、曝光、增益、ROI 等参数。\n\n{exc}")
+            return None
+        snapshot = self._config_snapshot()
+        snapshot.update(updates)
+        snapshot["image_format"] = image_extension(snapshot)
+        return self._capture_priority_record_config(snapshot)
+
+    def _build_record_preflight_plan(
+        self,
+        config_snapshot: dict,
+        benchmark: dict[str, object] | None = None,
+    ) -> dict[str, object]:
+        save_root = self.project_manager.output_root_for_mode("videos")
+        save_root.mkdir(parents=True, exist_ok=True)
+        usage = shutil.disk_usage(save_root)
+        fps = max(float(config_snapshot.get("record_fps", 5.0)), 0.1)
+        left_size, right_size = self._record_roi_sizes_from_config(config_snapshot)
+        pair_bytes = self._record_pair_bytes_from_config(config_snapshot)
+        required_mbps = pair_bytes * fps / 1024 / 1024
+        margin = max(config_float(config_snapshot, "record_disk_benchmark_margin", 1.25), 1.0)
+        measured_mbps = float((benchmark or {}).get("write_mbps") or 0.0)
+        usable_mbps = measured_mbps / margin if measured_mbps > 0 else 0.0
+        suggested_fps = usable_mbps * 1024 * 1024 / pair_bytes if pair_bytes > 0 and usable_mbps > 0 else 0.0
+        max_seconds = max(float(config_snapshot.get("record_max_seconds", 0.0) or 0.0), 0.0)
+        one_minute_bytes = pair_bytes * fps * 60
+        planned_seconds = max_seconds if max_seconds > 0 else 60.0
+        planned_bytes = pair_bytes * fps * planned_seconds
+        disk_ok = usage.free >= one_minute_bytes
+        speed_ok = measured_mbps <= 0 or measured_mbps >= required_mbps * margin
+        status = "ok" if disk_ok and speed_ok else "warn"
+        if measured_mbps <= 0:
+            status = "unknown" if disk_ok else "warn"
+        return {
+            "status": status,
+            "save_root": str(save_root),
+            "free_bytes": int(usage.free),
+            "left_size": list(left_size),
+            "right_size": list(right_size),
+            "pixel_format": str(config_snapshot.get("pixel_format", "Mono8")),
+            "image_format": image_extension(config_snapshot),
+            "record_save_image_sequence": config_bool(config_snapshot, "record_save_image_sequence", False, False),
+            "target_fps": fps,
+            "pair_bytes": int(pair_bytes),
+            "required_mbps": required_mbps,
+            "margin": margin,
+            "benchmark": benchmark,
+            "measured_mbps": measured_mbps,
+            "usable_mbps": usable_mbps,
+            "suggested_max_fps": suggested_fps,
+            "one_minute_bytes": int(one_minute_bytes),
+            "planned_seconds": planned_seconds,
+            "planned_bytes": int(planned_bytes),
+            "disk_ok": disk_ok,
+            "speed_ok": speed_ok,
+        }
+
+    def _record_preflight_text(self, plan: dict[str, object]) -> str:
+        left_size = plan.get("left_size") if isinstance(plan.get("left_size"), list) else [0, 0]
+        right_size = plan.get("right_size") if isinstance(plan.get("right_size"), list) else [0, 0]
+        measured_mbps = float(plan.get("measured_mbps") or 0.0)
+        suggested_fps = float(plan.get("suggested_max_fps") or 0.0)
+        speed_text = f"{measured_mbps:.1f} MB/s" if measured_mbps > 0 else "not measured"
+        suggested_text = f"{suggested_fps:.1f} fps" if suggested_fps > 0 else "run benchmark first"
+        save_sequence = bool(plan.get("record_save_image_sequence"))
+        output_mode = f"MP4 video; image sequence: {'on' if save_sequence else 'off'}"
+        status = str(plan.get("status", "unknown"))
+        if status == "ok":
+            verdict = "Current settings are expected to write steadily."
+        elif status == "warn":
+            verdict = "Current settings may not keep up. Lower FPS, shrink ROI, lower bitrate, or keep image sequence off."
+        else:
+            verdict = "Disk benchmark has not run yet. Benchmark before high-bandwidth recording."
+        return "\n".join(
+            [
+                "Recording preflight",
+                "",
+                f"ROI: left {left_size[0]}x{left_size[1]}, right {right_size[0]}x{right_size[1]}",
+                f"Pixel format: {plan.get('pixel_format', '--')}; output: {output_mode}",
+                f"Target FPS: {float(plan.get('target_fps') or 0.0):.1f}",
+                f"Estimated stereo frame group size: {format_bytes(plan.get('pair_bytes'))}",
+                f"Estimated write bandwidth: {float(plan.get('required_mbps') or 0.0):.1f} MB/s",
+                f"Measured disk write: {speed_text}",
+                f"Safety margin: {float(plan.get('margin') or 1.0):.2f}x",
+                f"Suggested max FPS: {suggested_text}",
+                f"Estimated 1-minute size: {format_bytes(plan.get('one_minute_bytes'))}",
+                f"Free space: {format_bytes(plan.get('free_bytes'))}",
+                "",
+                verdict,
+            ]
+        )
+
+    def _run_record_preflight(self, config_snapshot: dict, *, run_benchmark: bool = True) -> dict[str, object]:
+        benchmark = None
+        if run_benchmark and config_bool(config_snapshot, "record_disk_benchmark_enabled", True, True):
+            save_root = self.project_manager.output_root_for_mode("videos")
+            benchmark = benchmark_write_speed(
+                save_root,
+                size_mb=config_float(config_snapshot, "record_disk_benchmark_size_mb", 512.0),
+                sample_seconds=config_float(config_snapshot, "record_disk_benchmark_seconds", 3.0),
+            )
+            self._record_disk_benchmark = benchmark
+        plan = self._build_record_preflight_plan(config_snapshot, benchmark)
+        self._record_preflight_plan = dict(plan)
+        return plan
+
+    def show_record_preflight_wizard(self) -> None:
+        config_snapshot = self._collect_record_config_for_preflight()
+        if config_snapshot is None:
+            return
+        self.status_var.set("正在进行录像性能评估...")
+        try:
+            plan = self._run_record_preflight(config_snapshot, run_benchmark=True)
+        except Exception as exc:
+            self._show_error(exc)
+            return
+
+        popup = Toplevel(self.root)
+        popup.title("录像前性能评估")
+        popup.configure(bg=BG_COLOR)
+        popup.transient(self.root)
+        popup.geometry("+%d+%d" % (self.root.winfo_rootx() + 128, self.root.winfo_rooty() + 128))
+
+        body = ttk.LabelFrame(popup, text="当前配置", padding=(12, 10))
+        body.pack(side=TOP, fill=BOTH, expand=True, padx=12, pady=12)
+        text = ttk.Label(body, text=self._record_preflight_text(plan), style="Panel.TLabel", justify=LEFT)
+        text.pack(side=TOP, fill=BOTH, expand=True)
+        buttons = ttk.Frame(body, style="Panel.TFrame")
+        buttons.pack(side=BOTTOM, fill=X, pady=(12, 0))
+        ttk.Button(buttons, text="重新测速", command=lambda: self._refresh_record_preflight_popup(config_snapshot, text)).pack(
+            side=LEFT
+        )
+        ttk.Button(buttons, text="关闭", command=popup.destroy).pack(side=RIGHT)
+        popup.update_idletasks()
+        width = max(560, body.winfo_reqwidth() + 32)
+        height = max(360, body.winfo_reqheight() + 36)
+        popup.geometry(f"{width}x{height}+{self.root.winfo_rootx() + 128}+{self.root.winfo_rooty() + 128}")
+        self.status_var.set("录像性能评估完成。")
+
+    def _refresh_record_preflight_popup(self, config_snapshot: dict, label: ttk.Label) -> None:
+        self.status_var.set("正在重新测速...")
+        try:
+            plan = self._run_record_preflight(config_snapshot, run_benchmark=True)
+            label.configure(text=self._record_preflight_text(plan))
+            self.status_var.set("录像性能评估完成。")
+        except Exception as exc:
+            self._show_error(exc)
+
     def _sync_quality_toggles(self) -> None:
+        self.config["preview_quality_analysis_enabled"] = bool(self.preview_quality_analysis_var.get())
         exposure_monitor = self._ensure_config_section("exposure_monitor")
         exposure_monitor["zebra_enabled"] = bool(self.zebra_var.get())
         exposure_monitor["histogram_enabled"] = bool(self.histogram_enabled_var.get())
         self._focus_peaking_enabled_setting = bool(self.focus_peaking_var.get())
         self._histogram_enabled_setting = bool(self.histogram_enabled_var.get())
+        if not self.preview_quality_analysis_var.get():
+            self._set_last_quality_metrics(None)
+            self._last_focus_overlay_left = None
+            self._last_focus_overlay_right = None
+            self._last_focus_overlay_key = None
+            self._last_focus_overlay_time = 0.0
         self._update_quality_optional_sections()
         save_config(self.config)
         if hasattr(self, "left_pane"):
+            if self._histogram_enabled_setting and (
+                self._last_left_frame_obj is not None or self._last_right_frame_obj is not None
+            ):
+                metrics = self._analyze_preview_frames(
+                    self._last_left_frame_obj,
+                    self._last_right_frame_obj,
+                    self._preview_frame_counter + 1,
+                )
+                self._apply_quality_metrics(metrics)
             self._display_frames(self._last_left_frame_obj, self._last_right_frame_obj)
 
     def _update_quality_optional_sections(self) -> None:
@@ -4299,7 +5481,7 @@ class StereoCaptureOnlyApp:
             "temperatures_c": dict(self._latest_temperatures),
             "timestamp": time.time(),
         }
-        update_histogram = self._histogram_enabled_setting and frame_index % 4 == 0
+        update_histogram = bool(self._histogram_enabled_setting)
         metrics["left_exposure"] = exposure_metrics(left_image, include_histogram=update_histogram)
         metrics["right_exposure"] = exposure_metrics(right_image, include_histogram=update_histogram)
         focus = metrics["focus"]
@@ -4601,13 +5783,13 @@ class StereoCaptureOnlyApp:
                 if self.previewing:
                     self.ui_queue.put(("frames", (left, right)))
                 self.ui_queue.put(("shutter_flash", None))
-                self.ui_queue.put(("photo_done", photo_dir))
+                self.ui_queue.put(("photo_done", ("photo", photo_dir)))
             except Exception as exc:
                 self.ui_queue.put(("error", exc))
             finally:
                 self.ui_queue.put(("capture_idle", None))
 
-        threading.Thread(target=worker, daemon=True).start()
+        self._start_background_thread(worker, "save-photo-prefetched")
 
     def set_focus_reference(self) -> None:
         metrics = self._get_last_quality_metrics()
@@ -4638,12 +5820,16 @@ class StereoCaptureOnlyApp:
         save_config(self.config)
         root = resolve_output_root(self.config) / "focus_refs"
         root.mkdir(parents=True, exist_ok=True)
+        left_dir = root / "left"
+        right_dir = root / "right"
+        left_dir.mkdir(parents=True, exist_ok=True)
+        right_dir.mkdir(parents=True, exist_ok=True)
         capture_id = timestamp_ms()
         ext = image_extension(self.config)
         if left is not None:
-            self._save_image(left.image, root / f"focus_ref_{capture_id}_left.{ext}")
+            self._save_image(left.image, left_dir / f"focus_ref_{capture_id}_left.{ext}")
         if right is not None:
-            self._save_image(right.image, root / f"focus_ref_{capture_id}_right.{ext}")
+            self._save_image(right.image, right_dir / f"focus_ref_{capture_id}_right.{ext}")
         self._update_focus_display(focus)
         self.status_var.set(f"已保存对焦基准：{score:.1f}")
 
@@ -4666,7 +5852,7 @@ class StereoCaptureOnlyApp:
             except Exception as exc:
                 self.ui_queue.put(("status", f"对焦启动检查未完成：{exc}"))
 
-        threading.Thread(target=worker, daemon=True).start()
+        self._start_background_thread(worker, "focus-reference-check", report_errors=False)
 
     def _handle_focus_reference_check(self, focus: object) -> None:
         if not isinstance(focus, dict):
@@ -4727,7 +5913,7 @@ class StereoCaptureOnlyApp:
             result = epipolar_alignment(left.image, right.image)
             self.ui_queue.put(("epipolar_done", result))
 
-        threading.Thread(target=worker, daemon=True).start()
+        self._start_background_thread(worker, "epipolar-check", report_errors=False)
 
     def _handle_epipolar_result(self, result: object) -> None:
         if not isinstance(result, dict):
@@ -4743,7 +5929,7 @@ class StereoCaptureOnlyApp:
     def _on_magnifier_motion(self, event) -> None:
         if not self.magnifier_enabled_var.get() or self._magnifier_locked:
             return
-        roi = self._canvas_point_to_magnifier_roi(event.x, event.y)
+        roi = self._canvas_point_to_magnifier_roi(event.x, event.y, self._pane_from_event(event))
         if roi is not None:
             self._magnifier_roi_frac = roi
             self.config["focus_roi"] = roi
@@ -4753,7 +5939,7 @@ class StereoCaptureOnlyApp:
     def _on_magnifier_click(self, event) -> None:
         if not self.magnifier_enabled_var.get() or self.roi_editing:
             return
-        roi = self._canvas_point_to_magnifier_roi(event.x, event.y)
+        roi = self._canvas_point_to_magnifier_roi(event.x, event.y, self._pane_from_event(event))
         if roi is not None:
             self._magnifier_roi_frac = roi
             self.config["focus_roi"] = roi
@@ -4778,8 +5964,14 @@ class StereoCaptureOnlyApp:
         self._magnifier_zoom = values[index]
         self._update_magnifier()
 
-    def _canvas_point_to_magnifier_roi(self, x: int, y: int) -> dict[str, float] | None:
-        pane = self.left_pane
+    def _pane_from_event(self, event) -> ZoomImagePane:
+        widget = getattr(event, "widget", None)
+        if hasattr(self, "right_pane") and widget is self.right_pane.canvas and self.right_pane._last_image is not None:
+            return self.right_pane
+        return self.left_pane
+
+    def _canvas_point_to_magnifier_roi(self, x: int, y: int, pane: ZoomImagePane | None = None) -> dict[str, float] | None:
+        pane = pane or self.left_pane
         if pane._last_image is None or pane._render_bounds is None or not pane._point_inside_rendered_image(x, y):
             return None
         left, top, display_width, display_height = pane._render_bounds
@@ -4792,30 +5984,89 @@ class StereoCaptureOnlyApp:
         y0 = min(max(image_y - box_h // 2, 0), max(image_height - box_h, 0))
         return roi_from_pixels(x0, y0, box_w, box_h, image_width, image_height)
 
+    @staticmethod
+    def _magnifier_crop_for_roi(
+        image: Image.Image,
+        roi: dict[str, float],
+    ) -> tuple[Image.Image, tuple[int, int, int, int]]:
+        safe_roi = clamp_roi_frac(roi)
+        x = min(max(int(safe_roi["x_frac"] * image.width), 0), max(image.width - 1, 0))
+        y = min(max(int(safe_roi["y_frac"] * image.height), 0), max(image.height - 1, 0))
+        w = max(1, int(safe_roi["w_frac"] * image.width))
+        h = max(1, int(safe_roi["h_frac"] * image.height))
+        x1 = min(max(x + w, x + 1), image.width)
+        y1 = min(max(y + h, y + 1), image.height)
+        return image.crop((x, y, x1, y1)).convert("RGB"), (x, y, x1, y1)
+
+    @staticmethod
+    def _image_luma_stats(image: Image.Image) -> tuple[float, int, int]:
+        gray = np.asarray(image.convert("L"), dtype=np.uint8)
+        if gray.size == 0:
+            return 0.0, 0, 0
+        return float(np.mean(gray)), int(np.min(gray)), int(np.max(gray))
+
     def _update_magnifier(self) -> None:
         if not hasattr(self, "magnifier_canvas"):
             return
         self.magnifier_canvas.delete("all")
-        if not self.magnifier_enabled_var.get() or self._last_left_frame_obj is None:
-            self.magnifier_canvas.create_text(120, 90, text="未开启", fill=SUBTLE_TEXT_COLOR, anchor="center")
+        self._magnifier_image_refs = []
+        if not self.magnifier_enabled_var.get():
+            self.magnifier_canvas.create_text(120, 90, text="Magnifier off", fill=SUBTLE_TEXT_COLOR, anchor="center")
             return
-        image = self._last_left_frame_obj.image
+        frames = (("L", self._last_left_frame_obj), ("R", self._last_right_frame_obj))
+        available = [(label, frame) for label, frame in frames if frame is not None]
+        if not available:
+            self.magnifier_canvas.create_text(120, 90, text="No frame", fill=SUBTLE_TEXT_COLOR, anchor="center")
+            return
         roi = clamp_roi_frac(self._magnifier_roi_frac)
-        x = int(roi["x_frac"] * image.width)
-        y = int(roi["y_frac"] * image.height)
-        w = max(1, int(roi["w_frac"] * image.width))
-        h = max(1, int(roi["h_frac"] * image.height))
-        crop = image.crop((x, y, min(x + w, image.width), min(y + h, image.height))).convert("RGB")
-        if self._magnifier_zoom > 1:
-            crop = crop.resize((crop.width * self._magnifier_zoom, crop.height * self._magnifier_zoom), Image.Resampling.NEAREST)
         canvas_w = max(self.magnifier_canvas.winfo_width(), 120)
         canvas_h = max(self.magnifier_canvas.winfo_height(), 80)
-        preview = crop.copy()
-        preview.thumbnail((canvas_w, canvas_h), Image.Resampling.NEAREST)
-        self._magnifier_image_ref = ImageTk.PhotoImage(preview)
-        self.magnifier_canvas.create_image(canvas_w // 2, canvas_h // 2, image=self._magnifier_image_ref, anchor="center")
-        lock_text = "锁定" if self._magnifier_locked else "跟随"
-        self.magnifier_info_var.set(f"倍率 {self._magnifier_zoom * 100}% | {lock_text}")
+        pane_gap = 8 if len(available) > 1 else 0
+        pane_w = max((canvas_w - pane_gap) // max(len(available), 1), 1)
+        image_h = max(canvas_h - 18, 1)
+        dark_count = 0
+        for index, (label, frame) in enumerate(available):
+            crop, box = self._magnifier_crop_for_roi(frame.image, roi)
+            mean_luma, _min_luma, max_luma = self._image_luma_stats(crop)
+            crop_is_dark = mean_luma <= 2.0 and max_luma <= 5
+            if crop_is_dark:
+                dark_count += 1
+            if self._magnifier_zoom > 1:
+                crop = crop.resize(
+                    (crop.width * self._magnifier_zoom, crop.height * self._magnifier_zoom),
+                    Image.Resampling.NEAREST,
+                )
+            preview = crop.copy()
+            preview.thumbnail((pane_w, image_h), Image.Resampling.NEAREST)
+            image_ref = ImageTk.PhotoImage(preview)
+            self._magnifier_image_refs.append(image_ref)
+            left = index * (pane_w + pane_gap)
+            center_x = left + pane_w // 2
+            center_y = 18 + image_h // 2
+            self.magnifier_canvas.create_image(center_x, center_y, image=image_ref, anchor="center")
+            self.magnifier_canvas.create_rectangle(left, 0, left + pane_w, canvas_h, outline=BORDER_COLOR)
+            self.magnifier_canvas.create_text(
+                center_x,
+                3,
+                text=f"{label} mean {mean_luma:.0f}",
+                fill=WARNING_COLOR if crop_is_dark else TEXT_COLOR,
+                anchor="n",
+                font=(FONT_FAMILY, 9, "bold"),
+            )
+            x0, y0, x1, y1 = box
+            self.magnifier_canvas.create_text(
+                center_x,
+                canvas_h - 3,
+                text=f"{x0},{y0} {x1 - x0}x{y1 - y0}",
+                fill=SUBTLE_TEXT_COLOR,
+                anchor="s",
+                font=(MONO_FONT_FAMILY, 8),
+            )
+        lock_text = "locked" if self._magnifier_locked else "live"
+        status = " | dark ROI" if dark_count == len(available) else ""
+        self.magnifier_info_var.set(
+            f"Zoom {self._magnifier_zoom * 100}% | {lock_text} | ROI x={roi['x_frac']:.3f}, y={roi['y_frac']:.3f}{status}"
+        )
 
     def _capture_quality_gate_allows(self, metrics: dict[str, object] | None = None) -> tuple[bool, dict[str, object]]:
         gate = self.config.get("capture_quality_gate", {})
@@ -4851,8 +6102,14 @@ class StereoCaptureOnlyApp:
         return metrics
 
     def _current_parameter_config(self) -> dict:
-        width = optional_int_text(self.roi_width_var.get()) or CAPTURE_WIDTH
-        height = optional_int_text(self.roi_height_var.get()) or CAPTURE_HEIGHT
+        left_width = optional_int_text(self.left_roi_width_var.get()) or CAPTURE_WIDTH
+        left_height = optional_int_text(self.left_roi_height_var.get()) or CAPTURE_HEIGHT
+        left_offset_x = int(self.left_roi_offset_x_var.get() or 0)
+        left_offset_y = int(self.left_roi_offset_y_var.get() or 0)
+        right_width = optional_int_text(self.right_roi_width_var.get()) or CAPTURE_WIDTH
+        right_height = optional_int_text(self.right_roi_height_var.get()) or CAPTURE_HEIGHT
+        right_offset_x = int(self.right_roi_offset_x_var.get() or 0)
+        right_offset_y = int(self.right_roi_offset_y_var.get() or 0)
         return {
             "trigger_source": self.trigger_source_var.get(),
             "exposure_auto": self.exposure_auto_var.get(),
@@ -4867,10 +6124,18 @@ class StereoCaptureOnlyApp:
             "balance_ratio_red": optional_float_text(self.balance_red_var.get()),
             "balance_ratio_green": optional_float_text(self.balance_green_var.get()),
             "balance_ratio_blue": optional_float_text(self.balance_blue_var.get()),
-            "roi_width": width,
-            "roi_height": height,
-            "roi_offset_x": int(self.roi_offset_x_var.get() or 0),
-            "roi_offset_y": int(self.roi_offset_y_var.get() or 0),
+            "roi_width": left_width,
+            "roi_height": left_height,
+            "roi_offset_x": left_offset_x,
+            "roi_offset_y": left_offset_y,
+            "left_roi_width": left_width,
+            "left_roi_height": left_height,
+            "left_roi_offset_x": left_offset_x,
+            "left_roi_offset_y": left_offset_y,
+            "right_roi_width": right_width,
+            "right_roi_height": right_height,
+            "right_roi_offset_x": right_offset_x,
+            "right_roi_offset_y": right_offset_y,
         }
 
     def _save_current_capture_settings(self) -> None:
@@ -4892,8 +6157,9 @@ class StereoCaptureOnlyApp:
             "video_quality_crf": 23,
             "video_preset": "medium",
             "use_nvenc": False,
-            "record_split_interval_seconds": 600,
-            "record_split_size_gb": 4.0,
+            "record_save_image_sequence": False,
+            "record_split_interval_seconds": 0,
+            "record_split_size_gb": 1.0,
             "record_max_seconds": 0,
         }
         for key, value in defaults.items():
@@ -4916,16 +6182,32 @@ class StereoCaptureOnlyApp:
         self.balance_red_var.set(optional_config_text(self.config, "balance_ratio_red", ""))
         self.balance_green_var.set(optional_config_text(self.config, "balance_ratio_green", ""))
         self.balance_blue_var.set(optional_config_text(self.config, "balance_ratio_blue", ""))
-        self.roi_width_var.set(str(self.config.get("roi_width", CAPTURE_WIDTH)))
-        self.roi_height_var.set(str(self.config.get("roi_height", CAPTURE_HEIGHT)))
-        self.roi_offset_x_var.set(str(self.config.get("roi_offset_x", 0)))
-        self.roi_offset_y_var.set(str(self.config.get("roi_offset_y", 0)))
+        self.left_roi_width_var.set(str(self.config.get("left_roi_width", self.config.get("roi_width", CAPTURE_WIDTH))))
+        self.left_roi_height_var.set(str(self.config.get("left_roi_height", self.config.get("roi_height", CAPTURE_HEIGHT))))
+        self.left_roi_offset_x_var.set(str(self.config.get("left_roi_offset_x", self.config.get("roi_offset_x", 0))))
+        self.left_roi_offset_y_var.set(str(self.config.get("left_roi_offset_y", self.config.get("roi_offset_y", 0))))
+        self.right_roi_width_var.set(str(self.config.get("right_roi_width", self.config.get("roi_width", CAPTURE_WIDTH))))
+        self.right_roi_height_var.set(str(self.config.get("right_roi_height", self.config.get("roi_height", CAPTURE_HEIGHT))))
+        self.right_roi_offset_x_var.set(str(self.config.get("right_roi_offset_x", self.config.get("roi_offset_x", 0))))
+        self.right_roi_offset_y_var.set(str(self.config.get("right_roi_offset_y", self.config.get("roi_offset_y", 0))))
         self.record_max_seconds_var.set(optional_config_text(self.config, "record_max_seconds", "0"))
 
     def _format_apply_result(self, prefix: str, warnings: list[str]) -> str:
         if warnings:
             return prefix + "；" + "；".join(warnings)
         return prefix + f"到 {self._connected_camera_count()} 台相机。"
+
+    def _side_roi_dimensions_from_config(self, config_snapshot: dict | None = None) -> tuple[tuple[int, int], tuple[int, int]]:
+        config_snapshot = config_snapshot or self._config_snapshot()
+        left = (
+            int(config_snapshot.get("left_roi_width") or config_snapshot.get("roi_width") or CAPTURE_WIDTH),
+            int(config_snapshot.get("left_roi_height") or config_snapshot.get("roi_height") or CAPTURE_HEIGHT),
+        )
+        right = (
+            int(config_snapshot.get("right_roi_width") or config_snapshot.get("roi_width") or CAPTURE_WIDTH),
+            int(config_snapshot.get("right_roi_height") or config_snapshot.get("roi_height") or CAPTURE_HEIGHT),
+        )
+        return left, right
 
     def _reset_stats(self) -> None:
         self._stat_last_time = time.perf_counter()
@@ -5168,6 +6450,16 @@ class StereoCaptureOnlyApp:
             self._update_record_skip_strategy_locked()
 
     def _update_record_skip_strategy_locked(self) -> None:
+        if not config_bool(self.config, "record_drop_frames_on_write_lag", False, False):
+            self._record_skip_every_n = 1
+            self._record_skip_keep_frames = 1
+            if self._record_write_lag > 2.5:
+                self._record_write_warning = "Disk writes are severely behind; frame dropping is disabled."
+            elif self._record_write_lag > 1.5:
+                self._record_write_warning = "Disk writes are behind; frame dropping is disabled."
+            elif self._record_write_warning.startswith("Disk writes are"):
+                self._record_write_warning = ""
+            return
         if self._record_write_lag > 2.5:
             self._record_skip_every_n = 3
             self._record_skip_keep_frames = 1
@@ -5204,6 +6496,14 @@ class StereoCaptureOnlyApp:
         with self._record_stats_lock:
             self._record_skipped_count += 1
             self._record_skip_reasons[reason] = self._record_skip_reasons.get(reason, 0) + 1
+            bucket = self._record_second_bucket_locked(self._record_second_index_locked())
+            bucket["skipped_frames"] = int(bucket.get("skipped_frames", 0) or 0) + 1
+            if bucket.get("first_frame_index") is None:
+                bucket["first_frame_index"] = int(frame_index)
+            bucket["last_frame_index"] = int(frame_index)
+            reasons = bucket.setdefault("drop_reasons", {})
+            if isinstance(reasons, dict):
+                reasons[reason] = int(reasons.get(reason, 0) or 0) + 1
             if len(self._record_skipped_frames) < 1000:
                 self._record_skipped_frames.append(
                     {
@@ -5226,9 +6526,11 @@ class StereoCaptureOnlyApp:
         free_gb = usage.free / 1024**3
         min_free_gb = max(config_float(config_snapshot, "record_disk_min_free_gb", 2.0), 0.0)
         warning_minutes = max(config_float(config_snapshot, "record_disk_warning_minutes", 2.0), 0.1)
-        width = int(config_snapshot.get("roi_width") or CAPTURE_WIDTH)
-        height = int(config_snapshot.get("roi_height") or CAPTURE_HEIGHT)
-        bytes_per_second = estimate_frame_bytes(config_snapshot, width, height) * max(self._connected_camera_count(), 1) * fps
+        left_size, right_size = self._side_roi_dimensions_from_config(config_snapshot)
+        bytes_per_second = (
+            estimate_frame_bytes(config_snapshot, left_size[0], left_size[1])
+            + estimate_frame_bytes(config_snapshot, right_size[0], right_size[1])
+        ) * fps
         seconds_left = usage.free / max(bytes_per_second, 1)
         if free_gb <= min_free_gb or seconds_left <= warning_minutes * 60.0:
             self._add_record_disk_warning()
@@ -5264,7 +6566,7 @@ class StereoCaptureOnlyApp:
         if advanced is None:
             return
         new_segment_index, record_dir = advanced
-        if record_dir is not None:
+        if record_dir is not None and config_bool(config_snapshot, "record_save_image_sequence", False, False):
             for side in ("left", "right"):
                 (record_dir / self._record_segment_dir(side, new_segment_index)).mkdir(parents=True, exist_ok=True)
 
@@ -5276,16 +6578,175 @@ class StereoCaptureOnlyApp:
         video_outputs: dict[str, list[str]],
         config_snapshot: dict,
     ) -> list[str]:
-        if config_bool(config_snapshot, "auto_make_mp4", True, True):
-            ffmpeg_outputs = self._try_make_mp4_from_frames(record_dir, fps, frames, config_snapshot)
+        if config_bool(config_snapshot, "auto_make_mp4", True, True) and config_bool(
+            config_snapshot, "record_save_image_sequence", False, False
+        ):
+            total_units = self._mp4_progress_total_units(frames)
+            progress_done = 0
+
+            def progress(current: int = 0, message: str = "") -> None:
+                units = min(max(progress_done + max(int(current), 0), 0), max(total_units, 1))
+                percent = units / max(total_units, 1) * 100.0
+                self.ui_queue.put(
+                    (
+                        "mp4_progress",
+                        {
+                            "percent": percent,
+                            "message": message or f"合成 MP4 {percent:.0f}%",
+                        },
+                    )
+                )
+
+            def segment_done(count: int, message: str = "") -> None:
+                nonlocal progress_done
+                progress_done = min(progress_done + max(int(count), 0), max(total_units, 1))
+                progress(0, message)
+
+            progress(0, "MP4 0%")
+            ffmpeg_outputs = self._try_make_mp4_from_frames(
+                record_dir,
+                fps,
+                frames,
+                config_snapshot,
+                progress_callback=progress,
+                segment_done_callback=segment_done,
+            )
             for side, paths in ffmpeg_outputs.items():
                 if paths:
                     video_outputs[side] = [str(path) for path in paths]
+            missing_sides = [side for side in ("left", "right") if not video_outputs[side]]
+            if missing_sides:
+                opencv_outputs = self._try_make_mp4_from_frames_opencv(
+                    record_dir,
+                    fps,
+                    frames,
+                    config_snapshot,
+                    missing_sides,
+                    progress_callback=progress,
+                    segment_done_callback=segment_done,
+                )
+                for side, paths in opencv_outputs.items():
+                    if paths:
+                        video_outputs[side] = [str(path) for path in paths]
+            progress_done = max(total_units, 1)
+            progress(0, "MP4 100%")
         names: list[str] = []
         for side in ("left", "right"):
             for path in video_outputs[side]:
                 names.append(Path(path).name)
         return names
+
+    def _mp4_progress_total_units(self, frames: list[dict]) -> int:
+        total = 0
+        for frame in frames:
+            for side in ("left", "right"):
+                if frame.get(f"{side}_path") is not None:
+                    total += 1
+        return max(total, 1)
+
+    def _try_make_mp4_from_frames_opencv(
+        self,
+        record_dir: Path,
+        fps: float,
+        frames: list[dict],
+        config_snapshot: dict,
+        sides: list[str],
+        progress_callback=None,
+        segment_done_callback=None,
+    ) -> dict[str, list[Path]]:
+        if not frames:
+            return {side: [] for side in sides}
+        ext = image_extension(config_snapshot)
+        outputs: dict[str, list[Path]] = {side: [] for side in sides}
+        segment_indices = sorted({int(frame["segment_index"]) for frame in frames})
+        for segment_index in segment_indices:
+            for side in sides:
+                segment_frames = sorted(
+                    (
+                        frame
+                        for frame in frames
+                        if int(frame["segment_index"]) == segment_index and frame.get(f"{side}_path") is not None
+                    ),
+                    key=lambda frame: int(frame.get("saved_index", 0) or 0),
+                )
+                if not segment_frames:
+                    continue
+                first_path = Path(str(segment_frames[0].get(f"{side}_path")))
+                first_image = self._cv2_imread_unicode(first_path, cv2.IMREAD_UNCHANGED)
+                if first_image is None:
+                    LOGGER.warning("OpenCV MP4 generation could not read first frame: %s", first_path)
+                    continue
+                height, width = first_image.shape[:2]
+                output = self._record_segment_video_path(side, segment_index)
+                output.parent.mkdir(parents=True, exist_ok=True)
+                temp_output = self._opencv_temp_video_path(output)
+                writer, codec_name = self._create_video_writer_v2(
+                    temp_output,
+                    fps,
+                    Image.new("L", (width, height)),
+                    config_snapshot,
+                )
+                started = time.perf_counter()
+                written = 0
+                segment_total = len(segment_frames)
+                try:
+                    for frame in segment_frames:
+                        path = Path(str(frame.get(f"{side}_path")))
+                        if path.suffix.lower().lstrip(".") != ext:
+                            continue
+                        image = self._cv2_imread_unicode(path, cv2.IMREAD_UNCHANGED)
+                        if image is None:
+                            continue
+                        if image.ndim == 2:
+                            image = cv2.cvtColor(image, cv2.COLOR_GRAY2BGR)
+                        elif image.shape[2] == 4:
+                            image = cv2.cvtColor(image, cv2.COLOR_BGRA2BGR)
+                        writer.write(image)
+                        written += 1
+                        if progress_callback is not None and (written % 5 == 0 or written == segment_total):
+                            progress_callback(
+                                written,
+                                f"MP4 {side} part {segment_index} {written}/{segment_total}",
+                            )
+                finally:
+                    writer.release()
+                if written > 0 and temp_output.exists():
+                    try:
+                        output.unlink(missing_ok=True)
+                        shutil.move(str(temp_output), str(output))
+                    except OSError:
+                        LOGGER.exception("OpenCV MP4 generation could not move %s to %s.", temp_output, output)
+                        continue
+                else:
+                    temp_output.unlink(missing_ok=True)
+                if written > 0 and output.exists():
+                    outputs[side].append(output)
+                    if codec_name != str(config_snapshot.get("video_codec", "mp4v")):
+                        self._set_record_write_warning(f"Video codec fallback: {codec_name}")
+                    LOGGER.info(
+                        "OpenCV MP4 generation wrote %s from %d %s frames in %.1fs.",
+                        output,
+                        written,
+                        ext.upper(),
+                        time.perf_counter() - started,
+                    )
+                if segment_done_callback is not None:
+                    segment_done_callback(written, f"MP4 {side} part {segment_index} done")
+        return outputs
+
+    def _cv2_imread_unicode(self, path: Path, flags: int) -> np.ndarray | None:
+        try:
+            data = np.fromfile(str(path), dtype=np.uint8)
+        except OSError:
+            return None
+        if data.size == 0:
+            return None
+        return cv2.imdecode(data, flags)
+
+    def _opencv_temp_video_path(self, final_path: Path) -> Path:
+        temp_dir = Path(tempfile.gettempdir()) / "mvss_capture_mp4"
+        temp_dir.mkdir(parents=True, exist_ok=True)
+        return temp_dir / f"{timestamp_ms()}_{final_path.stem}.mp4"
 
     def _try_make_mp4_from_frames(
         self,
@@ -5293,6 +6754,8 @@ class StereoCaptureOnlyApp:
         fps: float,
         frames: list[dict],
         config_snapshot: dict,
+        progress_callback=None,
+        segment_done_callback=None,
     ) -> dict[str, list[Path]]:
         ffmpeg = shutil.which("ffmpeg")
         if not ffmpeg or not frames:
@@ -5309,6 +6772,8 @@ class StereoCaptureOnlyApp:
                 ]
                 if not segment_frames:
                     continue
+                if progress_callback is not None:
+                    progress_callback(0, f"MP4 {side} part {segment_index}")
                 frame_dir = record_dir / self._record_segment_dir(side, segment_index)
                 if not frame_dir.exists() or not any(frame_dir.glob(f"{side}_*.{ext}")):
                     continue
@@ -5334,6 +6799,8 @@ class StereoCaptureOnlyApp:
                     )
                     if result.returncode == 0 and output.exists():
                         outputs[side].append(output)
+                        if segment_done_callback is not None:
+                            segment_done_callback(len(segment_frames), f"MP4 {side} part {segment_index} done")
                     elif config_bool(config_snapshot, "use_nvenc", False, False):
                         if result.stderr:
                             LOGGER.warning("ffmpeg NVENC MP4 generation failed for %s: %s", output, result.stderr[-2000:])
@@ -5358,6 +6825,8 @@ class StereoCaptureOnlyApp:
                         if result.returncode == 0 and output.exists():
                             outputs[side].append(output)
                             self._set_record_write_warning("NVENC失败，已回退软件编码")
+                            if segment_done_callback is not None:
+                                segment_done_callback(len(segment_frames), f"MP4 {side} part {segment_index} done")
                         elif result.stderr:
                             LOGGER.warning("ffmpeg fallback MP4 generation failed for %s: %s", output, result.stderr[-2000:])
                     elif result.stderr:
@@ -5380,6 +6849,14 @@ class StereoCaptureOnlyApp:
         expected = list(range(saved_indices[0], saved_indices[0] + len(saved_indices)))
         if saved_indices == expected:
             return False, None, False
+        missing_count = saved_indices[-1] - saved_indices[0] + 1 - len(saved_indices)
+        gap_warning_threshold = max(config_int(self.config, "ffmpeg_sequence_gap_warning_threshold", 300), 0)
+        if gap_warning_threshold and missing_count >= gap_warning_threshold:
+            self._notify_warning(
+                "ffmpeg_sequence_many_gaps",
+                f"录像帧序列缺号 {missing_count} 帧，MP4 合成需要临时重排文件，可能占用较多磁盘空间。",
+                log_only=True,
+            )
         sources = [frame_dir / f"{side}_{saved_index:06d}.{ext}" for saved_index in saved_indices]
         existing_sources = [src for src in sources if src.exists()]
         required_bytes = sum(src.stat().st_size for src in existing_sources)
@@ -5454,44 +6931,50 @@ class StereoCaptureOnlyApp:
     def _check_disk_space_for_recording(self, config_snapshot: dict) -> bool:
         save_root = self.project_manager.output_root_for_mode("videos")
         save_root.mkdir(parents=True, exist_ok=True)
-        usage = shutil.disk_usage(save_root)
-        width = optional_int_text(self.roi_width_var.get()) or CAPTURE_WIDTH
-        height = optional_int_text(self.roi_height_var.get()) or CAPTURE_HEIGHT
-        frame_bytes = estimate_frame_bytes(config_snapshot, width, height)
-        camera_count = max(self._connected_camera_count(), 1)
-        pair_bytes = frame_bytes * camera_count
-        fps = max(float(config_snapshot.get("record_fps", 5.0)), 0.1)
-        estimated_one_minute = int(pair_bytes * fps * 60)
-        if usage.free < estimated_one_minute:
+        plan = self._run_record_preflight(
+            config_snapshot,
+            run_benchmark=config_bool(config_snapshot, "record_disk_benchmark_enabled", True, True),
+        )
+        usage_free = int(plan.get("free_bytes", 0) or 0)
+        required_mbps = float(plan.get("required_mbps") or 0.0)
+        estimated_one_minute = int(plan.get("one_minute_bytes", 0) or 0)
+        if usage_free < estimated_one_minute:
             messagebox.showerror(
                 "磁盘空间不足",
-                f"当前可用空间约 {usage.free / 1024**3:.1f} GB，按当前设置录制 1 分钟预计需要 "
+                f"当前可用空间约 {usage_free / 1024**3:.1f} GB，按当前设置录制 1 分钟预计需要 "
                 f"{estimated_one_minute / 1024**3:.1f} GB。",
             )
             return False
-        if usage.free < estimated_one_minute * 3:
+        if usage_free < estimated_one_minute * 3:
             if not messagebox.askyesno(
                 "磁盘空间偏低",
-                f"当前可用空间约 {usage.free / 1024**3:.1f} GB，按当前设置录制 1 分钟预计需要 "
+                f"当前可用空间约 {usage_free / 1024**3:.1f} GB，按当前设置录制 1 分钟预计需要 "
                 f"{estimated_one_minute / 1024**3:.1f} GB。是否继续？",
             ):
                 return False
-        if config_bool(config_snapshot, "record_disk_benchmark_enabled", True, True):
-            required_mbps = pair_bytes * fps / 1024 / 1024
-            benchmark = benchmark_write_speed(
-                save_root,
-                size_mb=config_float(config_snapshot, "record_disk_benchmark_size_mb", 512.0),
-                sample_seconds=config_float(config_snapshot, "record_disk_benchmark_seconds", 3.0),
-            )
-            self._record_disk_benchmark = benchmark
-            margin = max(config_float(config_snapshot, "record_disk_benchmark_margin", 1.25), 1.0)
-            if float(benchmark.get("write_mbps") or 0.0) < required_mbps * margin:
-                if not messagebox.askyesno(
-                    "写入速度可能不足",
-                    f"当前设置预计需要 {required_mbps:.1f} MB/s，实测约 "
-                    f"{float(benchmark.get('write_mbps') or 0.0):.1f} MB/s。继续录像可能丢帧，是否继续？",
-                ):
-                    return False
+        measured_mbps = float(plan.get("measured_mbps") or 0.0)
+        margin = float(plan.get("margin") or 1.0)
+        if config_bool(config_snapshot, "record_preflight_prompt_enabled", True, True):
+            speed_text = f"{measured_mbps:.1f} MB/s" if measured_mbps > 0 else "未测速"
+            suggested = float(plan.get("suggested_max_fps") or 0.0)
+            suggested_text = f"{suggested:.1f} fps" if suggested > 0 else "需先测速"
+            if not messagebox.askyesno(
+                "录像前性能评估",
+                "当前配置评估结果：\n"
+                f"- 预计需要：{required_mbps:.1f} MB/s\n"
+                f"- 磁盘测速：{speed_text}\n"
+                f"- 建议最高 FPS：{suggested_text}\n"
+                f"- 录制 1 分钟约占用：{estimated_one_minute / 1024**3:.2f} GB\n\n"
+                "是否开始录像？",
+            ):
+                return False
+        if measured_mbps > 0 and measured_mbps < required_mbps * margin:
+            if not messagebox.askyesno(
+                "写入速度可能不足",
+                f"当前设置预计需要 {required_mbps:.1f} MB/s，实测约 {measured_mbps:.1f} MB/s。"
+                f"\n建议最高 FPS：{float(plan.get('suggested_max_fps') or 0.0):.1f}。继续录像可能丢帧，是否继续？",
+            ):
+                return False
         return True
 
     def _checksum_algorithm(self, config_snapshot: dict | None = None) -> str:
@@ -5543,6 +7026,7 @@ class StereoCaptureOnlyApp:
             "saved_frame_count": stats["saved_frame_count"],
             "valid_frame_count": len(frames),
             "skipped_frame_count": stats["skipped_frame_count"],
+            "skipped_frames": stats["skipped_frames"],
             "timeout_count": stats["timeout_count"],
             "error_count": stats["error_count"],
             "reconnect_count": stats["reconnect_count"],
@@ -5555,10 +7039,276 @@ class StereoCaptureOnlyApp:
             "disk_used_delta_bytes": disk_used_delta,
             "stop_reason": stats["stop_reason"],
             "skip_reasons": stats["skip_reasons"],
+            "per_second": stats.get("per_second", []),
+            "average_write_seconds": self._average_record_write_seconds(frames),
+            "disk_write_benchmark": self._record_disk_benchmark,
+            "preflight": dict(self._record_preflight_plan),
         }
         with self._record_stats_lock:
             self._record_summary = summary
         return summary
+
+    def _average_record_write_seconds(self, frames: list[dict]) -> float:
+        values = []
+        for frame in frames:
+            try:
+                value = float(frame.get("write_seconds") or 0.0)
+            except (TypeError, ValueError):
+                continue
+            if value > 0:
+                values.append(value)
+        return float(np.mean(values)) if values else 0.0
+
+    def _record_report_second_rows(self, summary: dict[str, object], frames: list[dict]) -> list[dict[str, object]]:
+        rows_by_second: dict[int, dict[str, object]] = {}
+        for raw in summary.get("per_second", []) if isinstance(summary.get("per_second"), list) else []:
+            if not isinstance(raw, dict):
+                continue
+            second = int(raw.get("second", 0) or 0)
+            drop_reasons = raw.get("drop_reasons") if isinstance(raw.get("drop_reasons"), dict) else {}
+            write_samples = int(raw.get("write_samples", 0) or 0)
+            write_total = float(raw.get("write_seconds_total", 0.0) or 0.0)
+            rows_by_second[second] = {
+                "second": second,
+                "captured_frames": int(raw.get("captured_frames", 0) or 0),
+                "saved_frames": int(raw.get("saved_frames", 0) or 0),
+                "skipped_frames": int(raw.get("skipped_frames", 0) or 0),
+                "timeout_count": int(raw.get("timeout_count", 0) or 0),
+                "error_count": int(raw.get("error_count", 0) or 0),
+                "first_frame_index": raw.get("first_frame_index"),
+                "last_frame_index": raw.get("last_frame_index"),
+                "first_saved_index": raw.get("first_saved_index"),
+                "last_saved_index": raw.get("last_saved_index"),
+                "saved_mb": float(raw.get("saved_bytes", 0) or 0) / 1024 / 1024,
+                "avg_write_ms": (write_total / write_samples * 1000.0) if write_samples > 0 else 0.0,
+                "drop_reasons": "; ".join(f"{key}: {value}" for key, value in sorted(drop_reasons.items())),
+            }
+        for frame in frames:
+            try:
+                trigger = float(frame.get("trigger_time") or 0.0)
+            except (TypeError, ValueError):
+                trigger = 0.0
+            second = int(max(trigger - float(frames[0].get("trigger_time") or trigger), 0.0)) if frames else 0
+            rows_by_second.setdefault(
+                second,
+                {
+                    "second": second,
+                    "captured_frames": 0,
+                    "saved_frames": 0,
+                    "skipped_frames": 0,
+                    "timeout_count": 0,
+                    "error_count": 0,
+                    "first_frame_index": None,
+                    "last_frame_index": None,
+                    "first_saved_index": None,
+                    "last_saved_index": None,
+                    "saved_mb": 0.0,
+                    "avg_write_ms": 0.0,
+                    "drop_reasons": "",
+                },
+            )
+        return [rows_by_second[key] for key in sorted(rows_by_second)]
+
+    def _write_record_reports(
+        self,
+        record_dir: Path,
+        summary: dict[str, object],
+        frames: list[dict],
+        config_snapshot: dict,
+    ) -> dict[str, str]:
+        second_rows = self._record_report_second_rows(summary, frames)
+        skipped_frames = summary.get("skipped_frames")
+        if not isinstance(skipped_frames, list):
+            skipped_frames = self._record_stats_snapshot().get("skipped_frames", [])
+        csv_path = record_dir / "record_report.csv"
+        html_path = record_dir / "record_report.html"
+        csv_fields = [
+            "section",
+            "second",
+            "captured_frames",
+            "saved_frames",
+            "skipped_frames",
+            "timeout_count",
+            "error_count",
+            "first_frame_index",
+            "last_frame_index",
+            "first_saved_index",
+            "last_saved_index",
+            "saved_mb",
+            "avg_write_ms",
+            "drop_reasons",
+            "frame_index",
+            "reason",
+            "time",
+            "metric",
+            "value",
+        ]
+        with csv_path.open("w", newline="", encoding="utf-8-sig") as fh:
+            writer = csv.DictWriter(fh, fieldnames=csv_fields)
+            writer.writeheader()
+            summary_rows = {
+                "total_frame_count": summary.get("total_frame_count", 0),
+                "saved_frame_count": summary.get("saved_frame_count", 0),
+                "skipped_frame_count": summary.get("skipped_frame_count", 0),
+                "timeout_count": summary.get("timeout_count", 0),
+                "average_capture_fps": f"{float(summary.get('average_capture_fps') or 0.0):.4f}",
+                "effective_video_fps": f"{float(summary.get('effective_video_fps') or 0.0):.4f}",
+                "average_write_ms": f"{float(summary.get('average_write_seconds') or 0.0) * 1000.0:.4f}",
+                "directory_size_bytes": summary.get("directory_size_bytes", 0),
+                "stop_reason": summary.get("stop_reason", ""),
+            }
+            for metric_name, value in summary_rows.items():
+                writer.writerow({"section": "summary", "metric": metric_name, "value": value})
+            for row in second_rows:
+                writer.writerow({"section": "per_second", **row})
+            for skipped in skipped_frames if isinstance(skipped_frames, list) else []:
+                if not isinstance(skipped, dict):
+                    continue
+                writer.writerow(
+                    {
+                        "section": "skipped_frame",
+                        "frame_index": skipped.get("index"),
+                        "reason": skipped.get("reason"),
+                        "time": self._format_wall_time(skipped.get("time")),
+                    }
+                )
+
+        html_path.write_text(
+            self._record_report_html(record_dir, summary, second_rows, skipped_frames, config_snapshot),
+            encoding="utf-8",
+        )
+        return {"csv": str(csv_path), "html": str(html_path)}
+
+    def _format_wall_time(self, value: object) -> str:
+        try:
+            return time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(float(value)))
+        except (TypeError, ValueError, OSError):
+            return ""
+
+    def _record_report_html(
+        self,
+        record_dir: Path,
+        summary: dict[str, object],
+        second_rows: list[dict[str, object]],
+        skipped_frames: object,
+        config_snapshot: dict,
+    ) -> str:
+        benchmark = summary.get("disk_write_benchmark") if isinstance(summary.get("disk_write_benchmark"), dict) else {}
+        preflight = summary.get("preflight") if isinstance(summary.get("preflight"), dict) else {}
+        skip_reasons = summary.get("skip_reasons") if isinstance(summary.get("skip_reasons"), dict) else {}
+        generated_at = time.strftime("%Y-%m-%d %H:%M:%S")
+
+        def esc(value: object) -> str:
+            return html.escape(str(value if value is not None else ""))
+
+        def metric(label: str, value: object, suffix: str = "") -> str:
+            return f"<div class=\"metric\"><span>{esc(label)}</span><strong>{esc(value)}{suffix}</strong></div>"
+
+        second_body = "\n".join(
+            "<tr>"
+            f"<td>{int(row.get('second', 0))}</td>"
+            f"<td>{int(row.get('captured_frames', 0))}</td>"
+            f"<td>{int(row.get('saved_frames', 0))}</td>"
+            f"<td>{int(row.get('skipped_frames', 0))}</td>"
+            f"<td>{int(row.get('timeout_count', 0))}</td>"
+            f"<td>{int(row.get('error_count', 0))}</td>"
+            f"<td>{esc(row.get('first_frame_index'))}</td>"
+            f"<td>{esc(row.get('last_frame_index'))}</td>"
+            f"<td>{float(row.get('saved_mb') or 0.0):.2f}</td>"
+            f"<td>{float(row.get('avg_write_ms') or 0.0):.2f}</td>"
+            f"<td>{esc(row.get('drop_reasons'))}</td>"
+            "</tr>"
+            for row in second_rows
+        )
+        skipped_body = "\n".join(
+            "<tr>"
+            f"<td>{esc(item.get('index'))}</td>"
+            f"<td>{esc(item.get('reason'))}</td>"
+            f"<td>{esc(self._format_wall_time(item.get('time')))}</td>"
+            "</tr>"
+            for item in skipped_frames
+            if isinstance(item, dict)
+        ) if isinstance(skipped_frames, list) else ""
+        if not skipped_body:
+            skipped_body = "<tr><td colspan=\"3\">无具体跳帧记录</td></tr>"
+        reason_text = ", ".join(f"{key}: {value}" for key, value in sorted(skip_reasons.items())) if skip_reasons else "无"
+        benchmark_text = (
+            f"{float(benchmark.get('write_mbps') or 0.0):.1f} MB/s"
+            if benchmark
+            else "未测速或未记录"
+        )
+        suggested_text = (
+            f"{float(preflight.get('suggested_max_fps') or 0.0):.1f} fps"
+            if preflight and float(preflight.get("suggested_max_fps") or 0.0) > 0
+            else "--"
+        )
+        return f"""<!doctype html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<title>MVSS 录像报告 - {esc(record_dir.name)}</title>
+<style>
+body {{ margin: 0; background: #f5f7fa; color: #1f2933; font-family: "Microsoft YaHei UI", Arial, sans-serif; }}
+main {{ max-width: 1180px; margin: 0 auto; padding: 28px; }}
+h1 {{ margin: 0 0 4px; font-size: 24px; }}
+h2 {{ margin: 28px 0 10px; font-size: 18px; }}
+.sub {{ color: #66788a; margin-bottom: 18px; }}
+.grid {{ display: grid; grid-template-columns: repeat(auto-fit, minmax(180px, 1fr)); gap: 10px; }}
+.metric {{ background: #ffffff; border: 1px solid #d8e0e8; border-radius: 8px; padding: 12px 14px; }}
+.metric span {{ display: block; color: #66788a; font-size: 12px; margin-bottom: 6px; }}
+.metric strong {{ font-size: 18px; }}
+.panel {{ background: #ffffff; border: 1px solid #d8e0e8; border-radius: 8px; padding: 14px; margin-top: 12px; }}
+table {{ width: 100%; border-collapse: collapse; background: #ffffff; border: 1px solid #d8e0e8; }}
+th, td {{ padding: 8px 9px; border-bottom: 1px solid #e6edf3; text-align: left; font-size: 13px; }}
+th {{ background: #edf3f8; color: #344250; position: sticky; top: 0; }}
+.table-wrap {{ max-height: 520px; overflow: auto; border-radius: 8px; }}
+.warn {{ color: #a15c00; }}
+.ok {{ color: #14784e; }}
+code {{ background: #edf3f8; padding: 2px 5px; border-radius: 4px; }}
+</style>
+</head>
+<body>
+<main>
+<h1>MVSS 录像报告</h1>
+<div class="sub">生成时间：{esc(generated_at)} | 目录：<code>{esc(record_dir)}</code></div>
+<section class="grid">
+{metric("总采集帧", summary.get("total_frame_count", 0))}
+{metric("保存帧", summary.get("saved_frame_count", 0))}
+{metric("跳帧/未保存", summary.get("skipped_frame_count", 0))}
+{metric("超时", summary.get("timeout_count", 0))}
+{metric("平均采集 FPS", f"{float(summary.get('average_capture_fps') or 0.0):.2f}")}
+{metric("有效视频 FPS", f"{float(summary.get('effective_video_fps') or 0.0):.2f}")}
+{metric("平均写入耗时", f"{float(summary.get('average_write_seconds') or 0.0) * 1000.0:.2f}", " ms")}
+{metric("磁盘测速", benchmark_text)}
+{metric("建议最高 FPS", suggested_text)}
+{metric("目录大小", format_bytes(summary.get("directory_size_bytes")))}
+</section>
+<section class="panel">
+<strong>结论：</strong>
+<span class="{esc('ok' if not skip_reasons and int(summary.get('timeout_count', 0) or 0) == 0 else 'warn')}">
+停止原因 {esc(summary.get('stop_reason', '--'))}；跳帧原因：{esc(reason_text)}。
+</span>
+<br>
+Output {esc('MP4 + image sequence' if config_bool(config_snapshot, 'record_save_image_sequence', False, False) else 'MP4 video')}; target FPS {float(summary.get('target_fps') or 0.0):.2f}; pixel format {esc(config_snapshot.get('pixel_format', '--'))}.
+</section>
+<h2>每秒采集/保存统计</h2>
+<div class="table-wrap">
+<table>
+<thead><tr><th>秒</th><th>采集帧</th><th>保存帧</th><th>跳帧</th><th>超时</th><th>错误</th><th>首帧</th><th>末帧</th><th>保存 MB</th><th>平均写入 ms</th><th>原因</th></tr></thead>
+<tbody>{second_body or '<tr><td colspan="11">无秒级统计</td></tr>'}</tbody>
+</table>
+</div>
+<h2>跳帧明细</h2>
+<div class="table-wrap">
+<table>
+<thead><tr><th>帧号</th><th>原因</th><th>时间</th></tr></thead>
+<tbody>{skipped_body}</tbody>
+</table>
+</div>
+</main>
+</body>
+</html>
+"""
 
     def _format_record_summary(self, summary: object) -> str:
         if not isinstance(summary, dict):
@@ -5588,8 +7338,12 @@ class StereoCaptureOnlyApp:
         group_dir.mkdir(parents=True, exist_ok=True)
         ext = image_extension(self.config)
 
-        group_left = group_dir / f"left.{ext}"
-        group_right = group_dir / f"right.{ext}"
+        left_dir = group_dir / "left"
+        right_dir = group_dir / "right"
+        left_dir.mkdir(parents=True, exist_ok=True)
+        right_dir.mkdir(parents=True, exist_ok=True)
+        group_left = left_dir / f"{capture_id}_left.{ext}"
+        group_right = right_dir / f"{capture_id}_right.{ext}"
 
         if left is not None:
             group_left = self._save_image(left.image, group_left)
@@ -5656,6 +7410,10 @@ class StereoCaptureOnlyApp:
                 image.save(path, format="BMP")
         except OSError as exc:
             LOGGER.exception("图像保存失败: %s", path)
+            try:
+                path.unlink(missing_ok=True)
+            except OSError:
+                LOGGER.warning("图像保存失败后清理残留文件失败: %s", path, exc_info=True)
             raise MvsError(f"图像保存失败：{path}；{exc}") from exc
         return path
 
@@ -5712,9 +7470,20 @@ class StereoCaptureOnlyApp:
             "roi_height",
             "roi_offset_x",
             "roi_offset_y",
+            "left_roi_width",
+            "left_roi_height",
+            "left_roi_offset_x",
+            "left_roi_offset_y",
+            "right_roi_width",
+            "right_roi_height",
+            "right_roi_offset_x",
+            "right_roi_offset_y",
             "pixel_format",
             "image_format",
+            "record_save_image_sequence",
             "record_fps",
+            "record_split_interval_seconds",
+            "record_split_size_gb",
             "record_max_seconds",
         )
         snapshot = {key: config_snapshot.get(key) for key in keys}
@@ -5788,9 +7557,13 @@ class StereoCaptureOnlyApp:
             self.right_pane.unbind_external_callbacks()
             self._set_recording_indicator(False)
         join_timeout = max(config_float(self.config, "close_thread_join_timeout_seconds", 10.0), 0.1)
-        self._join_thread_on_close(self.preview_thread, join_timeout)
-        self._join_thread_on_close(self.interval_thread, join_timeout)
-        self._join_thread_on_close(self.record_thread, join_timeout)
+        join_budget = max(config_float(self.config, "close_total_thread_join_timeout_seconds", join_timeout), 0.1)
+        join_deadline = time.perf_counter() + join_budget
+        self._join_thread_on_close(self.preview_thread, join_timeout, join_deadline)
+        self._join_thread_on_close(self.interval_thread, join_timeout, join_deadline)
+        self._join_thread_on_close(self.record_thread, join_timeout, join_deadline)
+        for thread in self._background_threads_snapshot():
+            self._join_thread_on_close(thread, join_timeout, join_deadline)
         if self.camera_system is not None:
             try:
                 self.camera_system.close()
@@ -5798,12 +7571,21 @@ class StereoCaptureOnlyApp:
                 self.status_var.set(str(exc))
         self.root.destroy()
 
-    def _join_thread_on_close(self, thread: threading.Thread | None, timeout: float) -> None:
+    def _join_thread_on_close(
+        self,
+        thread: threading.Thread | None,
+        timeout: float,
+        deadline: float | None = None,
+    ) -> None:
         if thread is None or not thread.is_alive():
             return
-        thread.join(timeout=timeout)
+        wait_timeout = timeout
+        if deadline is not None:
+            wait_timeout = min(wait_timeout, max(deadline - time.perf_counter(), 0.0))
+        if wait_timeout > 0:
+            thread.join(timeout=wait_timeout)
         if thread.is_alive():
-            LOGGER.warning("Thread %s did not stop within %.1f seconds during close.", thread.name or thread.ident, timeout)
+            LOGGER.warning("Thread %s did not stop within %.1f seconds during close.", thread.name or thread.ident, wait_timeout)
 
 
 def _log_startup_exception() -> None:

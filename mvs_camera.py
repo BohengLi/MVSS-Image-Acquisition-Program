@@ -14,7 +14,7 @@ from typing import Any
 import numpy as np
 from PIL import Image
 
-from config_utils import config_bool, config_int
+from config_utils import config_bool, config_float, config_int
 
 _DLL_DIRECTORIES: list[Any] = []
 LOGGER = logging.getLogger("mvss_capture")
@@ -60,11 +60,17 @@ def _add_mvs_runtime_path() -> None:
 
 def _mvs_python_candidates() -> list[Path]:
     candidates = [
+        Path(sys.executable).resolve().parent,
+        Path(sys.executable).resolve().parent / "hikrobot",
         Path(r"C:\Program Files (x86)\MVS\Development\Samples\Python\MvImport"),
         Path(r"C:\Program Files\MVS\Development\Samples\Python\MvImport"),
         Path(r"C:\Program Files (x86)\MVS\Development\Samples\Python"),
         Path(r"C:\Program Files\MVS\Development\Samples\Python"),
     ]
+    bundle_dir = getattr(sys, "_MEIPASS", None)
+    if bundle_dir:
+        bundle_path = Path(bundle_dir)
+        candidates[:0] = [bundle_path, bundle_path / "hikrobot", bundle_path / "hikrobot" / "MvImport"]
 
     try:
         package_spec = find_spec("hikrobot")
@@ -731,9 +737,13 @@ class MvsCamera:
 
             image = self._frame_to_image(raw_buffer, frame_info)
             camera_timestamp = (int(frame_info.nDevTimeStampHigh) << 32) | int(frame_info.nDevTimeStampLow)
+            try:
+                frame_num = int(frame_info.nFrameNum)
+            except AttributeError:
+                frame_num = int(frame_info.stFrameInfo.nFrameNum)
             return Frame(
                 image=image,
-                frame_number=int(frame_info.nFrameNum),
+                frame_number=frame_num,
                 width=int(frame_info.nWidth),
                 height=int(frame_info.nHeight),
                 host_timestamp=int(frame_info.nHostTimeStamp),
@@ -875,20 +885,37 @@ class MvsCamera:
             value = self._cam.MV_CC_GetFloatValue(key)
             if isinstance(value, tuple) and value:
                 for item in reversed(value):
-                    if isinstance(item, (int, float)):
-                        return float(item)
-                    if hasattr(item, "fCurValue"):
-                        return float(item.fCurValue)
-            if hasattr(value, "fCurValue"):
-                return float(value.fCurValue)
-            if isinstance(value, (int, float)):
-                return float(value)
+                    parsed = self._float_from_sdk_value(item, key)
+                    if parsed is not None:
+                        return parsed
+                LOGGER.debug("%s: direct float node %s returned tuple without numeric value: %r", self.info.label, key, value)
+            else:
+                parsed = self._float_from_sdk_value(value, key)
+                if parsed is not None:
+                    return parsed
+                LOGGER.debug("%s: direct float node %s returned unsupported value: %r", self.info.label, key, value)
         except Exception as exc:
             LOGGER.debug("%s: exception while reading float node %s using direct API: %s", self.info.label, key, exc, exc_info=True)
         try:
             return float(self._get_int(key))
         except Exception as exc:
             LOGGER.debug("%s: exception while reading float node %s as int fallback: %s", self.info.label, key, exc, exc_info=True)
+            return None
+
+    def _float_from_sdk_value(self, value: object, key: str) -> float | None:
+        if isinstance(value, (int, float)):
+            return float(value)
+        try:
+            raw = getattr(value, "fCurValue")
+        except AttributeError:
+            return None
+        except Exception as exc:
+            LOGGER.debug("%s: exception while reading fCurValue from %s: %s", self.info.label, key, exc, exc_info=True)
+            return None
+        try:
+            return float(raw)
+        except (TypeError, ValueError, OverflowError) as exc:
+            LOGGER.debug("%s: invalid fCurValue for %s: %r (%s)", self.info.label, key, raw, exc, exc_info=True)
             return None
 
     def _try_get_float_any(self, keys: tuple[str, ...]) -> float | None:
@@ -988,6 +1015,11 @@ class StereoCameraSystem:
         if self.max_camera_timestamp_delta <= 0 and self.max_host_timestamp_delta <= 0:
             self.timestamp_reject_enabled = False
         self.require_hardware_trigger = config_bool(config, "require_hardware_trigger", False, False)
+        timeout_s = self.timeout_ms / 1000.0 + 1.0
+        self.software_trigger_barrier_timeout_s = max(
+            config_float(config, "software_trigger_barrier_timeout_seconds", timeout_s),
+            0.1,
+        )
         self.camera_timestamp_offset_samples = max(config_int(config, "camera_timestamp_offset_samples", 5), 1)
         self._camera_timestamp_offset: int | None = None
         self._camera_timestamp_offset_samples: list[int] = []
@@ -1011,6 +1043,7 @@ class StereoCameraSystem:
                     continue
                 cam.open()
                 opened.append(cam)
+                side = "left" if cam is left else "right"
                 cam.configure(
                     trigger_source=self.trigger_source,
                     exposure_time_us=float(self.config.get("exposure_time_us", 0) or 0),
@@ -1026,10 +1059,10 @@ class StereoCameraSystem:
                     balance_ratio_red=self._optional_float("balance_ratio_red"),
                     balance_ratio_green=self._optional_float("balance_ratio_green"),
                     balance_ratio_blue=self._optional_float("balance_ratio_blue"),
-                    roi_width=self._optional_int("roi_width"),
-                    roi_height=self._optional_int("roi_height"),
-                    roi_offset_x=int(self.config.get("roi_offset_x", 0) or 0),
-                    roi_offset_y=int(self.config.get("roi_offset_y", 0) or 0),
+                    roi_width=self._roi_value(side, "width", "roi_width"),
+                    roi_height=self._roi_value(side, "height", "roi_height"),
+                    roi_offset_x=int(self._roi_value(side, "offset_x", "roi_offset_x", 0) or 0),
+                    roi_offset_y=int(self._roi_value(side, "offset_y", "roi_offset_y", 0) or 0),
                 )
                 cam.start()
         except Exception:
@@ -1056,6 +1089,12 @@ class StereoCameraSystem:
         value = self.config.get(key, None)
         if value in (None, ""):
             return None
+        return int(value)
+
+    def _roi_value(self, side: str, field: str, default_key: str, default: int | None = None) -> int | None:
+        value = self.config.get(f"{side}_roi_{field}", self.config.get(default_key, default))
+        if value in (None, ""):
+            return default
         return int(value)
 
     def close(self) -> None:
@@ -1179,7 +1218,57 @@ class StereoCameraSystem:
                     f"左 W={left_result.actual_roi[0]}, H={left_result.actual_roi[1]}, X={left_result.actual_roi[2]}, Y={left_result.actual_roi[3]}；"
                     f"右 W={right_result.actual_roi[0]}, H={right_result.actual_roi[1]}, X={right_result.actual_roi[2]}, Y={right_result.actual_roi[3]}"
                 )
+            if restart_stream:
+                warnings.extend(self._warm_up_after_roi_locked())
             return RoiApplyResult(warnings, actual_roi)
+
+    def apply_side_roi_settings(
+        self,
+        rois: dict[str, tuple[int | None, int | None, int, int]],
+        restart_stream: bool = True,
+    ) -> tuple[dict[str, RoiApplyResult], list[str]]:
+        cameras = self._connected_cameras()
+        if not cameras:
+            raise MvsError("相机尚未连接。")
+        with self._capture_lock:
+            warnings: list[str] = []
+            results: dict[str, RoiApplyResult] = {}
+            for name, cam in cameras:
+                if name not in rois:
+                    continue
+                width, height, offset_x, offset_y = rois[name]
+                result = cam.apply_roi_settings(width, height, offset_x, offset_y, restart_stream=restart_stream)
+                results[name] = result
+                warnings.extend(result)
+            if restart_stream:
+                warnings.extend(self._warm_up_after_roi_locked())
+            return results, warnings
+
+    def _warm_up_after_roi_locked(self) -> list[str]:
+        warnings: list[str] = []
+        settle_s = max(config_float(self.config, "roi_restart_settle_seconds", 0.20), 0.0)
+        if settle_s > 0:
+            time.sleep(settle_s)
+
+        warmup_frames = max(config_int(self.config, "roi_warmup_frames", 2), 0)
+        if warmup_frames <= 0 or self.trigger_source.lower() != "software":
+            return warnings
+
+        timeout_default = min(max(int(self.timeout_ms), 1), 800)
+        timeout_ms = max(config_int(self.config, "roi_warmup_timeout_ms", timeout_default), 1)
+        for index in range(warmup_frames):
+            try:
+                self._capture_pair_locked(timeout_ms=timeout_ms)
+            except FrameTimeoutError as exc:
+                message = f"ROI warm-up frame {index + 1} timed out: {exc}"
+                LOGGER.warning(message)
+                warnings.append(message)
+            except Exception as exc:
+                message = f"ROI warm-up frame {index + 1} failed: {exc}"
+                LOGGER.warning(message)
+                warnings.append(message)
+                break
+        return warnings
 
     def apply_trigger_settings(self, trigger_source: str) -> list[str]:
         cameras = self._connected_cameras()
@@ -1192,14 +1281,15 @@ class StereoCameraSystem:
             self.trigger_source = trigger_source
             return warnings
 
-    def capture_pair(self) -> tuple[Frame | None, Frame | None, float]:
+    def capture_pair(self, timeout_ms: int | None = None) -> tuple[Frame | None, Frame | None, float]:
         with self._capture_lock:
-            return self._capture_pair_locked()
+            return self._capture_pair_locked(timeout_ms=timeout_ms)
 
-    def _capture_pair_locked(self) -> tuple[Frame | None, Frame | None, float]:
+    def _capture_pair_locked(self, timeout_ms: int | None = None) -> tuple[Frame | None, Frame | None, float]:
         cameras = self._connected_cameras()
         if not cameras:
             raise MvsError("相机尚未连接。")
+        effective_timeout_ms = max(int(timeout_ms if timeout_ms is not None else self.timeout_ms), 1)
 
         if self.require_hardware_trigger and self.trigger_source.lower() == "software":
             raise MvsError("Hardware trigger is required, but trigger_source is Software.")
@@ -1211,24 +1301,38 @@ class StereoCameraSystem:
             else:
                 barrier = threading.Barrier(len(cameras) + 1)
                 errors: list[Exception] = []
+                errors_lock = threading.Lock()
 
                 def fire(cam: MvsCamera) -> None:
                     try:
-                        barrier.wait()
+                        barrier.wait(timeout=self.software_trigger_barrier_timeout_s)
                         cam.trigger_software()
+                    except threading.BrokenBarrierError as exc:
+                        with errors_lock:
+                            errors.append(MvsError(f"{cam.info.label} 软触发同步等待超时"))
                     except Exception as exc:
-                        errors.append(exc)
+                        with errors_lock:
+                            errors.append(exc)
 
                 trigger_threads = [threading.Thread(target=fire, args=(cam,), daemon=True) for _name, cam in cameras]
                 for thread in trigger_threads:
                     thread.start()
                 trigger_time = time.time()
-                barrier.wait()
+                try:
+                    barrier.wait(timeout=self.software_trigger_barrier_timeout_s)
+                except threading.BrokenBarrierError as exc:
+                    with errors_lock:
+                        errors.append(MvsError("软触发同步等待超时，已取消本次采集"))
                 for thread in trigger_threads:
-                    thread.join()
+                    thread.join(timeout=self.software_trigger_barrier_timeout_s)
+                    if thread.is_alive():
+                        with errors_lock:
+                            errors.append(MvsError(f"软触发线程 {thread.name or thread.ident} 未能及时退出"))
                 if errors:
-                    message = "; ".join(str(exc) for exc in errors)
-                    if all(isinstance(exc, FrameTimeoutError) for exc in errors):
+                    with errors_lock:
+                        error_snapshot = list(errors)
+                    message = "; ".join(str(exc) for exc in error_snapshot)
+                    if all(isinstance(exc, FrameTimeoutError) for exc in error_snapshot):
                         raise FrameTimeoutError(message)
                     raise MvsError(message)
         else:
@@ -1239,7 +1343,7 @@ class StereoCameraSystem:
 
         def grab(name: str, cam: MvsCamera) -> None:
             try:
-                frames[name] = cam.grab_frame(self.timeout_ms)
+                frames[name] = cam.grab_frame(effective_timeout_ms)
             except Exception as exc:
                 errors.append(exc)
 

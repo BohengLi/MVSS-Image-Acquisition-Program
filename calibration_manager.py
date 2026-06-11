@@ -37,7 +37,7 @@ MATRIX_KEYS = (
     "distortion_coefficients",
     "dist_coeffs",
 )
-MAX_RECTIFICATION_MAP_CACHE = 3
+MAX_RECTIFICATION_MAP_CACHE = 8
 
 
 def _resolve_path(base_dir: Path, value: object) -> Path | None:

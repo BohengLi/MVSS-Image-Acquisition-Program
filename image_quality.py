@@ -176,16 +176,23 @@ def estimate_snr_db(gray: np.ndarray) -> float | None:
     best: tuple[float, float, float] | None = None
     step = 16
     block = 32
-    for y in range(0, max(region.shape[0] - block + 1, 1), step):
-        for x in range(0, max(region.shape[1] - block + 1, 1), step):
-            patch = region[y : y + block, x : x + block].astype(np.float32)
-            if patch.shape[0] != block or patch.shape[1] != block:
-                continue
-            mean = float(np.mean(patch))
-            std = float(np.std(patch))
-            var = std * std
-            if best is None or var < best[0]:
-                best = (var, mean, std)
+    candidates = [
+        (y, x)
+        for y in range(0, max(region.shape[0] - block + 1, 1), step)
+        for x in range(0, max(region.shape[1] - block + 1, 1), step)
+    ]
+    if len(candidates) > 96:
+        sample_idx = np.linspace(0, len(candidates) - 1, 96, dtype=int)
+        candidates = [candidates[int(index)] for index in sample_idx]
+    for y, x in candidates:
+        patch = region[y : y + block, x : x + block].astype(np.float32)
+        if patch.shape[0] != block or patch.shape[1] != block:
+            continue
+        mean = float(np.mean(patch))
+        std = float(np.std(patch))
+        var = std * std
+        if best is None or var < best[0]:
+            best = (var, mean, std)
     if best is None:
         return None
     var, mean, std = best
