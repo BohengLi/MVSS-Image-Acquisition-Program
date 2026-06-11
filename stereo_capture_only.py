@@ -156,6 +156,51 @@ DEFAULT_HOST_TIMESTAMP_DELTA_NS = 10_000_000
 _CONFIG_MISSING = object()
 DEFAULT_PREVIEW_FPS = 15.0
 DEFAULT_RECORD_QUEUE_SECONDS = 10.0
+DIC_CAPTURE_MODE = "dic_capture"
+DIC_CAPTURE_CONFIG = {
+    "trigger_source": "Software",
+    "pixel_format": "Mono16",
+    "image_format": "jpg",
+    "record_jpeg_quality": 100,
+    "exposure_auto": "Off",
+    "exposure_time_us": 20000.0,
+    "gain_auto": "Off",
+    "gain": 0.0,
+    "roi_width": CAPTURE_WIDTH,
+    "roi_height": CAPTURE_HEIGHT,
+    "roi_offset_x": 0,
+    "roi_offset_y": 0,
+    "left_roi_width": CAPTURE_WIDTH,
+    "left_roi_height": CAPTURE_HEIGHT,
+    "left_roi_offset_x": 0,
+    "left_roi_offset_y": 0,
+    "right_roi_width": CAPTURE_WIDTH,
+    "right_roi_height": CAPTURE_HEIGHT,
+    "right_roi_offset_x": 0,
+    "right_roi_offset_y": 0,
+    "record_fps": 5.0,
+    "interval_capture_seconds": 0.5,
+    "interval_capture_count": None,
+    "record_save_image_sequence": True,
+    "record_realtime_mp4": True,
+    "auto_make_mp4": False,
+    "preview_fps": 5.0,
+    "record_queue_max_items": 32,
+    "record_queue_force_configured": True,
+    "chunk_data_enabled": True,
+    "timestamp_reject_enabled": False,
+    "record_capture_priority_mode": False,
+    "record_preview_during_capture": False,
+    "preview_quality_analysis_enabled": False,
+    "record_force_image_format": True,
+    "capture_quality_gate": {"enabled": False},
+}
+
+
+def dic_capture_defaults() -> dict[str, object]:
+    values = dict(DIC_CAPTURE_CONFIG)
+    values["capture_quality_gate"] = dict(DIC_CAPTURE_CONFIG["capture_quality_gate"])
+    return values
 
 
 class UiEventQueue(Queue[tuple[str, object]]):
@@ -411,7 +456,35 @@ def configured_record_queue_size(config: dict, fps: float | None = None) -> int:
     target_fps = fps if fps is not None and fps > 0 else configured_record_output_fps(config)
     required = int(round(max(target_fps, 0.1) * DEFAULT_RECORD_QUEUE_SECONDS))
     configured = config_int(config, "record_queue_max_items", required)
+    if config_bool(config, "record_queue_force_configured", False, False):
+        return max(configured, 1)
     return max(configured, required, 1)
+
+
+def configured_record_outputs(config: dict, save_image_sequence: bool) -> dict[str, object]:
+    post_make_mp4 = config_bool(config, "auto_make_mp4", True, True)
+    realtime_mp4_enabled = config_bool(config, "record_realtime_mp4", not save_image_sequence, not save_image_sequence)
+    forced_realtime = False
+    if not save_image_sequence and not (post_make_mp4 or realtime_mp4_enabled):
+        realtime_mp4_enabled = True
+        forced_realtime = True
+    elif not save_image_sequence and not realtime_mp4_enabled:
+        realtime_mp4_enabled = True
+        forced_realtime = True
+    make_mp4_after = post_make_mp4 and save_image_sequence and not realtime_mp4_enabled
+    use_realtime_mp4 = realtime_mp4_enabled
+    return {
+        "post_make_mp4": post_make_mp4,
+        "record_realtime_mp4": realtime_mp4_enabled,
+        "make_mp4_after": make_mp4_after,
+        "use_realtime_mp4": use_realtime_mp4,
+        "forced_realtime": forced_realtime,
+        "mp4_generation": "ffmpeg_after_recording"
+        if make_mp4_after
+        else "opencv_realtime"
+        if use_realtime_mp4
+        else "disabled",
+    }
 
 
 def optional_config_text(config: dict, key: str, default: str = "") -> str:
@@ -1529,6 +1602,7 @@ class StereoCaptureOnlyApp:
         self._record_last_disk_check = 0.0
         self._record_disk_usage_start = 0
         self._record_summary: dict[str, object] = {}
+        self._dic_recording = False
         self._last_alert_times: dict[str, float] = {}
         self._last_reconnect_message = ""
         self._reconnecting = False
@@ -1793,6 +1867,15 @@ class StereoCaptureOnlyApp:
         ttk.Button(interval_panel, text="复位", command=self.reset_photo_count, width=5).grid(
             row=0, column=11, padx=(0, 4), pady=2
         )
+        self.dic_capture_button = ttk.Button(
+            interval_panel,
+            text="DIC采集",
+            command=self.toggle_dic_capture,
+            state=DISABLED,
+            style="Record.TButton",
+            width=8,
+        )
+        self.dic_capture_button.grid(row=0, column=12, padx=(0, 4), pady=2)
 
         info = ttk.Frame(toolbar, style="InfoBar.TFrame", padding=(8, 4))
         info.pack(side=TOP, fill=X, pady=(5, 0))
@@ -3505,6 +3588,9 @@ class StereoCaptureOnlyApp:
         if self.interval_capturing:
             self.status_var.set("定时拍照中不能开始录像。")
             return
+        if self._dic_recording:
+            self.status_var.set("DIC 图像采集中不能开始普通录像。")
+            return
         self._ensure_recording_config_defaults()
         try:
             fps = optional_positive_fps(self.record_fps_var.get())
@@ -3542,8 +3628,53 @@ class StereoCaptureOnlyApp:
             }
         )
         config_snapshot = self._update_config(persisted_updates)
-        if not self._check_disk_space_for_recording(config_snapshot):
+        self._start_record_session(config_snapshot, mode="video")
+
+    def toggle_dic_capture(self) -> None:
+        if self._dic_recording and self.recording:
+            self.stop_recording()
+        else:
+            self.start_dic_capture()
+
+    def _dic_capture_config(self) -> dict[str, object]:
+        dic_section = self._config_snapshot().get("dic_capture", {})
+        dic_overrides = dic_section if isinstance(dic_section, dict) else {}
+        snapshot = {**self._config_snapshot(), **dic_capture_defaults(), **dic_overrides}
+        gate = dict(snapshot.get("capture_quality_gate", DIC_CAPTURE_CONFIG["capture_quality_gate"]))
+        snapshot["capture_quality_gate"] = gate
+        snapshot["image_format"] = image_extension(snapshot)
+        return snapshot
+
+    def start_dic_capture(self) -> None:
+        if self.camera_system is None:
             return
+        if self.recording:
+            self.status_var.set("录像中不能启动 DIC 图像采集。")
+            return
+        if self.interval_capturing:
+            self.status_var.set("定时拍照中不能启动 DIC 图像采集。")
+            return
+        config_snapshot = self._dic_capture_config()
+        self._load_vars_from_snapshot(config_snapshot)
+        self.status_var.set("正在应用 DIC 图像采集参数...")
+        self.dic_capture_button.configure(state=DISABLED)
+        self._set_parameter_buttons(DISABLED)
+
+        def worker() -> None:
+            try:
+                warnings = self._apply_capture_config_to_camera(config_snapshot)
+                persisted = self._update_config(config_snapshot)
+                self._set_cached_trigger_source(str(persisted.get("trigger_source", "Software")))
+                self.ui_queue.put(("dic_start", (persisted, warnings)))
+            except Exception as exc:
+                self.ui_queue.put(("error", exc))
+                self.ui_queue.put(("dic_start_failed", None))
+
+        self._start_background_thread(worker, "start-dic-capture")
+
+    def _start_record_session(self, config_snapshot: dict, *, mode: str = "video", status_prefix: str = "正在录像") -> bool:
+        if not self._check_disk_space_for_recording(config_snapshot):
+            return False
         self._reset_stats()
         display_enabled = self.previewing and config_bool(
             config_snapshot, "record_preview_during_capture", False, False
@@ -3564,17 +3695,26 @@ class StereoCaptureOnlyApp:
             self._record_last_frame_pair = None
         self.record_dir = self.project_manager.output_root_for_mode("videos") / time.strftime("%Y%m%d_%H%M%S")
         self.record_dir.mkdir(parents=True, exist_ok=True)
+        config_snapshot = {**config_snapshot, "record_mode": mode}
+        if mode == DIC_CAPTURE_MODE:
+            self._dic_recording = True
+            self.dic_capture_button.configure(text="停止DIC")
+        else:
+            self._dic_recording = False
         self.record_button.configure(text="停止录像")
         self._set_capture_buttons(NORMAL)
         self._set_recording_indicator(True)
         display_note = "并显示画面" if self.previewing else ""
-        self.status_var.set(f"正在录像{display_note}：{self.record_dir}")
+        self.status_var.set(f"{status_prefix}{display_note}：{self.record_dir}")
         self.record_thread = threading.Thread(target=self._record_loop, args=(config_snapshot,), daemon=True)
         self.record_thread.start()
+        return True
 
     def stop_recording(self) -> None:
         self.recording = False
         self.record_button.configure(state=DISABLED)
+        if self._dic_recording and hasattr(self, "dic_capture_button"):
+            self.dic_capture_button.configure(state=DISABLED)
         self._set_recording_indicator(False)
         self.status_var.set("正在停止录像并整理文件...")
 
@@ -3696,31 +3836,27 @@ class StereoCaptureOnlyApp:
         capture_mode = str(getattr(camera_system, "trigger_source", config_snapshot.get("trigger_source", ""))).strip().lower()
         continuous_capture = capture_mode in {"continuous", "freerun", "free-run", "free run", "off", "none", "trigger off", "no trigger"}
         interval = 1.0 / capture_fps if capture_fps is not None else 0.0
+        image_interval = (
+            max(config_float(config_snapshot, "interval_capture_seconds", interval), 0.0)
+            if config_bool(config_snapshot, "record_force_image_format", False, False)
+            else interval
+        )
         acquisition_interval = 0.0 if continuous_capture else interval
         save_interval = 1.0 / fps if fps > 0 else 0.0
         ext = image_extension(config_snapshot)
         save_image_sequence = config_bool(config_snapshot, "record_save_image_sequence", False, False)
-        auto_make_mp4 = config_bool(config_snapshot, "auto_make_mp4", True, True)
-        realtime_mp4_enabled = config_bool(
-            config_snapshot,
-            "record_realtime_mp4",
-            not save_image_sequence,
-            not save_image_sequence,
-        )
-        if not save_image_sequence and not auto_make_mp4:
+        output_plan = configured_record_outputs(config_snapshot, save_image_sequence)
+        post_make_mp4 = bool(output_plan["post_make_mp4"])
+        realtime_mp4_enabled = bool(output_plan["record_realtime_mp4"])
+        if bool(output_plan["forced_realtime"]):
             LOGGER.warning("Recording has no enabled output; forcing realtime MP4 output.")
-            auto_make_mp4 = True
-            realtime_mp4_enabled = True
-        elif not save_image_sequence and auto_make_mp4 and not realtime_mp4_enabled:
-            LOGGER.warning("Realtime MP4 is required when image sequence output is disabled; enabling it.")
-            realtime_mp4_enabled = True
         if save_image_sequence:
             for side in ("left", "right"):
                 (record_dir / self._record_segment_dir(side, 1)).mkdir(parents=True, exist_ok=True)
 
         queue_size = configured_record_queue_size(config_snapshot, fps)
         image_queue: Queue[dict | None] | None = Queue(maxsize=queue_size) if save_image_sequence else None
-        video_queue: Queue[dict | None] | None = Queue(maxsize=queue_size) if auto_make_mp4 and realtime_mp4_enabled else None
+        video_queue: Queue[dict | None] | None = Queue(maxsize=queue_size) if realtime_mp4_enabled else None
         meta_writer = RecordMetaWriter(record_dir / "frames.meta.json", config_int(config_snapshot, "record_meta_flush_every", 32))
         writer_errors: list[Exception] = []
         writer_errors_lock = threading.Lock()
@@ -3729,10 +3865,10 @@ class StereoCaptureOnlyApp:
         next_save_time = time.perf_counter()
         last_status_time = 0.0
         max_seconds = max(config_float(config_snapshot, "record_max_seconds", 0.0), 0.0)
-        make_mp4_after = auto_make_mp4 and save_image_sequence
-        use_realtime_mp4 = auto_make_mp4 and realtime_mp4_enabled and not make_mp4_after
-        mp4_generation = "ffmpeg_after_recording" if make_mp4_after else "opencv_realtime" if use_realtime_mp4 else "disabled"
-        if not auto_make_mp4:
+        make_mp4_after = bool(output_plan["make_mp4_after"])
+        use_realtime_mp4 = bool(output_plan["use_realtime_mp4"])
+        mp4_generation = str(output_plan["mp4_generation"])
+        if save_image_sequence and not post_make_mp4 and not realtime_mp4_enabled:
             LOGGER.info("MP4 generation disabled by auto_make_mp4=false; recording %s sequence only.", ext.upper())
 
         workers: list[threading.Thread] = []
@@ -3740,7 +3876,7 @@ class StereoCaptureOnlyApp:
             workers.append(
                 threading.Thread(
                     target=self._record_image_writer_loop,
-                    args=(image_queue, meta_writer, interval, ext, writer_errors, writer_errors_lock, config_snapshot),
+                    args=(image_queue, meta_writer, image_interval, ext, writer_errors, writer_errors_lock, config_snapshot),
                     daemon=True,
                 )
             )
@@ -3892,8 +4028,9 @@ class StereoCaptureOnlyApp:
             write_lag, _write_warning, skip_every_n, skip_keep_frames = self._record_write_state_snapshot()
             stats = self._record_stats_snapshot()
             camera_system = self.camera_system
+            record_mode = str(config_snapshot.get("record_mode", "video"))
             meta = {
-                "mode": "video",
+                "mode": record_mode,
                 "fps": fps,
                 "effective_video_fps": output_fps,
                 "frame_count": stats["record_count"],
@@ -3907,14 +4044,16 @@ class StereoCaptureOnlyApp:
                 "disk_warning_count": stats["disk_warning_count"],
                 "image_format": ext,
                 "record_save_image_sequence": save_image_sequence,
-                "video_format": "mp4" if auto_make_mp4 else None,
+                "video_format": "mp4" if (post_make_mp4 or realtime_mp4_enabled) else None,
                 "video_codec": config_snapshot.get("video_codec", "mp4v"),
                 "video_bitrate_kbps": config_int(config_snapshot, "video_bitrate_kbps", 8000),
                 "video_quality_crf": config_int(config_snapshot, "video_quality_crf", 23),
                 "video_preset": config_snapshot.get("video_preset", "medium"),
                 "use_nvenc": config_bool(config_snapshot, "use_nvenc", False, False),
-                "auto_make_mp4": auto_make_mp4,
+                "auto_make_mp4": post_make_mp4,
+                "record_realtime_mp4": realtime_mp4_enabled,
                 "mp4_generation": mp4_generation,
+                "record_mode": record_mode,
                 "record_split_interval_seconds": config_float(config_snapshot, "record_split_interval_seconds", 600.0),
                 "record_split_size_gb": config_float(config_snapshot, "record_split_size_gb", 4.0),
                 "record_max_seconds": max_seconds,
@@ -3945,7 +4084,7 @@ class StereoCaptureOnlyApp:
             with (record_dir / "meta.json").open("w", encoding="utf-8") as fh:
                 json.dump(meta, fh, ensure_ascii=False, indent=2)
             manifest = self._write_manifest_for_session(record_dir, summary, config_snapshot)
-            self.project_manager.register_session("video", record_dir, record_dir / "meta.json", {"manifest": manifest})
+            self.project_manager.register_session(record_mode, record_dir, record_dir / "meta.json", {"manifest": manifest})
             self.ui_queue.put(("record_done", (record_dir, generated_video_names, summary)))
 
     def _reset_record_write_state(self) -> None:
@@ -4493,7 +4632,9 @@ class StereoCaptureOnlyApp:
                                 self._set_record_write_warning(f"Video codec fallback: {codec_name}")
                         writers[key].write(self._frame_to_video_frame(frame))
                         paths[side] = str(self._record_segment_video_path(side, segment_index))
-                        if self._should_save_raw_frame(frame, config_snapshot):
+                        if self._should_save_raw_frame(frame, config_snapshot) and not config_bool(
+                            config_snapshot, "record_force_image_format", False, False
+                        ):
                             raw_path = (
                                 self._require_record_dir()
                                 / "raw"
@@ -5150,6 +5291,30 @@ class StereoCaptureOnlyApp:
                 elif kind == "capture_idle":
                     if self.camera_system is not None and not self.interval_capturing:
                         self._set_capture_buttons(NORMAL)
+                elif kind == "dic_start":
+                    config_snapshot, warnings = payload if isinstance(payload, tuple) and len(payload) == 2 else (self._dic_capture_config(), [])
+                    self._set_parameter_buttons(NORMAL)
+                    started = self._start_record_session(
+                        dict(config_snapshot),
+                        mode=DIC_CAPTURE_MODE,
+                        status_prefix="DIC 图像采集中",
+                    )
+                    if not started:
+                        self._dic_recording = False
+                        if hasattr(self, "dic_capture_button"):
+                            self.dic_capture_button.configure(text="DIC采集")
+                        if self.camera_system is not None:
+                            self._set_capture_buttons(NORMAL)
+                        continue
+                    if warnings:
+                        self.status_var.set("DIC 参数已应用；" + "；".join(str(item) for item in warnings))
+                elif kind == "dic_start_failed":
+                    self._dic_recording = False
+                    if hasattr(self, "dic_capture_button"):
+                        self.dic_capture_button.configure(text="DIC采集", state=NORMAL if self.camera_system is not None else DISABLED)
+                    self._set_parameter_buttons(NORMAL)
+                    if self.camera_system is not None:
+                        self._set_capture_buttons(NORMAL)
                 elif kind == "interval_done":
                     self.interval_capturing = False
                     self.interval_button.configure(text="定时拍照")
@@ -5179,9 +5344,13 @@ class StereoCaptureOnlyApp:
                             self.status_var.set("实时采集已停止。")
                 elif kind == "record_done":
                     record_dir, video_names, summary = payload
+                    was_dic = self._dic_recording
+                    self._dic_recording = False
                     self.recording = False
                     self._hide_mp4_progress()
                     self.record_button.configure(text="开始录像")
+                    if hasattr(self, "dic_capture_button"):
+                        self.dic_capture_button.configure(text="DIC采集")
                     self.preview_button.configure(text="停止采集" if self.previewing else "开始采集")
                     self._set_recording_indicator(False)
                     self._set_capture_buttons(NORMAL)
@@ -5193,7 +5362,8 @@ class StereoCaptureOnlyApp:
                         reports = summary.get("record_reports")
                         if isinstance(reports, dict) and reports.get("html"):
                             report_note = f"；报告 {Path(str(reports['html'])).name}"
-                    self.status_var.set(f"录像完成：{record_dir}，{videos}；{self._format_record_summary(summary)}{report_note}")
+                    done_label = "DIC 图像采集完成" if was_dic else "录像完成"
+                    self.status_var.set(f"{done_label}：{record_dir}，{videos}；{self._format_record_summary(summary)}{report_note}")
                 elif kind == "param_idle":
                     if self.camera_system is not None:
                         self._set_parameter_buttons(NORMAL)
@@ -5227,6 +5397,8 @@ class StereoCaptureOnlyApp:
             self.hdr_button.configure(state=DISABLED)
             self.interval_button.configure(state=DISABLED)
             self.record_button.configure(state=DISABLED)
+            if hasattr(self, "dic_capture_button"):
+                self.dic_capture_button.configure(state=DISABLED)
             self.record_preflight_button.configure(state=NORMAL)
             self.calibration_wizard_button.configure(state=NORMAL)
             return
@@ -5239,25 +5411,33 @@ class StereoCaptureOnlyApp:
             self.photo_button.configure(state=state)
             self.hdr_button.configure(state=DISABLED)
             self.interval_button.configure(state=DISABLED)
-            self.record_button.configure(state=state)
+            self.record_button.configure(state=DISABLED if self._dic_recording else state)
+            if hasattr(self, "dic_capture_button"):
+                self.dic_capture_button.configure(state=state if self._dic_recording else DISABLED)
         elif self.interval_capturing:
             self.preview_button.configure(state=state)
             self.photo_button.configure(state=DISABLED)
             self.hdr_button.configure(state=DISABLED)
             self.interval_button.configure(state=state)
             self.record_button.configure(state=DISABLED)
+            if hasattr(self, "dic_capture_button"):
+                self.dic_capture_button.configure(state=DISABLED)
         elif self.previewing:
             self.preview_button.configure(state=state)
             self.photo_button.configure(state=state)
             self.hdr_button.configure(state=state)
             self.interval_button.configure(state=state)
             self.record_button.configure(state=state)
+            if hasattr(self, "dic_capture_button"):
+                self.dic_capture_button.configure(state=state)
         else:
             self.preview_button.configure(state=state)
             self.photo_button.configure(state=state)
             self.hdr_button.configure(state=state)
             self.interval_button.configure(state=state)
             self.record_button.configure(state=state)
+            if hasattr(self, "dic_capture_button"):
+                self.dic_capture_button.configure(state=state)
 
     def _set_parameter_buttons(self, state: str) -> None:
         self.apply_gain_button.configure(state=state)
@@ -5342,6 +5522,7 @@ class StereoCaptureOnlyApp:
             "close_total_thread_join_timeout_seconds": 10.0,
             "software_trigger_barrier_timeout_seconds": 1.0,
             "record_queue_max_items": 200,
+            "record_queue_force_configured": False,
             "record_queue_put_timeout_seconds": 0.05,
             "record_output_fps_when_unlimited": 30.0,
             "ffmpeg_sequence_gap_warning_threshold": 300,
@@ -5356,6 +5537,7 @@ class StereoCaptureOnlyApp:
             "record_clone_frames_for_writer": False,
             "record_drop_frames_on_write_lag": False,
             "record_checksum_during_capture": False,
+            "record_force_image_format": False,
             "focus_peaking_overlay_interval_seconds": 0.20,
             "record_disk_benchmark_enabled": True,
             "record_disk_benchmark_size_mb": 512.0,
@@ -5390,6 +5572,17 @@ class StereoCaptureOnlyApp:
             self.config["timestamp_reject_enabled"] = False
 
     def _ensure_project_config_defaults(self) -> None:
+        dic_capture = self._ensure_config_section("dic_capture")
+        for key, value in dic_capture_defaults().items():
+            if isinstance(value, dict):
+                section = dic_capture.get(key)
+                if not isinstance(section, dict):
+                    section = {}
+                    dic_capture[key] = section
+                for sub_key, sub_value in value.items():
+                    section.setdefault(sub_key, sub_value)
+            else:
+                dic_capture.setdefault(key, value)
         project = self._ensure_config_section("project")
         project.setdefault("enabled", True)
         project.setdefault("projects_subdir", "projects")
@@ -6423,6 +6616,85 @@ class StereoCaptureOnlyApp:
             "right_roi_offset_x": right_offset_x,
             "right_roi_offset_y": right_offset_y,
         }
+
+    def _load_vars_from_snapshot(self, snapshot: dict[str, object]) -> None:
+        self.trigger_source_var.set(str(snapshot.get("trigger_source", "Software")))
+        self._set_cached_trigger_source(str(snapshot.get("trigger_source", "Software")))
+        self.exposure_auto_var.set(str(snapshot.get("exposure_auto", "Off")))
+        self.exposure_time_var.set(str(snapshot.get("exposure_time_us", 10000.0)))
+        self.gain_auto_var.set(str(snapshot.get("gain_auto", "Off")))
+        self.gain_var.set(str(snapshot.get("gain", 0.0)))
+        self.left_roi_width_var.set(str(snapshot.get("left_roi_width", snapshot.get("roi_width", CAPTURE_WIDTH))))
+        self.left_roi_height_var.set(str(snapshot.get("left_roi_height", snapshot.get("roi_height", CAPTURE_HEIGHT))))
+        self.left_roi_offset_x_var.set(str(snapshot.get("left_roi_offset_x", snapshot.get("roi_offset_x", 0))))
+        self.left_roi_offset_y_var.set(str(snapshot.get("left_roi_offset_y", snapshot.get("roi_offset_y", 0))))
+        self.right_roi_width_var.set(str(snapshot.get("right_roi_width", snapshot.get("roi_width", CAPTURE_WIDTH))))
+        self.right_roi_height_var.set(str(snapshot.get("right_roi_height", snapshot.get("roi_height", CAPTURE_HEIGHT))))
+        self.right_roi_offset_x_var.set(str(snapshot.get("right_roi_offset_x", snapshot.get("roi_offset_x", 0))))
+        self.right_roi_offset_y_var.set(str(snapshot.get("right_roi_offset_y", snapshot.get("roi_offset_y", 0))))
+        self.interval_seconds_var.set(optional_config_text(snapshot, "interval_capture_seconds", ""))
+        self.interval_limit_var.set(optional_config_text(snapshot, "interval_capture_count", ""))
+        self.record_fps_var.set(str(snapshot.get("record_fps", 5.0)))
+
+    def _apply_capture_config_to_camera(self, config_snapshot: dict[str, object]) -> list[str]:
+        camera_system = self._require_camera_system()
+        warnings: list[str] = []
+        pixel_format = str(config_snapshot.get("pixel_format", "Mono8"))
+        apply_pixel_format = getattr(camera_system, "apply_pixel_format_settings", None)
+        if callable(apply_pixel_format):
+            warnings.extend(apply_pixel_format(pixel_format))
+        warnings.extend(camera_system.apply_trigger_settings(str(config_snapshot.get("trigger_source", "Software"))))
+        warnings.extend(
+            camera_system.apply_exposure_settings(
+                str(config_snapshot.get("exposure_auto", "Off")),
+                float(config_snapshot.get("exposure_time_us", 0.0) or 0.0),
+                optional_float_text(str(config_snapshot.get("auto_exposure_lower_limit") or "")),
+                optional_float_text(str(config_snapshot.get("auto_exposure_upper_limit") or "")),
+            )
+        )
+        warnings.extend(
+            camera_system.apply_gain_settings(
+                str(config_snapshot.get("gain_auto", "Off")),
+                float(config_snapshot.get("gain", 0.0) or 0.0),
+                optional_float_text(str(config_snapshot.get("auto_gain_lower_limit") or "")),
+                optional_float_text(str(config_snapshot.get("auto_gain_upper_limit") or "")),
+            )
+        )
+        rois = {
+            "left": (
+                int(config_snapshot.get("left_roi_width", config_snapshot.get("roi_width", CAPTURE_WIDTH)) or CAPTURE_WIDTH),
+                int(config_snapshot.get("left_roi_height", config_snapshot.get("roi_height", CAPTURE_HEIGHT)) or CAPTURE_HEIGHT),
+                int(config_snapshot.get("left_roi_offset_x", config_snapshot.get("roi_offset_x", 0)) or 0),
+                int(config_snapshot.get("left_roi_offset_y", config_snapshot.get("roi_offset_y", 0)) or 0),
+            ),
+            "right": (
+                int(config_snapshot.get("right_roi_width", config_snapshot.get("roi_width", CAPTURE_WIDTH)) or CAPTURE_WIDTH),
+                int(config_snapshot.get("right_roi_height", config_snapshot.get("roi_height", CAPTURE_HEIGHT)) or CAPTURE_HEIGHT),
+                int(config_snapshot.get("right_roi_offset_x", config_snapshot.get("roi_offset_x", 0)) or 0),
+                int(config_snapshot.get("right_roi_offset_y", config_snapshot.get("roi_offset_y", 0)) or 0),
+            ),
+        }
+        _results, roi_warnings = camera_system.apply_side_roi_settings(rois, restart_stream=True)
+        warnings.extend(roi_warnings)
+        apply_chunk = getattr(camera_system, "apply_chunk_settings", None)
+        if callable(apply_chunk):
+            warnings.extend(
+                apply_chunk(
+                    config_bool(config_snapshot, "chunk_data_enabled", False, False),
+                    config_snapshot.get("chunk_selectors"),
+                )
+            )
+        if hasattr(camera_system, "config"):
+            camera_system.config.update(config_snapshot)
+        camera_system.trigger_source = str(config_snapshot.get("trigger_source", camera_system.trigger_source))
+        camera_system.timestamp_reject_enabled = config_bool(config_snapshot, "timestamp_reject_enabled", True, False)
+        camera_system.max_camera_timestamp_delta = int(config_snapshot.get("max_camera_timestamp_delta", 0) or 0)
+        camera_system.max_host_timestamp_delta = int(
+            config_snapshot.get("max_host_timestamp_delta", DEFAULT_HOST_TIMESTAMP_DELTA_NS) or 0
+        )
+        if camera_system.max_camera_timestamp_delta <= 0 and camera_system.max_host_timestamp_delta <= 0:
+            camera_system.timestamp_reject_enabled = False
+        return warnings
 
     def _save_current_capture_settings(self) -> None:
         values = self._current_parameter_config()
@@ -7682,7 +7954,8 @@ Output {esc('MP4 + image sequence' if config_bool(config_snapshot, 'record_save_
 
     def _save_frame(self, frame: CameraFrame, path: Path, config_snapshot: dict | None = None) -> Path:
         config_snapshot = config_snapshot or self._config_snapshot()
-        if self._should_save_raw_frame(frame, config_snapshot):
+        force_image = config_bool(config_snapshot, "record_force_image_format", False, False)
+        if self._should_save_raw_frame(frame, config_snapshot) and not force_image:
             return self._save_raw_frame(frame, path)
         if getattr(frame, "image", None) is None:
             return self._save_raw_frame(frame, path)
@@ -7889,6 +8162,7 @@ Output {esc('MP4 + image sequence' if config_bool(config_snapshot, 'record_save_
         self.previewing = False
         self.recording = False
         self.interval_capturing = False
+        self._dic_recording = False
         self.interval_stop_event.set()
         if self._focus_drift_timer is not None:
             self._focus_drift_timer.cancel()

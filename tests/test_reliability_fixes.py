@@ -10,6 +10,7 @@ from unittest.mock import patch
 import image_quality
 import mvs_camera
 import numpy as np
+from PIL import Image
 from mvs_camera import Frame, MvsCamera, RawFramePacket, StereoCameraSystem
 import stereo_capture_only
 from stereo_capture_only import StereoCaptureOnlyApp
@@ -313,6 +314,31 @@ class ReliabilityFixTests(unittest.TestCase):
         self.assertEqual(saved.dtype, np.uint16)
         self.assertEqual(saved.shape, (2, 2))
 
+    def test_force_image_format_saves_high_bit_depth_frame_as_jpeg(self) -> None:
+        app = StereoCaptureOnlyApp.__new__(StereoCaptureOnlyApp)
+        frame = Frame(
+            image=Image.new("L", (2, 2), 128),
+            frame_number=1,
+            width=2,
+            height=2,
+            host_timestamp=0,
+            camera_timestamp=0,
+            raw_data=np.array([[0, 4095], [2048, 1024]], dtype=np.uint16).tobytes(),
+            raw_frame_len=8,
+            pixel_type_name="PixelType_Gvsp_Mono16",
+            raw_bit_depth=16,
+            raw_array_shape=(2, 2),
+        )
+
+        with tempfile.TemporaryDirectory() as tmp:
+            path = app._save_frame(
+                frame,
+                Path(tmp) / "left_000001.jpg",
+                {"record_force_image_format": True, "image_format": "jpg", "record_jpeg_quality": 100},
+            )
+
+        self.assertEqual(path.suffix, ".jpg")
+
     def test_capture_priority_config_uses_realtime_mp4_without_image_sequence(self) -> None:
         app = StereoCaptureOnlyApp.__new__(StereoCaptureOnlyApp)
 
@@ -354,6 +380,45 @@ class ReliabilityFixTests(unittest.TestCase):
         }
 
         self.assertEqual(app._capture_priority_record_config(original), original)
+
+    def test_dic_capture_config_keeps_requested_outputs_and_camera_settings(self) -> None:
+        app = StereoCaptureOnlyApp.__new__(StereoCaptureOnlyApp)
+        app._config_snapshot = lambda: {"trigger_source": "Continuous", "record_capture_priority_mode": True}
+
+        config = app._dic_capture_config()
+
+        self.assertEqual(config["trigger_source"], "Software")
+        self.assertEqual(config["pixel_format"], "Mono16")
+        self.assertEqual(config["image_format"], "jpg")
+        self.assertEqual(config["record_jpeg_quality"], 100)
+        self.assertEqual(config["record_fps"], 5.0)
+        self.assertEqual(config["interval_capture_seconds"], 0.5)
+        self.assertTrue(config["record_save_image_sequence"])
+        self.assertTrue(config["record_realtime_mp4"])
+        self.assertFalse(config["auto_make_mp4"])
+        self.assertFalse(config["timestamp_reject_enabled"])
+        self.assertFalse(config["capture_quality_gate"]["enabled"])
+        self.assertFalse(config["record_capture_priority_mode"])
+
+    def test_dic_record_queue_uses_configured_capacity(self) -> None:
+        self.assertEqual(
+            stereo_capture_only.configured_record_queue_size(
+                {"record_queue_max_items": 32, "record_fps": 5.0, "record_queue_force_configured": True}
+            ),
+            32,
+        )
+
+    def test_realtime_mp4_is_independent_from_post_sequence_mp4_flag(self) -> None:
+        plan = stereo_capture_only.configured_record_outputs(
+            {"record_save_image_sequence": True, "record_realtime_mp4": True, "auto_make_mp4": False},
+            save_image_sequence=True,
+        )
+
+        self.assertFalse(plan["post_make_mp4"])
+        self.assertTrue(plan["record_realtime_mp4"])
+        self.assertFalse(plan["make_mp4_after"])
+        self.assertTrue(plan["use_realtime_mp4"])
+        self.assertEqual(plan["mp4_generation"], "opencv_realtime")
 
     def test_mp4_progress_total_counts_left_and_right_frame_paths(self) -> None:
         app = StereoCaptureOnlyApp.__new__(StereoCaptureOnlyApp)

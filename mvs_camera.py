@@ -574,7 +574,8 @@ class MvsCamera:
             LOGGER.warning(warning)
 
         if pixel_format:
-            self._try_set_enum_by_string("PixelFormat", pixel_format)
+            for warning in self.apply_pixel_format_settings(pixel_format, restart_stream=False):
+                LOGGER.warning(warning)
         self.apply_roi_settings(roi_width, roi_height, roi_offset_x, roi_offset_y, restart_stream=False)
         self.apply_exposure_settings(
             exposure_auto,
@@ -593,6 +594,32 @@ class MvsCamera:
             LOGGER.warning(warning)
 
         self._set_payload_size(self._get_int("PayloadSize"))
+
+    def apply_pixel_format_settings(self, pixel_format: str | None, restart_stream: bool = True) -> list[str]:
+        warnings: list[str] = []
+        value = str(pixel_format or "").strip()
+        if not value:
+            return warnings
+        was_grabbing = self._grabbing
+        if restart_stream and was_grabbing:
+            self.stop()
+        try:
+            if not self._try_set_enum_by_string("PixelFormat", value):
+                warnings.append(f"{self.info.label}: PixelFormat={value} 设置失败")
+            try:
+                self._set_payload_size(self._get_int("PayloadSize"))
+            except MvsError as exc:
+                LOGGER.debug("%s: failed to refresh PayloadSize after PixelFormat update: %s", self.info.label, exc, exc_info=True)
+        finally:
+            pending_exc_type = sys.exc_info()[0]
+            if restart_stream and was_grabbing:
+                try:
+                    self.start()
+                except Exception:
+                    LOGGER.exception("%s: failed to restart stream after applying PixelFormat.", self.info.label)
+                    if pending_exc_type is None:
+                        raise
+        return warnings
 
     def _optimize_gige_packet_size(self) -> None:
         if self.info.transport != "GigE":
@@ -1779,6 +1806,30 @@ class StereoCameraSystem:
             warnings: list[str] = []
             for _name, cam in cameras:
                 warnings.extend(cam.apply_white_balance_settings(balance_white_auto, red, green, blue))
+            return warnings
+
+    def apply_pixel_format_settings(self, pixel_format: str) -> list[str]:
+        cameras = self._connected_cameras()
+        if not cameras:
+            raise MvsError("相机尚未连接。")
+        with self._capture_lock:
+            warnings: list[str] = []
+            for _name, cam in cameras:
+                warnings.extend(cam.apply_pixel_format_settings(pixel_format))
+            self.config["pixel_format"] = pixel_format
+            return warnings
+
+    def apply_chunk_settings(self, enabled: bool, selectors: list[str] | tuple[str, ...] | str | None = None) -> list[str]:
+        cameras = self._connected_cameras()
+        if not cameras:
+            raise MvsError("相机尚未连接。")
+        with self._capture_lock:
+            warnings: list[str] = []
+            for _name, cam in cameras:
+                warnings.extend(cam.apply_chunk_settings(enabled, selectors))
+            self.config["chunk_data_enabled"] = bool(enabled)
+            if selectors is not None:
+                self.config["chunk_selectors"] = selectors
             return warnings
 
     def apply_roi_settings(
