@@ -152,6 +152,51 @@ def exposure_metrics(image: Image.Image | None, include_histogram: bool = True) 
     }
 
 
+def speckle_quality(image: Image.Image | None, roi: dict[str, Any] | None = None) -> dict[str, Any] | None:
+    if image is None:
+        return None
+    gray, _scale_x, _scale_y = _pil_to_gray(image, max_side=960)
+    x, y, w, h = roi_to_pixels(roi, gray.shape[1], gray.shape[0])
+    patch = gray[y : y + h, x : x + w]
+    if patch.size < 64:
+        return {
+            "score": 0.0,
+            "contrast_rms": 0.0,
+            "gradient_density": 0.0,
+            "saturation_pct": 100.0,
+            "rating": "poor",
+        }
+    patch_f = patch.astype(np.float32)
+    mean = float(np.mean(patch_f))
+    std = float(np.std(patch_f))
+    contrast_rms = float(std / max(mean, 1.0))
+    gx = cv2.Sobel(patch, cv2.CV_32F, 1, 0, ksize=3)
+    gy = cv2.Sobel(patch, cv2.CV_32F, 0, 1, ksize=3)
+    gradient = cv2.magnitude(gx, gy)
+    gradient_cutoff = max(float(np.percentile(gradient, 75)), 1.0)
+    gradient_density = float(np.count_nonzero(gradient > gradient_cutoff) / max(gradient.size, 1))
+    saturation_pct = float(
+        (np.count_nonzero(patch <= 1) + np.count_nonzero(patch >= 254)) * 100.0 / max(patch.size, 1)
+    )
+    contrast_score = min(contrast_rms / 0.35, 1.0)
+    texture_score = min(gradient_density / 0.25, 1.0)
+    saturation_penalty = min(saturation_pct / 10.0, 1.0)
+    score = float(max((0.55 * contrast_score + 0.45 * texture_score) * (1.0 - 0.5 * saturation_penalty), 0.0))
+    if score >= 0.75:
+        rating = "good"
+    elif score >= 0.45:
+        rating = "usable"
+    else:
+        rating = "poor"
+    return {
+        "score": score,
+        "contrast_rms": contrast_rms,
+        "gradient_density": gradient_density,
+        "saturation_pct": saturation_pct,
+        "rating": rating,
+    }
+
+
 def exposure_advice(mean: float, over_pct: float) -> str:
     if mean < 40.0 and over_pct < 0.5:
         return "曝光不足，建议增加曝光时间或增益"

@@ -7,8 +7,13 @@ from importlib.util import find_spec
 
 datas = [('config.json', '.')]
 hikrobot_spec = find_spec('hikrobot')
-hikrobot_dir = Path(hikrobot_spec.origin).resolve().parent
-datas += [(str(path), str(Path('hikrobot') / 'MvImport')) for path in (hikrobot_dir / 'MvImport').glob('*.py')]
+if hikrobot_spec is not None:
+    hikrobot_locations = list(hikrobot_spec.submodule_search_locations or [])
+    if hikrobot_spec.origin:
+        hikrobot_locations.append(str(Path(hikrobot_spec.origin).resolve().parent))
+    if hikrobot_locations:
+        hikrobot_dir = Path(hikrobot_locations[0]).resolve()
+        datas += [(str(path), str(Path('hikrobot') / 'MvImport')) for path in (hikrobot_dir / 'MvImport').glob('*.py')]
 
 
 a = Analysis(

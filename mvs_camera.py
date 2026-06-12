@@ -96,10 +96,17 @@ def _mvs_runtime_candidates() -> list[Path]:
 def _add_mvs_runtime_path() -> None:
     for path in _mvs_runtime_candidates():
         if path.exists():
-            try:
-                _DLL_DIRECTORIES.append(os.add_dll_directory(str(path)))
-            except (AttributeError, OSError):
-                os.environ["PATH"] = str(path) + os.pathsep + os.environ.get("PATH", "")
+            add_dll_directory = getattr(os, "add_dll_directory", None)
+            if callable(add_dll_directory):
+                try:
+                    _DLL_DIRECTORIES.append(add_dll_directory(str(path)))
+                    continue
+                except OSError:
+                    LOGGER.debug("os.add_dll_directory failed for %s; falling back to PATH", path, exc_info=True)
+            path_text = str(path)
+            current_path = os.environ.get("PATH", "")
+            if path_text not in current_path.split(os.pathsep):
+                os.environ["PATH"] = path_text + os.pathsep + current_path
 
 
 def _mvs_python_candidates() -> list[Path]:
@@ -2430,6 +2437,36 @@ class StereoCameraSystem:
         self._camera_timestamp_offset_samples.append(int(raw_camera_delta))
         if len(self._camera_timestamp_offset_samples) >= self.camera_timestamp_offset_samples:
             self._camera_timestamp_offset = self._median_offset(self._camera_timestamp_offset_samples)
+
+    def camera_timestamp_offset(self) -> int | None:
+        return self._camera_timestamp_offset
+
+    def set_camera_timestamp_offset(self, offset: int | None, *, seed_samples: bool = True) -> None:
+        self._camera_timestamp_offset = None if offset is None else int(offset)
+        self._camera_timestamp_offset_samples.clear()
+        if seed_samples and self._camera_timestamp_offset is not None:
+            for _ in range(self.camera_timestamp_offset_samples):
+                self._camera_timestamp_offset_samples.append(self._camera_timestamp_offset)
+
+    def calibrate_camera_timestamp_offset(self, sample_count: int | None = None, timeout_ms: int | None = None) -> int:
+        count = max(int(sample_count or self.camera_timestamp_offset_samples), 1)
+        previous_enabled = self.timestamp_reject_enabled
+        self.timestamp_reject_enabled = False
+        offsets: list[int] = []
+        try:
+            for _ in range(count):
+                left, right, _trigger_time = self.capture_pair(timeout_ms=timeout_ms)
+                if left is None or right is None:
+                    continue
+                offsets.append(int(left.camera_timestamp) - int(right.camera_timestamp))
+        finally:
+            self.timestamp_reject_enabled = previous_enabled
+        if not offsets:
+            raise FrameTimeoutError("unable to calibrate camera timestamp offset: no stereo frame pairs captured")
+        offset = self._median_offset(offsets)
+        self.set_camera_timestamp_offset(offset)
+        self.config["camera_timestamp_offset_fixed"] = offset
+        return offset
 
     def _validate_frame_sync(self, left: Frame, right: Frame) -> None:
         if not self.timestamp_reject_enabled:

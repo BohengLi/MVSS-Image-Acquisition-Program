@@ -459,6 +459,15 @@ class ReliabilityFixTests(unittest.TestCase):
         self.assertTrue(due)
         self.assertAlmostEqual(next_time, 2.5)
 
+    def test_record_intervals_ignore_interval_capture_seconds_for_forced_images(self) -> None:
+        interval, image_interval = stereo_capture_only.effective_record_intervals(
+            {"record_force_image_format": True, "interval_capture_seconds": 5.0},
+            10.0,
+        )
+
+        self.assertAlmostEqual(interval, 0.1)
+        self.assertAlmostEqual(image_interval, 0.1)
+
     def test_thread_safe_config_setdefault_returns_wrapped_existing_dict(self) -> None:
         config = stereo_capture_only.ThreadSafeConfig({"nested": {"value": 1}})
 
@@ -690,9 +699,14 @@ class ReliabilityFixTests(unittest.TestCase):
         self.assertEqual(presets["DIC 标准"]["hardware_sync_master_line"], "Line2")
         self.assertEqual(presets["DIC 标准"]["hardware_sync_slave_line"], "Line0")
         self.assertEqual(presets["DIC 标准"]["pixel_format"], "Mono16")
+        self.assertEqual(presets["DIC 标准"]["image_format"], "png")
+        self.assertTrue(presets["DIC 标准"]["save_raw_frames"])
+        self.assertEqual(presets["DIC 标准"]["raw_frame_format"], "tiff16")
         self.assertTrue(presets["DIC 标准"]["chunk_data_enabled"])
         self.assertIn("black_level", presets["室内低光"])
+        self.assertTrue(presets["室内低光"]["save_raw_frames"])
         self.assertEqual(presets["标定采集"]["pixel_format"], "Mono8")
+        self.assertFalse(presets["标定采集"]["save_raw_frames"])
 
     def test_raw_frame_storage_estimate_uses_uncompressed_size(self) -> None:
         estimated = stereo_capture_only.estimate_frame_bytes(
@@ -715,7 +729,10 @@ class ReliabilityFixTests(unittest.TestCase):
         self.assertEqual(config["hardware_sync_master_line"], "Line2")
         self.assertEqual(config["hardware_sync_slave_line"], "Line0")
         self.assertEqual(config["pixel_format"], "Mono16")
-        self.assertEqual(config["image_format"], "jpg")
+        self.assertEqual(config["image_format"], "png")
+        self.assertTrue(config["save_raw_frames"])
+        self.assertEqual(config["raw_frame_format"], "tiff16")
+        self.assertFalse(config["record_force_image_format"])
         self.assertEqual(config["record_jpeg_quality"], 100)
         self.assertEqual(config["record_fps"], 5.0)
         self.assertEqual(config["interval_capture_seconds"], 0.5)
@@ -1033,6 +1050,42 @@ class ReliabilityFixTests(unittest.TestCase):
         self.assertEqual(system._camera_timestamp_offset, 101)
         self.assertEqual(list(system._camera_timestamp_offset_samples), [100, 101, 102])
 
+    def test_fixed_camera_timestamp_offset_seeds_samples(self) -> None:
+        system = StereoCameraSystem.__new__(StereoCameraSystem)
+        system.camera_timestamp_offset_samples = 3
+        system._camera_timestamp_offset_samples = mvs_camera.deque(maxlen=8)
+        system._camera_timestamp_offset = None
+
+        system.set_camera_timestamp_offset(123)
+
+        self.assertEqual(system.camera_timestamp_offset(), 123)
+        self.assertEqual(list(system._camera_timestamp_offset_samples), [123, 123, 123])
+
+    def test_camera_timestamp_offset_calibration_uses_median_and_restores_reject(self) -> None:
+        system = StereoCameraSystem.__new__(StereoCameraSystem)
+        system.camera_timestamp_offset_samples = 3
+        system._camera_timestamp_offset_samples = mvs_camera.deque(maxlen=8)
+        system._camera_timestamp_offset = None
+        system.timestamp_reject_enabled = True
+        system.config = {}
+        deltas = iter([100, 104, 102])
+
+        def fake_capture_pair(timeout_ms=None):
+            delta = next(deltas)
+            return (
+                Frame(object(), 1, 1, 1, 0, 1000 + delta),
+                Frame(object(), 1, 1, 1, 0, 1000),
+                0.0,
+            )
+
+        system.capture_pair = fake_capture_pair
+
+        offset = system.calibrate_camera_timestamp_offset(sample_count=3)
+
+        self.assertEqual(offset, 102)
+        self.assertTrue(system.timestamp_reject_enabled)
+        self.assertEqual(system.config["camera_timestamp_offset_fixed"], 102)
+
     def test_record_status_text_accepts_unlimited_target_fps(self) -> None:
         app = StereoCaptureOnlyApp.__new__(StereoCaptureOnlyApp)
         app._record_elapsed_seconds = lambda: 1.0
@@ -1104,6 +1157,68 @@ class ReliabilityFixTests(unittest.TestCase):
         )
 
         self.assertEqual(calls, [(0.0, None, None)])
+
+    def test_field_correction_subtracts_dark_and_preserves_uint16_raw(self) -> None:
+        app = StereoCaptureOnlyApp.__new__(StereoCaptureOnlyApp)
+        app.config = {"field_correction": {"enabled": True}}
+        app._field_correction_lock = threading.Lock()
+        app._dark_frame_refs = {"left": np.array([[10, 10], [10, 10]], dtype=np.float32)}
+        app._flat_field_refs = {}
+        raw = np.array([[20, 30], [40, 50]], dtype=np.uint16).tobytes()
+        frame = Frame(
+            image=None,
+            frame_number=1,
+            width=2,
+            height=2,
+            host_timestamp=0,
+            camera_timestamp=0,
+            raw_data=raw,
+            raw_frame_len=len(raw),
+            pixel_type_name="PixelType_Gvsp_Mono16",
+            raw_bit_depth=16,
+        )
+
+        corrected = app._correct_frame(frame, "left")
+
+        self.assertIsNotNone(corrected)
+        saved = np.frombuffer(corrected.raw_data, dtype=np.uint16).reshape((2, 2))
+        self.assertEqual(saved.tolist(), [[10, 20], [30, 40]])
+
+    def test_speckle_quality_scores_textured_image_above_flat(self) -> None:
+        flat = Image.fromarray(np.full((64, 64), 128, dtype=np.uint8), "L")
+        rng = np.random.default_rng(123)
+        textured_array = rng.integers(64, 192, size=(64, 64), dtype=np.uint8)
+        textured = Image.fromarray(textured_array, "L")
+
+        flat_quality = image_quality.speckle_quality(flat)
+        textured_quality = image_quality.speckle_quality(textured)
+
+        self.assertLess(flat_quality["score"], textured_quality["score"])
+        self.assertIn(textured_quality["rating"], {"usable", "good"})
+
+    def test_displacement_overlay_composites_configured_output(self) -> None:
+        app = StereoCaptureOnlyApp.__new__(StereoCaptureOnlyApp)
+        app.status_var = _Var()
+        frame = Frame(
+            image=Image.fromarray(np.zeros((2, 2), dtype=np.uint8), "L"),
+            frame_number=1,
+            width=2,
+            height=2,
+            host_timestamp=0,
+            camera_timestamp=0,
+        )
+        with tempfile.TemporaryDirectory() as tmp:
+            overlay_path = Path(tmp) / "overlay.png"
+            overlay = np.zeros((2, 2, 4), dtype=np.uint8)
+            overlay[..., 0] = 255
+            overlay[..., 3] = 255
+            Image.fromarray(overlay, "RGBA").save(overlay_path)
+            app.config = {"dic_analysis": {"overlay_path": str(overlay_path)}}
+
+            result = app._displacement_overlay_for_frame(frame)
+
+        self.assertIsNotNone(result)
+        self.assertEqual(result.getpixel((0, 0)), (255, 0, 0))
 
     def test_roi_warmup_uses_configured_short_timeout(self) -> None:
         system = StereoCameraSystem.__new__(StereoCameraSystem)

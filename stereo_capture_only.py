@@ -38,6 +38,7 @@ from image_quality import (
     make_anaglyph,
     make_focus_peaking_overlay,
     roi_from_pixels,
+    speckle_quality,
 )
 from project_manager import ProjectManager, benchmark_write_speed, write_data_manifest
 
@@ -170,7 +171,7 @@ DIC_CAPTURE_CONFIG = {
     "hardware_sync_slave_activation": "RisingEdge",
     "hardware_sync_master_trigger_source": "Software",
     "pixel_format": "Mono16",
-    "image_format": "jpg",
+    "image_format": "png",
     "record_jpeg_quality": 100,
     "exposure_auto": "Off",
     "exposure_time_us": 20000.0,
@@ -203,7 +204,9 @@ DIC_CAPTURE_CONFIG = {
     "record_preview_during_capture": True,
     "record_preview_fps": 2.0,
     "preview_quality_analysis_enabled": False,
-    "record_force_image_format": True,
+    "record_force_image_format": False,
+    "save_raw_frames": True,
+    "raw_frame_format": "tiff16",
     "capture_quality_gate": {"enabled": False},
 }
 
@@ -227,8 +230,10 @@ def default_presets() -> dict[str, dict[str, object]]:
         "black_level": None,
         "digital_shift": None,
         "gamma": None,
-        "save_raw_frames": False,
-        "raw_frame_format": "npy",
+        "save_raw_frames": True,
+        "raw_frame_format": "tiff16",
+        "image_format": "png",
+        "record_force_image_format": False,
     }
     return {
         "室内低光": {
@@ -307,6 +312,8 @@ def default_presets() -> dict[str, dict[str, object]]:
             "pixel_format": "Mono8",
             "image_format": "png",
             "record_force_image_format": True,
+            "save_raw_frames": False,
+            "raw_frame_format": "npy",
             "exposure_auto": "Off",
             "exposure_time_us": 8000.0,
             "gain_auto": "Off",
@@ -705,6 +712,11 @@ def record_preview_due(now: float, next_preview_time: float, preview_fps: float)
     while next_preview_time <= now:
         next_preview_time += preview_interval
     return True, next_preview_time
+
+
+def effective_record_intervals(config: dict, capture_fps: float | None) -> tuple[float, float]:
+    interval = 1.0 / capture_fps if capture_fps is not None and capture_fps > 0 else 0.0
+    return interval, interval
 
 
 def format_duration(seconds: float) -> str:
@@ -1825,6 +1837,9 @@ class StereoCaptureOnlyApp:
         self._stereo_blink_phase = 0
         self._last_rectified_overlay_key: tuple[int | None, int | None] | None = None
         self._last_rectified_overlay_image: Image.Image | None = None
+        self._field_correction_lock = threading.Lock()
+        self._dark_frame_refs: dict[str, np.ndarray] = {}
+        self._flat_field_refs: dict[str, np.ndarray] = {}
         self._device_versions: dict[str, str | None] = {}
         self._latest_temperatures: dict[str, float | None] = {}
         self._latest_link_throughput_mbps: dict[str, float | None] = {}
@@ -1930,6 +1945,13 @@ class StereoCaptureOnlyApp:
         self.calibration_summary_var = StringVar(value=self.calibration.status_text())
         self.temperature_status_var = StringVar(value="Temp --")
         self.camera_health_var = StringVar(value="Health --")
+        fixed_offset = self.config.get("camera_timestamp_offset_fixed")
+        offset_text = f"Camera offset {fixed_offset}" if fixed_offset not in (None, "") else "Camera offset --"
+        self.timestamp_offset_var = StringVar(value=offset_text)
+        field_correction = self._ensure_config_section("field_correction")
+        self.field_correction_enabled_var = BooleanVar(value=config_bool(field_correction, "enabled", False, False))
+        self.field_correction_status_var = StringVar(value=self._field_correction_status_text())
+        self.dic_quality_var = StringVar(value="DIC speckle --")
         self.focus_peak_var = StringVar(value="峰值 -- | 0%")
         hdr = self._ensure_config_section("hdr_bracketing")
         hdr_ev_offsets = hdr.get("ev_offsets", [-2, -1, 0, 1, 2])
@@ -2563,6 +2585,10 @@ class StereoCaptureOnlyApp:
         self.health_panel.pack(side=TOP, fill=X, pady=(8, 0))
         self._build_health_panel(self.health_panel)
 
+        self.science_panel = ttk.LabelFrame(parent, text="测量校正", padding=(6, 4))
+        self.science_panel.pack(side=TOP, fill=X, pady=(8, 0))
+        self._build_science_panel(self.science_panel)
+
     def _build_focus_panel(self, panel: ttk.LabelFrame) -> None:
         top = ttk.Frame(panel, style="Panel.TFrame")
         top.pack(side=TOP, fill=X)
@@ -2672,6 +2698,53 @@ class StereoCaptureOnlyApp:
         )
         self.health_chart_canvas.pack(side=TOP, fill=X, pady=(4, 0))
 
+    def _build_science_panel(self, panel: ttk.LabelFrame) -> None:
+        ttk.Label(panel, textvariable=self.timestamp_offset_var, style="Panel.TLabel").pack(side=TOP, fill=X)
+        offset_buttons = ttk.Frame(panel, style="Panel.TFrame")
+        offset_buttons.pack(side=TOP, fill=X, pady=(3, 0))
+        self.timestamp_offset_button = ttk.Button(
+            offset_buttons,
+            text="计算时间偏置",
+            command=self.calibrate_camera_timestamp_offset,
+            state=DISABLED,
+            width=12,
+        )
+        self.timestamp_offset_button.pack(side=LEFT, padx=(0, 4))
+        self.timestamp_offset_clear_button = ttk.Button(
+            offset_buttons,
+            text="清除偏置",
+            command=self.clear_camera_timestamp_offset,
+            state=DISABLED,
+            width=9,
+        )
+        self.timestamp_offset_clear_button.pack(side=LEFT)
+        ttk.Checkbutton(
+            panel,
+            text="暗场/平场实时校正",
+            variable=self.field_correction_enabled_var,
+            command=self._sync_field_correction_enabled,
+        ).pack(side=TOP, anchor="w", pady=(6, 0))
+        ref_buttons = ttk.Frame(panel, style="Panel.TFrame")
+        ref_buttons.pack(side=TOP, fill=X, pady=(3, 0))
+        self.dark_frame_button = ttk.Button(
+            ref_buttons,
+            text="采集暗场",
+            command=self.capture_dark_frame_reference,
+            state=DISABLED,
+            width=9,
+        )
+        self.dark_frame_button.pack(side=LEFT, padx=(0, 4))
+        self.flat_field_button = ttk.Button(
+            ref_buttons,
+            text="采集平场",
+            command=self.capture_flat_field_reference,
+            state=DISABLED,
+            width=9,
+        )
+        self.flat_field_button.pack(side=LEFT)
+        ttk.Label(panel, textvariable=self.field_correction_status_var, style="Panel.TLabel").pack(side=TOP, fill=X, pady=(4, 0))
+        ttk.Label(panel, textvariable=self.dic_quality_var, style="Panel.TLabel").pack(side=TOP, fill=X)
+
     def _build_validation_panel(self, panel: ttk.Frame) -> None:
         top = ttk.Frame(panel, style="Panel.TFrame")
         top.pack(side=TOP, fill=X)
@@ -2692,6 +2765,7 @@ class StereoCaptureOnlyApp:
             "红蓝立体",
             "交替闪烁",
             "校正叠加",
+            "位移叠加",
             command=self._on_quality_menu_changed,
         ).pack(side=LEFT, padx=(0, 6))
         ttk.Label(top, text="辅助线", style="CompactPanel.TLabel").pack(side=LEFT, padx=(0, 4))
@@ -3085,11 +3159,9 @@ class StereoCaptureOnlyApp:
         if not BIAODING_DIR.exists():
             raise RuntimeError(f"标定程序目录不存在：{BIAODING_DIR}")
         biaoding_path = str(BIAODING_DIR)
-        if biaoding_path not in sys.path:
-            sys.path.insert(0, biaoding_path)
-        elif sys.path[0] != biaoding_path:
+        if biaoding_path in sys.path:
             sys.path.remove(biaoding_path)
-            sys.path.insert(0, biaoding_path)
+        sys.path.insert(0, biaoding_path)
         try:
             from calibration import calibrate_stereo_from_folders
             from biaoding_app import export_capture_calibration
@@ -3199,6 +3271,19 @@ class StereoCaptureOnlyApp:
             return 0
         return sum(info is not None for info in (self.camera_system.left_info, self.camera_system.right_info))
 
+    def _apply_fixed_camera_timestamp_offset(self) -> None:
+        if self.camera_system is None or not hasattr(self.camera_system, "set_camera_timestamp_offset"):
+            return
+        offset = self.config.get("camera_timestamp_offset_fixed")
+        if offset in (None, ""):
+            return
+        try:
+            self.camera_system.set_camera_timestamp_offset(int(offset))
+            if hasattr(self, "timestamp_offset_var"):
+                self.timestamp_offset_var.set(f"Camera offset {int(offset)}")
+        except (TypeError, ValueError):
+            LOGGER.warning("invalid fixed camera timestamp offset: %s", offset)
+
     def _display_frames(self, left: CameraFrame | None, right: CameraFrame | None) -> None:
         self._update_stats(left, right)
         self._update_performance_display()
@@ -3246,6 +3331,20 @@ class StereoCaptureOnlyApp:
                 self.left_pane.set_frame(left)
                 self.right_pane.set_frame(right)
                 self.calibration_summary_var.set("Calibration: rectification unavailable")
+        elif mode == "位移叠加" and left is not None:
+            image = self._displacement_overlay_for_frame(left)
+            if image is not None:
+                self.left_pane.set_display_image(image, f"Displacement overlay {image.width}x{image.height}")
+                if right is not None:
+                    self.right_pane.set_frame(right)
+                else:
+                    self.right_pane.set_no_signal()
+            else:
+                self.left_pane.set_frame(left)
+                if right is not None:
+                    self.right_pane.set_frame(right)
+                else:
+                    self.right_pane.set_no_signal()
         else:
             if left is not None:
                 self.left_pane.set_frame(left)
@@ -3273,6 +3372,30 @@ class StereoCaptureOnlyApp:
         self._last_rectified_overlay_key = key
         self._last_rectified_overlay_image = image
         return image
+
+    def _displacement_overlay_for_frame(self, frame: CameraFrame) -> Image.Image | None:
+        image = getattr(frame, "image", None)
+        if image is None:
+            return None
+        dic_analysis = self.config.get("dic_analysis", {})
+        overlay_value = str(dic_analysis.get("overlay_path", "") or "").strip() if isinstance(dic_analysis, dict) else ""
+        if not overlay_value:
+            self.status_var.set("位移叠加未配置：请在 dic_analysis.overlay_path 指向位移模块输出图。")
+            return None
+        overlay_path = Path(overlay_value)
+        if not overlay_path.is_absolute():
+            overlay_path = BASE_DIR / overlay_path
+        if not overlay_path.exists():
+            self.status_var.set(f"位移叠加文件不存在：{overlay_path}")
+            return None
+        try:
+            overlay = Image.open(overlay_path).convert("RGBA").resize(image.size, Image.Resampling.BILINEAR)
+            base = image.convert("RGBA")
+            return Image.alpha_composite(base, overlay).convert("RGB")
+        except Exception as exc:
+            LOGGER.exception("displacement overlay failed")
+            self.status_var.set(f"位移叠加失败：{exc}")
+            return None
 
     def _ensure_preview_thread_after_recording(self) -> None:
         if self.camera_system is None or self.recording or self.interval_capturing:
@@ -3333,7 +3456,9 @@ class StereoCaptureOnlyApp:
                 system = StereoCameraSystem(system_config)
                 left_info, right_info = system.connect()
                 self.camera_system = system
+                self._apply_fixed_camera_timestamp_offset()
                 self._device_versions = system.device_versions()
+                self._load_field_correction_references()
                 self._poll_camera_temperatures(force=True)
                 self.ui_queue.put(("connected", (left_info, right_info)))
             except Exception as exc:
@@ -3404,6 +3529,7 @@ class StereoCaptureOnlyApp:
                     raise
 
                 consecutive_timeouts = 0
+                left, right = self._correct_frame_pair(left, right)
                 if self.previewing:
                     self._preview_frame_counter += 1
                     self._poll_camera_temperatures()
@@ -3769,6 +3895,7 @@ class StereoCaptureOnlyApp:
                             break
                         continue
                     raise
+                left, right = self._correct_frame_pair(left, right)
                 self.interval_count += 1
                 metrics = self._quality_metrics_for_pair(left, right)
                 report = self._quality_report_from_metrics(metrics)
@@ -4085,12 +4212,7 @@ class StereoCaptureOnlyApp:
         fps = capture_fps or max(output_fps_setting, 0.1)
         capture_mode = str(getattr(camera_system, "trigger_source", config_snapshot.get("trigger_source", ""))).strip().lower()
         continuous_capture = capture_mode in {"continuous", "freerun", "free-run", "free run", "off", "none", "trigger off", "no trigger"}
-        interval = 1.0 / capture_fps if capture_fps is not None else 0.0
-        image_interval = (
-            max(config_float(config_snapshot, "interval_capture_seconds", interval), 0.0)
-            if config_bool(config_snapshot, "record_force_image_format", False, False)
-            else interval
-        )
+        interval, image_interval = effective_record_intervals(config_snapshot, capture_fps)
         acquisition_interval = 0.0 if continuous_capture else interval
         save_interval = 1.0 / fps if fps > 0 else 0.0
         ext = image_extension(config_snapshot)
@@ -4183,6 +4305,7 @@ class StereoCaptureOnlyApp:
                         next_time = time.perf_counter() + acquisition_interval if acquisition_interval > 0 else time.perf_counter()
                         continue
                     raise
+                left, right = self._correct_frame_pair(left, right)
                 self._reset_record_timeouts()
                 record_count = self._increment_record_count()
                 self._record_capture_observed(record_count, trigger_time)
@@ -4328,6 +4451,13 @@ class StereoCaptureOnlyApp:
                 "stream_stats": dict(getattr(self, "_latest_stream_stats", {})),
                 "temperature_samples": list(self._temperature_samples),
                 "calibration": self.calibration.meta(),
+                "camera_timestamp_offset_fixed": config_snapshot.get("camera_timestamp_offset_fixed"),
+                "field_correction": dict(config_snapshot.get("field_correction", {}))
+                if isinstance(config_snapshot.get("field_correction"), dict)
+                else {},
+                "dic_analysis": dict(config_snapshot.get("dic_analysis", {}))
+                if isinstance(config_snapshot.get("dic_analysis"), dict)
+                else {},
                 "project": self.project_manager.project_meta(),
                 "data_manifest": {
                     "manifest_csv": str(record_dir / "exports" / "file_manifest.csv"),
@@ -5343,6 +5473,148 @@ class StereoCaptureOnlyApp:
 
         self._start_background_thread(worker, "apply-image-correction")
 
+    def _field_correction_status_text(self) -> str:
+        section = self.config.get("field_correction", {})
+        if not isinstance(section, dict):
+            return "Field correction --"
+        enabled = "on" if config_bool(section, "enabled", False, False) else "off"
+        dark = "dark" if section.get("dark_frame_path") else "no dark"
+        flat = "flat" if section.get("flat_field_path") else "no flat"
+        return f"Field correction {enabled} | {dark} | {flat}"
+
+    def _sync_field_correction_enabled(self) -> None:
+        section = self._ensure_config_section("field_correction")
+        section["enabled"] = bool(self.field_correction_enabled_var.get())
+        save_config(self.config)
+        self._load_field_correction_references()
+        self.field_correction_status_var.set(self._field_correction_status_text())
+
+    def _field_correction_dir(self) -> Path:
+        path = BASE_DIR / "calib" / "field_correction"
+        path.mkdir(parents=True, exist_ok=True)
+        return path
+
+    def _load_field_correction_references(self) -> None:
+        section = self.config.get("field_correction", {})
+        if not isinstance(section, dict):
+            return
+        refs: dict[str, dict[str, np.ndarray]] = {"dark": {}, "flat": {}}
+        for kind, key in (("dark", "dark_frame_path"), ("flat", "flat_field_path")):
+            value = str(section.get(key, "") or "").strip()
+            if not value:
+                continue
+            path = Path(value)
+            if not path.is_absolute():
+                path = BASE_DIR / path
+            if not path.exists():
+                continue
+            try:
+                with np.load(path) as data:
+                    for side in ("left", "right"):
+                        if side in data:
+                            refs[kind][side] = np.asarray(data[side], dtype=np.float32)
+            except Exception:
+                LOGGER.exception("field correction reference load failed: %s", path)
+        with self._field_correction_lock:
+            self._dark_frame_refs = refs["dark"]
+            self._flat_field_refs = refs["flat"]
+
+    def _relative_to_base(self, path: Path) -> str:
+        try:
+            return str(path.resolve().relative_to(BASE_DIR.resolve()))
+        except ValueError:
+            return str(path)
+
+    def _capture_field_reference_arrays(self, sample_count: int) -> dict[str, np.ndarray]:
+        sums: dict[str, np.ndarray] = {}
+        counts: dict[str, int] = {}
+        timeout_ms = self._preview_capture_timeout_ms()
+        for _ in range(max(int(sample_count), 1)):
+            left, right, _trigger_time = self._require_camera_system().capture_pair(timeout_ms=timeout_ms, convert_image=True)
+            for side, frame in (("left", left), ("right", right)):
+                array = self._frame_to_correction_array(frame)
+                if array is None:
+                    continue
+                if side not in sums:
+                    sums[side] = np.zeros_like(array, dtype=np.float64)
+                    counts[side] = 0
+                if sums[side].shape != array.shape:
+                    raise MvsError(f"{side} field correction frame size changed during reference capture")
+                sums[side] += array.astype(np.float64, copy=False)
+                counts[side] += 1
+        if not sums:
+            raise MvsError("未采集到可用于场校正的图像帧")
+        return {side: (array / max(counts[side], 1)).astype(np.float32) for side, array in sums.items()}
+
+    def _save_field_reference(self, kind: str, arrays: dict[str, np.ndarray]) -> Path:
+        path = self._field_correction_dir() / f"{kind}_{time.strftime('%Y%m%d_%H%M%S')}.npz"
+        np.savez_compressed(path, **arrays)
+        section = self._ensure_config_section("field_correction")
+        path_key = "dark_frame_path" if kind == "dark" else "flat_field_path"
+        section[path_key] = self._relative_to_base(path)
+        save_config(self.config)
+        self._load_field_correction_references()
+        if hasattr(self, "field_correction_status_var"):
+            self.field_correction_status_var.set(self._field_correction_status_text())
+        return path
+
+    def _capture_field_reference_async(self, kind: str) -> None:
+        if self.camera_system is None:
+            return
+        section = self._ensure_config_section("field_correction")
+        sample_count = max(config_int(section, "sample_count", 16), 1)
+        if hasattr(self, "dark_frame_button"):
+            self.dark_frame_button.configure(state=DISABLED)
+        if hasattr(self, "flat_field_button"):
+            self.flat_field_button.configure(state=DISABLED)
+        self.status_var.set(("正在采集暗场参考，请盖上镜头盖..." if kind == "dark" else "正在采集平场参考，请对准均匀光源..."))
+
+        def worker() -> None:
+            try:
+                arrays = self._capture_field_reference_arrays(sample_count)
+                path = self._save_field_reference(kind, arrays)
+                label = "暗场" if kind == "dark" else "平场"
+                self.ui_queue.put(("status", f"{label}参考已保存：{path}"))
+            except Exception as exc:
+                self.ui_queue.put(("error", exc))
+            finally:
+                self.ui_queue.put(("param_idle", None))
+
+        self._start_background_thread(worker, f"capture-{kind}-field")
+
+    def capture_dark_frame_reference(self) -> None:
+        self._capture_field_reference_async("dark")
+
+    def capture_flat_field_reference(self) -> None:
+        self._capture_field_reference_async("flat")
+
+    def calibrate_camera_timestamp_offset(self) -> None:
+        if self.camera_system is None:
+            return
+        if hasattr(self, "timestamp_offset_button"):
+            self.timestamp_offset_button.configure(state=DISABLED)
+        self.status_var.set("正在计算 CameraTimestamp Offset...")
+
+        def worker() -> None:
+            try:
+                offset = self.camera_system.calibrate_camera_timestamp_offset()
+                self._update_config({"camera_timestamp_offset_fixed": offset})
+                self.ui_queue.put(("timestamp_offset", offset))
+                self.ui_queue.put(("status", f"CameraTimestamp Offset 已固定为 {offset}"))
+            except Exception as exc:
+                self.ui_queue.put(("error", exc))
+            finally:
+                self.ui_queue.put(("param_idle", None))
+
+        self._start_background_thread(worker, "camera-timestamp-offset")
+
+    def clear_camera_timestamp_offset(self) -> None:
+        if self.camera_system is not None and hasattr(self.camera_system, "set_camera_timestamp_offset"):
+            self.camera_system.set_camera_timestamp_offset(None)
+        self._update_config({"camera_timestamp_offset_fixed": None})
+        self.timestamp_offset_var.set("Camera offset --")
+        self.status_var.set("CameraTimestamp Offset 已清除。")
+
     def apply_roi_settings(self, restart_stream: bool = True) -> None:
         if self.camera_system is None:
             return
@@ -5528,6 +5800,8 @@ class StereoCaptureOnlyApp:
                         percent = float(payload.get("percent", 0.0) or 0.0)
                         message = str(payload.get("message", "MP4 --"))
                         self._set_mp4_progress(percent, message, visible=True)
+                elif kind == "timestamp_offset":
+                    self.timestamp_offset_var.set(f"Camera offset {payload}")
                 elif kind == "shutter_flash":
                     self._flash_shutter_feedback()
                 elif kind == "photo_done":
@@ -5662,10 +5936,15 @@ class StereoCaptureOnlyApp:
                     with self._state_lock:
                         if generation != self._preview_generation:
                             continue
+                    should_continue_preview = bool(had_error and self.previewing and self.camera_system is not None)
                     if self.recording or self.interval_capturing:
                         self.preview_button.configure(text="停止采集" if self.previewing else "开始采集")
                         if self.camera_system is not None:
                             self._set_capture_buttons(NORMAL)
+                    elif should_continue_preview:
+                        self.preview_button.configure(text="停止采集")
+                        self._set_capture_buttons(NORMAL)
+                        self._start_preview_thread()
                     else:
                         self.previewing = False
                         self.preview_button.configure(text="开始采集")
@@ -5700,6 +5979,8 @@ class StereoCaptureOnlyApp:
                 elif kind == "param_idle":
                     if self.camera_system is not None:
                         self._set_parameter_buttons(NORMAL)
+                    if hasattr(self, "field_correction_status_var"):
+                        self.field_correction_status_var.set(self._field_correction_status_text())
                 elif kind == "error":
                     self._show_error(payload)
         except Empty:
@@ -5788,6 +6069,15 @@ class StereoCaptureOnlyApp:
         self.apply_correction_button.configure(state=state)
         self.apply_roi_button.configure(state=state)
         self.apply_trigger_button.configure(state=state)
+        for name in (
+            "timestamp_offset_button",
+            "timestamp_offset_clear_button",
+            "dark_frame_button",
+            "flat_field_button",
+        ):
+            button = getattr(self, name, None)
+            if button is not None:
+                button.configure(state=state)
 
     def _set_mp4_progress(self, percent: float, message: str, *, visible: bool = True) -> None:
         if not hasattr(self, "mp4_progress"):
@@ -5914,10 +6204,37 @@ class StereoCaptureOnlyApp:
             "black_level": None,
             "digital_shift": None,
             "gamma": None,
-            "save_raw_frames": False,
+            "save_raw_frames": True,
+            "image_format": "png",
+            "field_correction": {
+                "enabled": False,
+                "dark_frame_path": "",
+                "flat_field_path": "",
+                "sample_count": 16,
+            },
+            "dic_analysis": {
+                "enabled": False,
+                "displacement_module": "",
+                "output_schema_version": 1,
+                "overlay_path": "",
+            },
         }
         for key, value in defaults.items():
             self.config.setdefault(key, value)
+        if str(self.config.get("pixel_format", "")).lower() == "mono16":
+            if str(self.config.get("image_format", "")).lower() in {"jpg", "jpeg"}:
+                self.config["image_format"] = "png"
+            self.config["save_raw_frames"] = True
+        field_correction = self._ensure_config_section("field_correction")
+        field_correction.setdefault("enabled", False)
+        field_correction.setdefault("dark_frame_path", "")
+        field_correction.setdefault("flat_field_path", "")
+        field_correction.setdefault("sample_count", 16)
+        dic_analysis = self._ensure_config_section("dic_analysis")
+        dic_analysis.setdefault("enabled", False)
+        dic_analysis.setdefault("displacement_module", "")
+        dic_analysis.setdefault("output_schema_version", 1)
+        dic_analysis.setdefault("overlay_path", "")
         if (
             config_bool(self.config, "timestamp_reject_enabled", False, False)
             and int(self.config.get("max_camera_timestamp_delta", 0) or 0) <= 0
@@ -6274,6 +6591,10 @@ class StereoCaptureOnlyApp:
         update_histogram = bool(self._histogram_enabled_setting)
         metrics["left_exposure"] = exposure_metrics(left_image, include_histogram=update_histogram)
         metrics["right_exposure"] = exposure_metrics(right_image, include_histogram=update_histogram)
+        metrics["dic_speckle"] = {
+            "left": speckle_quality(left_image, roi),
+            "right": speckle_quality(right_image, roi),
+        }
         focus = metrics["focus"]
         if self._focus_peaking_enabled_setting and isinstance(focus, dict):
             now = time.perf_counter()
@@ -6316,7 +6637,27 @@ class StereoCaptureOnlyApp:
         left_exposure = metrics.get("left_exposure") if isinstance(metrics.get("left_exposure"), dict) else None
         right_exposure = metrics.get("right_exposure") if isinstance(metrics.get("right_exposure"), dict) else None
         self._update_exposure_display(left_exposure, right_exposure)
+        self._update_dic_quality_display(metrics.get("dic_speckle"))
         self._update_capture_gate_preview()
+
+    def _update_dic_quality_display(self, payload: object) -> None:
+        if not hasattr(self, "dic_quality_var"):
+            return
+        if not isinstance(payload, dict):
+            self.dic_quality_var.set("DIC speckle --")
+            return
+        scores: list[float] = []
+        ratings: list[str] = []
+        for side in ("left", "right"):
+            item = payload.get(side)
+            if not isinstance(item, dict):
+                continue
+            scores.append(float(item.get("score") or 0.0))
+            ratings.append(f"{side}:{item.get('rating', '--')}")
+        if not scores:
+            self.dic_quality_var.set("DIC speckle --")
+            return
+        self.dic_quality_var.set(f"DIC speckle {min(scores):.2f} | {' '.join(ratings)}")
 
     def _poll_camera_temperatures(self, force: bool = False) -> None:
         if self.camera_system is None:
@@ -7074,6 +7415,13 @@ class StereoCaptureOnlyApp:
             "record_force_image_format": config_bool(self.config, "record_force_image_format", False, False),
             "save_raw_frames": config_bool(self.config, "save_raw_frames", False, False),
             "raw_frame_format": raw_frame_format(self.config),
+            "camera_timestamp_offset_fixed": self.config.get("camera_timestamp_offset_fixed"),
+            "field_correction": dict(self.config.get("field_correction", {}))
+            if isinstance(self.config.get("field_correction"), dict)
+            else {},
+            "dic_analysis": dict(self.config.get("dic_analysis", {}))
+            if isinstance(self.config.get("dic_analysis"), dict)
+            else {},
             "chunk_data_enabled": config_bool(self.config, "chunk_data_enabled", False, False),
             "chunk_selectors": list(self.config.get("chunk_selectors", []))
             if isinstance(self.config.get("chunk_selectors"), list)
@@ -7483,6 +7831,8 @@ class StereoCaptureOnlyApp:
                     system = StereoCameraSystem(system_config)
                     left_info, right_info = system.connect()
                     self.camera_system = system
+                    self._apply_fixed_camera_timestamp_offset()
+                    self._load_field_correction_references()
                     self._add_record_reconnect()
                     self.ui_queue.put(("connected", (left_info, right_info)))
                     self.ui_queue.put(("status", "相机自动重连成功，采集任务继续。"))
@@ -8453,6 +8803,7 @@ Output {esc('MP4 + image sequence' if config_bool(config_snapshot, 'record_save_
         left_exposure = quality_metrics.get("left_exposure") if isinstance(quality_metrics.get("left_exposure"), dict) else None
         right_exposure = quality_metrics.get("right_exposure") if isinstance(quality_metrics.get("right_exposure"), dict) else None
         calibration_board = quality_metrics.get("calibration_board")
+        dic_speckle = quality_metrics.get("dic_speckle")
         self._write_meta(
             group_dir / "meta.json",
             mode=mode,
@@ -8470,6 +8821,7 @@ Output {esc('MP4 + image sequence' if config_bool(config_snapshot, 'record_save_
             focus_consistency_warning=bool(focus.get("consistency_warning")),
             exposure_left=self._meta_exposure(left_exposure),
             exposure_right=self._meta_exposure(right_exposure),
+            dic_speckle=dic_speckle,
             calibration_board=calibration_board,
             capture_quality_report=quality_report or self._quality_report_from_metrics(quality_metrics),
             data_manifest={
@@ -8482,6 +8834,7 @@ Output {esc('MP4 + image sequence' if config_bool(config_snapshot, 'record_save_
             {
                 "mode": mode,
                 "capture_id": capture_id,
+                "dic_speckle": dic_speckle,
                 "quality_report": quality_report or self._quality_report_from_metrics(quality_metrics),
             },
         )
@@ -8518,6 +8871,74 @@ Output {esc('MP4 + image sequence' if config_bool(config_snapshot, 'record_save_
         if width > 0 and height > 0 and raw_len >= width * height and ("mono" in pixel_name or "bayer" in pixel_name):
             return np.frombuffer(raw_data, dtype=np.uint8, count=width * height).reshape((height, width)).copy()
         return np.frombuffer(raw_data, dtype=np.uint8).copy()
+
+    def _frame_to_correction_array(self, frame: CameraFrame | None) -> np.ndarray | None:
+        if frame is None:
+            return None
+        raw_data = getattr(frame, "raw_data", None)
+        if raw_data is not None:
+            array = self._raw_frame_array(frame)
+            if array.ndim == 2:
+                return array.astype(np.float32, copy=False)
+        image = getattr(frame, "image", None)
+        if image is None:
+            return None
+        return np.asarray(image.convert("L"), dtype=np.float32)
+
+    def _correct_frame(self, frame: CameraFrame | None, side: str) -> CameraFrame | None:
+        if frame is None:
+            return None
+        field_correction = self.config.get("field_correction", {})
+        if not config_bool(field_correction if isinstance(field_correction, dict) else {}, "enabled", False, False):
+            return frame
+        array = self._frame_to_correction_array(frame)
+        if array is None:
+            return frame
+        with self._field_correction_lock:
+            dark = self._dark_frame_refs.get(side)
+            flat = self._flat_field_refs.get(side)
+        corrected = array.astype(np.float32, copy=True)
+        if dark is not None and dark.shape == corrected.shape:
+            corrected -= dark
+        if flat is not None and flat.shape == corrected.shape:
+            flat_work = flat.astype(np.float32, copy=False)
+            if dark is not None and dark.shape == flat_work.shape:
+                flat_work = flat_work - dark
+            gain = float(np.mean(flat_work[flat_work > 1.0])) if np.any(flat_work > 1.0) else 1.0
+            corrected = corrected / np.maximum(flat_work, 1.0) * gain
+        bit_depth = int(getattr(frame, "raw_bit_depth", 8) or 8)
+        max_value = float((1 << min(max(bit_depth, 8), 16)) - 1)
+        if bit_depth > 8:
+            corrected_u16 = np.clip(corrected, 0.0, max_value).astype(np.uint16)
+            image = Image.fromarray((corrected_u16 / max(max_value, 1.0) * 255.0).astype(np.uint8), "L")
+            raw_data = corrected_u16.tobytes()
+            raw_len = len(raw_data)
+        else:
+            corrected_u8 = np.clip(corrected, 0.0, 255.0).astype(np.uint8)
+            image = Image.fromarray(corrected_u8, "L")
+            raw_data = corrected_u8.tobytes()
+            raw_len = len(raw_data)
+        return CameraFrame(
+            image=image,
+            frame_number=frame.frame_number,
+            width=frame.width,
+            height=frame.height,
+            host_timestamp=frame.host_timestamp,
+            camera_timestamp=frame.camera_timestamp,
+            raw_data=raw_data,
+            raw_frame_len=raw_len,
+            pixel_type=frame.pixel_type,
+            pixel_type_name=frame.pixel_type_name,
+            raw_bit_depth=frame.raw_bit_depth,
+            raw_array_shape=getattr(frame, "raw_array_shape", None),
+        )
+
+    def _correct_frame_pair(
+        self,
+        left: CameraFrame | None,
+        right: CameraFrame | None,
+    ) -> tuple[CameraFrame | None, CameraFrame | None]:
+        return self._correct_frame(left, "left"), self._correct_frame(right, "right")
 
     def _validate_standard_raw_image_array(self, frame: CameraFrame, array: np.ndarray, fmt: str) -> None:
         width = int(getattr(frame, "width", 0) or 0)
@@ -8672,6 +9093,7 @@ Output {esc('MP4 + image sequence' if config_bool(config_snapshot, 'record_save_
             "timestamp_reject_enabled",
             "max_camera_timestamp_delta",
             "max_host_timestamp_delta",
+            "camera_timestamp_offset_fixed",
             "require_hardware_trigger",
             "hardware_sync_enabled",
             "hardware_sync_master",
@@ -8689,6 +9111,8 @@ Output {esc('MP4 + image sequence' if config_bool(config_snapshot, 'record_save_
             "gamma",
             "save_raw_frames",
             "raw_frame_format",
+            "field_correction",
+            "dic_analysis",
         )
         snapshot = {key: config_snapshot.get(key) for key in keys}
         snapshot["image_format"] = image_extension(config_snapshot)
@@ -8713,6 +9137,13 @@ Output {esc('MP4 + image sequence' if config_bool(config_snapshot, 'record_save_
         payload["stream_stats"] = dict(getattr(self, "_latest_stream_stats", {}))
         payload["temperature_samples"] = list(self._temperature_samples[-1000:])
         payload["calibration"] = self.calibration.meta()
+        payload["camera_timestamp_offset_fixed"] = self.config.get("camera_timestamp_offset_fixed")
+        payload["field_correction"] = dict(self.config.get("field_correction", {})) if isinstance(
+            self.config.get("field_correction"), dict
+        ) else {}
+        payload["dic_analysis"] = dict(self.config.get("dic_analysis", {})) if isinstance(
+            self.config.get("dic_analysis"), dict
+        ) else {}
         payload["project"] = self.project_manager.project_meta()
         tmp_path = path.with_name(f"{path.name}.tmp")
         with tmp_path.open("w", encoding="utf-8") as fh:

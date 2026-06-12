@@ -21,7 +21,7 @@
   "roi_offset_x": 0,
   "roi_offset_y": 0,
   "pixel_format": "Mono16",
-  "image_format": "jpg",
+  "image_format": "png",
   "frame_timeout_ms": 800,
   "preview_frame_timeout_ms": 300,
   "roi_restart_settle_seconds": 0.2,
@@ -106,8 +106,8 @@
       "black_level": null,
       "digital_shift": null,
       "gamma": null,
-      "save_raw_frames": false,
-      "raw_frame_format": "npy",
+      "save_raw_frames": true,
+      "raw_frame_format": "tiff16",
       "pixel_format": "Mono16",
       "chunk_data_enabled": true,
       "chunk_selectors": [
@@ -122,7 +122,9 @@
       "hardware_sync_master_line_source": "ExposureActive",
       "hardware_sync_slave_line": "Line0",
       "hardware_sync_slave_activation": "RisingEdge",
-      "hardware_sync_master_trigger_source": "Software"
+      "hardware_sync_master_trigger_source": "Software",
+      "image_format": "png",
+      "record_force_image_format": false
     },
     "室外强光": {
       "trigger_source": "Continuous",
@@ -153,8 +155,8 @@
       "black_level": null,
       "digital_shift": null,
       "gamma": null,
-      "save_raw_frames": false,
-      "raw_frame_format": "npy",
+      "save_raw_frames": true,
+      "raw_frame_format": "tiff16",
       "pixel_format": "Mono16",
       "chunk_data_enabled": true,
       "chunk_selectors": [
@@ -169,7 +171,9 @@
       "hardware_sync_master_line_source": "ExposureActive",
       "hardware_sync_slave_line": "Line0",
       "hardware_sync_slave_activation": "RisingEdge",
-      "hardware_sync_master_trigger_source": "Software"
+      "hardware_sync_master_trigger_source": "Software",
+      "image_format": "png",
+      "record_force_image_format": false
     },
     "DIC 标准": {
       "roi_width": 5472,
@@ -331,7 +335,7 @@
   "preview_analysis_fps": 1.0,
   "record_drop_frames_on_write_lag": false,
   "record_checksum_during_capture": false,
-  "save_raw_frames": false,
+  "save_raw_frames": true,
   "preview_quality_analysis_enabled": false,
   "left_roi_width": 5472,
   "left_roi_height": 3648,
@@ -377,7 +381,7 @@
   "dic_capture": {
     "trigger_source": "Cascade",
     "pixel_format": "Mono16",
-    "image_format": "jpg",
+    "image_format": "png",
     "record_jpeg_quality": 100,
     "exposure_auto": "Off",
     "exposure_time_us": 20000.0,
@@ -410,11 +414,11 @@
     "record_preview_during_capture": true,
     "record_preview_fps": 2.0,
     "preview_quality_analysis_enabled": false,
-    "record_force_image_format": true,
+    "record_force_image_format": false,
     "capture_quality_gate": {
       "enabled": false
     },
-    "raw_frame_format": "npy",
+    "raw_frame_format": "tiff16",
     "trigger_activation": "RisingEdge",
     "require_hardware_trigger": true,
     "hardware_sync_enabled": true,
@@ -423,16 +427,30 @@
     "hardware_sync_master_line_source": "ExposureActive",
     "hardware_sync_slave_line": "Line0",
     "hardware_sync_slave_activation": "RisingEdge",
-    "hardware_sync_master_trigger_source": "Software"
+    "hardware_sync_master_trigger_source": "Software",
+    "save_raw_frames": true
   },
   "record_queue_force_configured": true,
-  "record_force_image_format": true,
-  "raw_frame_format": "npy",
+  "record_force_image_format": false,
+  "raw_frame_format": "tiff16",
   "hardware_sync_enabled": false,
   "hardware_sync_master": "left",
   "hardware_sync_master_line": "Line2",
   "hardware_sync_master_line_source": "ExposureActive",
   "hardware_sync_slave_line": "Line0",
   "hardware_sync_slave_activation": "RisingEdge",
-  "hardware_sync_master_trigger_source": "Software"
+  "hardware_sync_master_trigger_source": "Software",
+  "field_correction": {
+    "enabled": false,
+    "dark_frame_path": "",
+    "flat_field_path": "",
+    "sample_count": 16
+  },
+  "dic_analysis": {
+    "enabled": false,
+    "displacement_module": "",
+    "output_schema_version": 1,
+    "overlay_path": ""
+  },
+  "camera_timestamp_offset_fixed": null
 }
