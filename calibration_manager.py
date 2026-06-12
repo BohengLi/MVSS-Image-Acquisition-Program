@@ -129,10 +129,11 @@ def _load_calibration_file(path: Path) -> dict[str, np.ndarray | float | str]:
                     result["image_size"] = matrix
         return result
 
-    fs = cv2.FileStorage(str(path), cv2.FILE_STORAGE_READ)
-    if not fs.isOpened():
-        raise ValueError(f"unable to open calibration file: {path}")
+    fs = None
     try:
+        fs = cv2.FileStorage(str(path), cv2.FILE_STORAGE_READ)
+        if not fs.isOpened():
+            raise ValueError(f"unable to open calibration file: {path}")
         result = {}
         for key in MATRIX_KEYS:
             value = _read_cv_node_matrix(fs, key)
@@ -147,7 +148,8 @@ def _load_calibration_file(path: Path) -> dict[str, np.ndarray | float | str]:
             result["image_size"] = value
         return result
     finally:
-        fs.release()
+        if fs is not None:
+            fs.release()
 
 
 def _first_matrix(data: dict[str, Any], keys: tuple[str, ...]) -> np.ndarray | None:

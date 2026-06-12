@@ -13,6 +13,7 @@ from importlib.util import find_spec
 from pathlib import Path
 from typing import Any, Callable
 
+import numpy as np
 from PIL import Image
 
 from config_utils import config_bool, config_float, config_int
@@ -338,6 +339,9 @@ class CameraParameters:
     balance_ratio_red: float | None = None
     balance_ratio_green: float | None = None
     balance_ratio_blue: float | None = None
+    black_level: float | None = None
+    digital_shift: float | None = None
+    gamma: float | None = None
     roi_width: int | None = None
     roi_height: int | None = None
     roi_offset_x: int = 0
@@ -358,6 +362,8 @@ class StreamStats:
     buffered_frames: int
     dropped_frames: int
     callback_enabled: bool
+    link_error_count: int | None = None
+    resend_packet_count: int | None = None
 
 
 @dataclass(frozen=True)
@@ -566,6 +572,9 @@ class MvsCamera:
         trigger_delay_us: float | None = None,
         line_debouncer_time_us: float | None = None,
         trigger_activation: str | None = None,
+        black_level: float | None = None,
+        digital_shift: float | None = None,
+        gamma: float | None = None,
     ) -> None:
         self._try_set_enum_by_string("AcquisitionMode", "Continuous")
         self._try_set_enum_by_string("TriggerSelector", "FrameStart")
@@ -574,7 +583,7 @@ class MvsCamera:
             LOGGER.warning(warning)
 
         if pixel_format:
-            for warning in self.apply_pixel_format_settings(pixel_format, restart_stream=False):
+            for warning in self.apply_pixel_format_settings(pixel_format, restart_stream=True):
                 LOGGER.warning(warning)
         self.apply_roi_settings(roi_width, roi_height, roi_offset_x, roi_offset_y, restart_stream=False)
         self.apply_exposure_settings(
@@ -590,6 +599,8 @@ class MvsCamera:
             balance_ratio_green,
             balance_ratio_blue,
         )
+        for warning in self.apply_image_correction_settings(black_level, digital_shift, gamma):
+            LOGGER.warning(warning)
         for warning in self.apply_chunk_settings(chunk_data_enabled, chunk_selectors):
             LOGGER.warning(warning)
 
@@ -664,6 +675,51 @@ class MvsCamera:
             warnings.append(f"{self.info.label}: 不支持的触发源 {trigger_source}")
         return warnings
 
+    def apply_trigger_output_settings(self, line_selector: str, line_source: str) -> list[str]:
+        warnings: list[str] = []
+        line = self._normalize_line_selector(line_selector)
+        source = self._normalize_line_source(line_source)
+        if not self._try_set_enum_by_string("LineSelector", line):
+            warnings.append(f"{self.info.label}: LineSelector={line} 设置失败")
+        if not self._try_set_enum_by_string("LineMode", "Output"):
+            warnings.append(f"{self.info.label}: LineMode=Output 设置失败")
+        if not self._try_set_enum_by_string("LineSource", source):
+            warnings.append(f"{self.info.label}: LineSource={source} 设置失败")
+        return warnings
+
+    def apply_trigger_input_settings(
+        self,
+        line_selector: str,
+        trigger_activation: str | None = None,
+    ) -> list[str]:
+        warnings: list[str] = []
+        line = self._normalize_line_selector(line_selector)
+        if not self._try_set_enum_by_string("LineSelector", line):
+            warnings.append(f"{self.info.label}: LineSelector={line} 设置失败")
+        if not self._try_set_enum_by_string("LineMode", "Input"):
+            warnings.append(f"{self.info.label}: LineMode=Input 设置失败")
+        warnings.extend(self.apply_trigger_settings(line, trigger_activation=trigger_activation))
+        return warnings
+
+    def apply_hardware_cascade_settings(
+        self,
+        role: str,
+        master_line: str = "Line2",
+        master_line_source: str = "ExposureActive",
+        slave_line: str = "Line0",
+        slave_activation: str | None = None,
+        master_trigger_source: str = "Software",
+        master_trigger_activation: str | None = None,
+    ) -> list[str]:
+        normalized_role = str(role or "").strip().lower()
+        if normalized_role == "master":
+            warnings = self.apply_trigger_settings(master_trigger_source, trigger_activation=master_trigger_activation)
+            warnings.extend(self.apply_trigger_output_settings(master_line, master_line_source))
+            return warnings
+        if normalized_role == "slave":
+            return self.apply_trigger_input_settings(slave_line, trigger_activation=slave_activation)
+        return [f"{self.info.label}: 不支持的硬触发级联角色 {role}"]
+
     def apply_timing_settings(
         self,
         acquisition_frame_rate: float | None = None,
@@ -688,9 +744,42 @@ class MvsCamera:
         value = str(trigger_source).strip().lower()
         if value in {"line0", "line 0", "hardware", "硬件", "外触发"}:
             return "Line0"
+        if value in {"line1", "line 1"}:
+            return "Line1"
+        if value in {"line2", "line 2"}:
+            return "Line2"
+        if value in {"line3", "line 3"}:
+            return "Line3"
         if value in {"continuous", "freerun", "free-run", "free run", "off", "none", "trigger off", "no trigger"}:
             return "Continuous"
         return "Software"
+
+    def _normalize_line_selector(self, line: str | None) -> str:
+        value = str(line or "Line0").strip().lower().replace("_", "").replace("-", "").replace(" ", "")
+        mapping = {
+            "0": "Line0",
+            "line0": "Line0",
+            "1": "Line1",
+            "line1": "Line1",
+            "2": "Line2",
+            "line2": "Line2",
+            "3": "Line3",
+            "line3": "Line3",
+        }
+        return mapping.get(value, str(line or "Line0").strip() or "Line0")
+
+    def _normalize_line_source(self, source: str | None) -> str:
+        value = str(source or "ExposureActive").strip().lower().replace("_", "").replace("-", "").replace(" ", "")
+        mapping = {
+            "exposureactive": "ExposureActive",
+            "exposing": "ExposureActive",
+            "strobe": "Strobe",
+            "triggerwait": "TriggerWait",
+            "useroutput0": "UserOutput0",
+            "useroutput1": "UserOutput1",
+            "useroutput2": "UserOutput2",
+        }
+        return mapping.get(value, str(source or "ExposureActive").strip() or "ExposureActive")
 
     def _normalize_trigger_activation(self, trigger_activation: str | None) -> str:
         value = str(trigger_activation or "RisingEdge").strip().lower()
@@ -800,6 +889,34 @@ class MvsCamera:
                 if not self._try_set_float("BalanceRatio", value):
                     warnings.append(f"{self.info.label}: BalanceRatio {selector}={value} 设置失败")
         return warnings
+
+    def apply_image_correction_settings(
+        self,
+        black_level: float | None = None,
+        digital_shift: float | None = None,
+        gamma: float | None = None,
+    ) -> list[str]:
+        warnings: list[str] = []
+        if black_level is not None:
+            if not self._try_set_number_any(("BlackLevel", "BlackLevelRaw"), black_level):
+                warnings.append(f"{self.info.label}: BlackLevel={black_level} 设置失败")
+        if digital_shift is not None:
+            if not self._try_set_number_any(("DigitalShift",), digital_shift):
+                warnings.append(f"{self.info.label}: DigitalShift={digital_shift} 设置失败")
+        if gamma is not None:
+            self._try_set_bool("GammaEnable", True)
+            if not self._try_set_float("Gamma", gamma):
+                warnings.append(f"{self.info.label}: Gamma={gamma} 设置失败")
+        return warnings
+
+    def _try_set_number_any(self, keys: tuple[str, ...], value: float) -> bool:
+        numeric = float(value)
+        for key in keys:
+            if self._try_set_float(key, numeric):
+                return True
+            if numeric.is_integer() and self._try_set_int(key, int(numeric)):
+                return True
+        return False
 
     def apply_chunk_settings(
         self,
@@ -1113,11 +1230,32 @@ class MvsCamera:
 
     def stream_stats(self) -> StreamStats:
         with self._stream_condition:
-            return StreamStats(
-                buffered_frames=len(self._stream_frames),
-                dropped_frames=self._stream_dropped_frames,
-                callback_enabled=self._stream_callback_enabled,
+            buffered_frames = len(self._stream_frames)
+            dropped_frames = self._stream_dropped_frames
+            callback_enabled = self._stream_callback_enabled
+        link_error_count = self._try_get_int_any(
+            (
+                "DeviceLinkErrorCount",
+                "GevSCPSPacketErrorCount",
+                "GevSCPSPacketLostCount",
+                "GevStreamChannelPacketErrorCount",
+                "GevStreamChannelPacketLostCount",
             )
+        )
+        resend_packet_count = self._try_get_int_any(
+            (
+                "GevStreamChannelResendPacketCount",
+                "GevResendPacketCount",
+                "GevSCPSPacketResendCount",
+            )
+        )
+        return StreamStats(
+            buffered_frames=buffered_frames,
+            dropped_frames=dropped_frames,
+            callback_enabled=callback_enabled,
+            link_error_count=link_error_count,
+            resend_packet_count=resend_packet_count,
+        )
 
     def _set_payload_size(self, payload_size: int) -> None:
         with self._payload_lock:
@@ -1243,11 +1381,11 @@ class MvsCamera:
 
     def _raw_bit_depth(self, pixel_type_name: str, packet: RawFramePacket) -> int:
         name = pixel_type_name.lower()
-        if "mono16" in name or "bayer" in name and "16" in name:
+        if "mono16" in name or ("bayer" in name and "16" in name):
             return 16
-        if "mono12" in name or "bayer" in name and "12" in name:
+        if "mono12" in name or ("bayer" in name and "12" in name):
             return 12
-        if "mono10" in name or "bayer" in name and "10" in name:
+        if "mono10" in name or ("bayer" in name and "10" in name):
             return 10
         if packet.width > 0 and packet.height > 0 and packet.frame_len >= packet.width * packet.height * 2:
             return 16
@@ -1269,6 +1407,21 @@ class MvsCamera:
         if packet.pixel_type == s["PixelType_Gvsp_Mono8"] and packet.frame_len >= expected_len:
             payload = packet.data if len(packet.data) == expected_len else memoryview(packet.data)[:expected_len]
             return Image.frombytes("L", (packet.width, packet.height), payload)
+        pixel_type_name = self._pixel_type_name(packet.pixel_type).lower()
+        if (
+            any(token in pixel_type_name for token in ("mono16", "mono12", "mono10"))
+            and expected_len > 0
+            and len(packet.data) >= expected_len * 2
+        ):
+            payload = packet.data if len(packet.data) == expected_len * 2 else memoryview(packet.data)[: expected_len * 2]
+            raw = np.frombuffer(payload, dtype="<u2", count=expected_len).reshape((packet.height, packet.width))
+            if "mono16" in pixel_type_name:
+                display = (raw >> 8).astype(np.uint8)
+            elif "mono12" in pixel_type_name:
+                display = np.clip(raw >> 4, 0, 255).astype(np.uint8)
+            else:
+                display = np.clip(raw >> 2, 0, 255).astype(np.uint8)
+            return Image.fromarray(display, "L")
         buffer_type = c_ubyte * len(packet.data)
         raw_buffer = buffer_type.from_buffer_copy(packet.data)
 
@@ -1382,6 +1535,20 @@ class MvsCamera:
             increment=max(increment, 1),
         )
 
+    def _try_get_int(self, key: str) -> int | None:
+        try:
+            return self._get_int(key)
+        except Exception as exc:
+            LOGGER.debug("%s: exception while reading int node %s: %s", self.info.label, key, exc, exc_info=True)
+            return None
+
+    def _try_get_int_any(self, keys: tuple[str, ...]) -> int | None:
+        for key in keys:
+            value = self._try_get_int(key)
+            if value is not None:
+                return value
+        return None
+
     def _align_to_increment(self, value: int, minimum: int, maximum: int, increment: int, direction: str) -> int:
         if maximum < minimum:
             maximum = minimum
@@ -1419,10 +1586,12 @@ class MvsCamera:
         try:
             setter = getattr(self._cam, "MV_CC_SetBoolValue", None)
             if setter is not None:
-                return setter(key, bool(value)) == 0
+                if setter(key, bool(value)) == 0:
+                    return True
         except Exception as exc:
             LOGGER.debug("%s: exception while probing bool node %s=%s: %s", self.info.label, key, value, exc, exc_info=True)
-            return False
+        if self._try_set_enum_by_string(key, "On" if value else "Off"):
+            return True
         return self._try_set_int(key, 1 if value else 0)
 
     def _try_set_bool_any(self, keys: tuple[str, ...], value: bool) -> bool:
@@ -1605,6 +1774,17 @@ class StereoCameraSystem:
         if self.max_camera_timestamp_delta <= 0 and self.max_host_timestamp_delta <= 0:
             self.timestamp_reject_enabled = False
         self.require_hardware_trigger = config_bool(config, "require_hardware_trigger", False, False)
+        self.hardware_sync_enabled = config_bool(config, "hardware_sync_enabled", False, False)
+        self.hardware_sync_master = str(config.get("hardware_sync_master", "left") or "left").strip().lower()
+        self.hardware_sync_master_line = str(config.get("hardware_sync_master_line", "Line2") or "Line2")
+        self.hardware_sync_master_line_source = str(
+            config.get("hardware_sync_master_line_source", "ExposureActive") or "ExposureActive"
+        )
+        self.hardware_sync_slave_line = str(config.get("hardware_sync_slave_line", "Line0") or "Line0")
+        self.hardware_sync_slave_activation = str(config.get("hardware_sync_slave_activation", "RisingEdge") or "RisingEdge")
+        self.hardware_sync_master_trigger_source = str(
+            config.get("hardware_sync_master_trigger_source", "Software") or "Software"
+        )
         timeout_s = self.timeout_ms / 1000.0 + 1.0
         self.software_trigger_barrier_timeout_s = max(
             config_float(config, "software_trigger_barrier_timeout_seconds", timeout_s),
@@ -1649,8 +1829,10 @@ class StereoCameraSystem:
                     prefer_callback=self._normalized_system_trigger_source() == "continuous",
                 )
                 side = "left" if cam is left else "right"
+                camera_trigger_source = self._camera_trigger_source_for_connect(side)
+                camera_trigger_activation = self._camera_trigger_activation_for_connect(side)
                 cam.configure(
-                    trigger_source=self.trigger_source,
+                    trigger_source=camera_trigger_source,
                     exposure_time_us=float(self.config.get("exposure_time_us", 0) or 0),
                     gain=float(self.config.get("gain", -1)),
                     pixel_format=str(self.config.get("pixel_format", "Mono8")),
@@ -1673,8 +1855,13 @@ class StereoCameraSystem:
                     acquisition_frame_rate=self._optional_float("acquisition_frame_rate"),
                     trigger_delay_us=self._optional_float("trigger_delay_us"),
                     line_debouncer_time_us=self._optional_float("line_debouncer_time_us"),
-                    trigger_activation=str(self.config.get("trigger_activation", "RisingEdge")),
+                    trigger_activation=camera_trigger_activation,
+                    black_level=self._optional_float("black_level"),
+                    digital_shift=self._optional_float("digital_shift"),
+                    gamma=self._optional_float("gamma"),
                 )
+                for warning in self._apply_hardware_sync_role(cam, side):
+                    LOGGER.warning(warning)
                 cam.start()
         except Exception:
             for cam in opened:
@@ -1707,6 +1894,40 @@ class StereoCameraSystem:
         if value in (None, ""):
             return default
         return int(value)
+
+    def _hardware_sync_active(self) -> bool:
+        return self.hardware_sync_enabled or self._normalized_system_trigger_source() == "cascade"
+
+    def _hardware_sync_master_side(self) -> str:
+        return "right" if self.hardware_sync_master == "right" else "left"
+
+    def _hardware_sync_role(self, side: str) -> str:
+        return "master" if side == self._hardware_sync_master_side() else "slave"
+
+    def _camera_trigger_source_for_connect(self, side: str) -> str:
+        if not self._hardware_sync_active():
+            return self.trigger_source
+        if self._hardware_sync_role(side) == "master":
+            return self.hardware_sync_master_trigger_source
+        return self.hardware_sync_slave_line
+
+    def _camera_trigger_activation_for_connect(self, side: str) -> str:
+        if self._hardware_sync_active() and self._hardware_sync_role(side) == "slave":
+            return self.hardware_sync_slave_activation
+        return str(self.config.get("trigger_activation", "RisingEdge"))
+
+    def _apply_hardware_sync_role(self, cam: MvsCamera, side: str) -> list[str]:
+        if not self._hardware_sync_active():
+            return []
+        return cam.apply_hardware_cascade_settings(
+            self._hardware_sync_role(side),
+            master_line=self.hardware_sync_master_line,
+            master_line_source=self.hardware_sync_master_line_source,
+            slave_line=self.hardware_sync_slave_line,
+            slave_activation=self.hardware_sync_slave_activation,
+            master_trigger_source=self.hardware_sync_master_trigger_source,
+            master_trigger_activation=str(self.config.get("trigger_activation", "RisingEdge")),
+        )
 
     def close(self) -> None:
         errors: list[str] = []
@@ -1806,6 +2027,27 @@ class StereoCameraSystem:
             warnings: list[str] = []
             for _name, cam in cameras:
                 warnings.extend(cam.apply_white_balance_settings(balance_white_auto, red, green, blue))
+            return warnings
+
+    def apply_image_correction_settings(
+        self,
+        black_level: float | None = None,
+        digital_shift: float | None = None,
+        gamma: float | None = None,
+    ) -> list[str]:
+        cameras = self._connected_cameras()
+        if not cameras:
+            raise MvsError("相机尚未连接。")
+        with self._capture_lock:
+            warnings: list[str] = []
+            for _name, cam in cameras:
+                warnings.extend(cam.apply_image_correction_settings(black_level, digital_shift, gamma))
+            if black_level is not None:
+                self.config["black_level"] = black_level
+            if digital_shift is not None:
+                self.config["digital_shift"] = digital_shift
+            if gamma is not None:
+                self.config["gamma"] = gamma
             return warnings
 
     def apply_pixel_format_settings(self, pixel_format: str) -> list[str]:
@@ -1923,8 +2165,18 @@ class StereoCameraSystem:
             raise MvsError("相机尚未连接。")
         with self._capture_lock:
             warnings: list[str] = []
-            for _name, cam in cameras:
-                warnings.extend(cam.apply_trigger_settings(trigger_source))
+            self.trigger_source = trigger_source
+            if self._normalized_system_trigger_source() == "cascade":
+                self.hardware_sync_enabled = True
+                self.config["hardware_sync_enabled"] = True
+                for name, cam in cameras:
+                    warnings.extend(self._apply_hardware_sync_role(cam, name))
+            else:
+                self.hardware_sync_enabled = False
+                self.config["hardware_sync_enabled"] = False
+                for _name, cam in cameras:
+                    warnings.extend(cam.apply_trigger_settings(trigger_source))
+            self.config["trigger_source"] = trigger_source
             self.trigger_source = trigger_source
             return warnings
 
@@ -1960,6 +2212,13 @@ class StereoCameraSystem:
             raise MvsError("Hardware trigger is required, but trigger_source is Software/Continuous.")
 
         trigger_time = time.time()
+        if trigger_mode == "cascade":
+            frames = self._capture_pair_hardware_cascade(cameras, effective_timeout_ms, convert_image=convert_image)
+            left = frames.get("left")
+            right = frames.get("right")
+            if left is not None and right is not None:
+                self._validate_frame_sync(left, right)
+            return left, right, trigger_time
         if trigger_mode == "software":
             if len(cameras) == 1:
                 cameras[0][1].trigger_software()
@@ -1983,6 +2242,44 @@ class StereoCameraSystem:
         if left is not None and right is not None:
             self._validate_frame_sync(left, right)
         return left, right, trigger_time
+
+    def _capture_pair_hardware_cascade(
+        self,
+        cameras: list[tuple[str, MvsCamera]],
+        effective_timeout_ms: int,
+        convert_image: bool = True,
+    ) -> dict[str, Frame]:
+        if len(cameras) < 2:
+            raise MvsError("Hardware cascade trigger requires both stereo cameras.")
+        master_side = self._hardware_sync_master_side()
+        master = next((cam for name, cam in cameras if name == master_side), None)
+        if master is None:
+            raise MvsError(f"Hardware cascade master camera '{master_side}' is not connected.")
+        executor = self._executor_snapshot()
+        futures = {
+            executor.submit(self._grab_camera_frame, cam, effective_timeout_ms, convert_image): name for name, cam in cameras
+        }
+        # Let both GetImageBuffer calls enter the SDK before the master emits its hardware output pulse.
+        time.sleep(0.002)
+        master.trigger_software()
+        done, pending = wait(futures, timeout=effective_timeout_ms / 1000.0 + 0.2)
+        errors: list[Exception] = []
+        frames: dict[str, Frame] = {}
+        for future in pending:
+            errors.append(FrameTimeoutError(f"{futures[future]} timed out"))
+            future.cancel()
+        for future in done:
+            name = futures[future]
+            try:
+                frames[name] = future.result()
+            except Exception as exc:
+                errors.append(exc)
+        if errors:
+            message = "; ".join(str(exc) for exc in errors)
+            if all(isinstance(exc, FrameTimeoutError) for exc in errors):
+                raise FrameTimeoutError(message)
+            raise MvsError(message)
+        return frames
 
     def _capture_pair_continuous(
         self,
@@ -2084,6 +2381,8 @@ class StereoCameraSystem:
         value = str(self.trigger_source).strip().lower()
         if value in {"continuous", "freerun", "free-run", "free run", "off", "none", "trigger off", "no trigger"}:
             return "continuous"
+        if value in {"cascade", "hardwarecascade", "hardware-cascade", "hardwaresync", "hardware-sync", "级联", "硬触发级联"}:
+            return "cascade"
         if value in {"line0", "line 0", "hardware"}:
             return "line0"
         return "software"
