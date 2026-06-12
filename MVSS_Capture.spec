@@ -6,8 +6,10 @@ from importlib.util import find_spec
 
 
 datas = [('config.json', '.')]
+hiddenimports = []
 hikrobot_spec = find_spec('hikrobot')
 if hikrobot_spec is not None:
+    hiddenimports.append('hikrobot')
     hikrobot_locations = list(hikrobot_spec.submodule_search_locations or [])
     if hikrobot_spec.origin:
         hikrobot_locations.append(str(Path(hikrobot_spec.origin).resolve().parent))
@@ -21,7 +23,7 @@ a = Analysis(
     pathex=[],
     binaries=[],
     datas=datas,
-    hiddenimports=['hikrobot'],
+    hiddenimports=hiddenimports,
     hookspath=[],
     hooksconfig={},
     runtime_hooks=[],

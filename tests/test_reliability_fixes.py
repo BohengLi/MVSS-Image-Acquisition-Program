@@ -7,6 +7,7 @@ from pathlib import Path
 from queue import Queue
 from unittest.mock import patch
 
+import importlib.util
 import image_quality
 import calibration_manager
 import mvs_camera
@@ -144,6 +145,31 @@ class _FakeStatsSystem:
 
 
 class ReliabilityFixTests(unittest.TestCase):
+    def test_pyinstaller_spec_skips_hikrobot_hidden_import_when_package_missing(self) -> None:
+        spec_path = Path(__file__).resolve().parents[1] / "MVSS_Capture.spec"
+        calls: dict[str, object] = {}
+
+        def fake_analysis(_scripts, **kwargs):
+            calls["hiddenimports"] = kwargs.get("hiddenimports")
+            calls["datas"] = kwargs.get("datas")
+            return type("AnalysisResult", (), {"pure": [], "scripts": [], "binaries": [], "datas": []})()
+
+        namespace = {
+            "Analysis": fake_analysis,
+            "PYZ": lambda _pure: object(),
+            "EXE": lambda *_args, **_kwargs: object(),
+            "__file__": str(spec_path),
+        }
+        original_find_spec = importlib.util.find_spec
+        importlib.util.find_spec = lambda name: None if name == "hikrobot" else original_find_spec(name)
+        try:
+            exec(compile(spec_path.read_text(encoding="utf-8"), str(spec_path), "exec"), namespace)
+        finally:
+            importlib.util.find_spec = original_find_spec
+
+        self.assertEqual(calls["hiddenimports"], [])
+        self.assertEqual(calls["datas"], [("config.json", ".")])
+
     def test_float_from_sdk_value_handles_bad_sdk_object(self) -> None:
         camera = MvsCamera.__new__(MvsCamera)
         camera.info = _Info()
