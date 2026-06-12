@@ -2797,6 +2797,7 @@ class StereoCaptureOnlyApp:
         ttk.Button(top, text="新建项目", command=self.create_new_project).pack(side=LEFT, padx=(0, 4))
         ttk.Button(top, text="重载标定", command=self.reload_calibration).pack(side=LEFT, padx=(0, 4))
         ttk.Button(top, text="标定向导", command=self.show_calibration_wizard).pack(side=LEFT, padx=(0, 4))
+        ttk.Button(top, text="相机健康/校正", command=self.show_health_correction_popup).pack(side=LEFT, padx=(0, 4))
         ttk.Checkbutton(top, text="HDR", variable=self.hdr_enabled_var).pack(side=LEFT)
 
         body = ttk.Frame(panel, style="Panel.TFrame")
@@ -2867,6 +2868,77 @@ class StereoCaptureOnlyApp:
         width = max(container.winfo_reqwidth() + 32, 520)
         height = max(container.winfo_reqheight() + 36, 190)
         popup.geometry(f"{width}x{height}+{self.root.winfo_rootx() + 96}+{self.root.winfo_rooty() + 96}")
+
+    def show_health_correction_popup(self) -> None:
+        popup = getattr(self, "_health_correction_popup", None)
+        if popup is not None and popup.winfo_exists():
+            popup.lift()
+            popup.focus_force()
+            return
+
+        popup = Toplevel(self.root)
+        self._health_correction_popup = popup
+        popup.title("相机健康/测量校正")
+        popup.configure(bg=BG_COLOR)
+        popup.transient(self.root)
+        popup.geometry("+%d+%d" % (self.root.winfo_rootx() + 128, self.root.winfo_rooty() + 128))
+
+        def close_popup() -> None:
+            self._clear_health_correction_popup_refs()
+            if popup.winfo_exists():
+                popup.destroy()
+
+        popup.protocol("WM_DELETE_WINDOW", close_popup)
+
+        container = ttk.Frame(popup, style="Toolbar.TFrame", padding=(12, 10))
+        container.pack(side=TOP, fill=BOTH, expand=True)
+        container.grid_columnconfigure(0, weight=1)
+        container.grid_columnconfigure(1, weight=1)
+
+        self.health_panel = ttk.LabelFrame(container, text="相机健康", padding=(8, 6))
+        self.health_panel.grid(row=0, column=0, sticky="nsew", padx=(0, 6))
+        self._build_health_panel(self.health_panel)
+
+        self.science_panel = ttk.LabelFrame(container, text="测量校正", padding=(8, 6))
+        self.science_panel.grid(row=0, column=1, sticky="nsew", padx=(6, 0))
+        self._build_science_panel(self.science_panel)
+        self._sync_health_correction_popup_state()
+        self._update_camera_health_display(
+            dict(getattr(self, "_latest_temperatures", {})),
+            dict(getattr(self, "_latest_link_throughput_mbps", {})),
+            dict(getattr(self, "_latest_stream_stats", {})),
+        )
+
+        popup.update_idletasks()
+        width = max(container.winfo_reqwidth() + 32, 700)
+        height = max(container.winfo_reqheight() + 28, 190)
+        popup.geometry(f"{width}x{height}+{self.root.winfo_rootx() + 128}+{self.root.winfo_rooty() + 128}")
+
+    def _sync_health_correction_popup_state(self) -> None:
+        state = NORMAL if self.camera_system is not None else DISABLED
+        for name in (
+            "timestamp_offset_button",
+            "timestamp_offset_clear_button",
+            "dark_frame_button",
+            "flat_field_button",
+        ):
+            button = getattr(self, name, None)
+            if button is not None and button.winfo_exists():
+                button.configure(state=state)
+
+    def _clear_health_correction_popup_refs(self) -> None:
+        for name in (
+            "_health_correction_popup",
+            "health_panel",
+            "science_panel",
+            "health_chart_canvas",
+            "timestamp_offset_button",
+            "timestamp_offset_clear_button",
+            "dark_frame_button",
+            "flat_field_button",
+        ):
+            if hasattr(self, name):
+                delattr(self, name)
 
     def _toggle_panel(self, panel_name: str) -> None:
         mapping = {
