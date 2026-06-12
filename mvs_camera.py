@@ -80,17 +80,27 @@ def _format_mvs_error(ret: int) -> str:
 
 
 def _mvs_runtime_candidates() -> list[Path]:
+    candidates: list[Path] = []
+    bundle_dir = getattr(sys, "_MEIPASS", None)
+    if bundle_dir:
+        bundle_path = Path(bundle_dir)
+        candidates.extend([bundle_path, bundle_path / "ThirdParty"])
+    exe_dir = Path(sys.executable).resolve().parent if getattr(sys, "frozen", False) else None
+    if exe_dir is not None and exe_dir != bundle_path:
+        candidates.extend([exe_dir, exe_dir / "ThirdParty"])
     if sys.maxsize > 2**32:
-        return [
+        candidates.extend([
             Path(r"C:\Program Files (x86)\Common Files\MVS\Runtime\Win64_x64"),
             Path(r"C:\Program Files\MVS\Runtime\Win64_x64"),
             Path(r"C:\Program Files\MVS\Development\Samples\Python\MvImport"),
-        ]
-    return [
-        Path(r"C:\Program Files (x86)\Common Files\MVS\Runtime\Win32_i86"),
-        Path(r"C:\Program Files\MVS\Runtime\Win32_i86"),
-        Path(r"C:\Program Files\MVS\Development\Samples\Python\MvImport"),
-    ]
+        ])
+    else:
+        candidates.extend([
+            Path(r"C:\Program Files (x86)\Common Files\MVS\Runtime\Win32_i86"),
+            Path(r"C:\Program Files\MVS\Runtime\Win32_i86"),
+            Path(r"C:\Program Files\MVS\Development\Samples\Python\MvImport"),
+        ])
+    return candidates
 
 
 def _add_mvs_runtime_path() -> None:
