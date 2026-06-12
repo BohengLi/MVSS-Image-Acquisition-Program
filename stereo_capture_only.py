@@ -112,6 +112,7 @@ LOG_DIR = BASE_DIR / "logs"
 BIAODING_DIR = BASE_DIR.parent / "MVSS_Biaoding_CalibrationOnly"
 CAPTURE_WIDTH = 5472
 CAPTURE_HEIGHT = 3648
+APP_VERSION = "V2.0_20260612"
 
 BG_COLOR = "#0e1116"
 SURFACE_COLOR = "#141a21"
@@ -2215,12 +2216,14 @@ class StereoCaptureOnlyApp:
         gain_panel = ttk.Frame(param_panel, style="Panel.TFrame", padding=(4, 2))
         gain_panel.grid(row=0, column=0, sticky="ew", padx=0, pady=(0, 4))
         self._configure_parameter_grid(gain_panel)
-        ttk.Label(gain_panel, text="增益", style="Panel.TLabel").grid(row=0, column=0, padx=(0, 5), pady=1, sticky="w")
+        ttk.Label(gain_panel, text="增 益", style="Panel.TLabel").grid(row=0, column=0, padx=(0, 5), pady=1, sticky="w")
         ttk.OptionMenu(gain_panel, self.gain_auto_var, self.gain_auto_var.get(), "Off", "Once", "Continuous").grid(
-            row=0, column=1, columnspan=5, padx=2, pady=1, sticky="w"
+            row=0, column=1, columnspan=2, padx=2, pady=1, sticky="w"
         )
+        gain_panel.grid_columnconfigure(4, weight=1)
+        gain_panel.grid_columnconfigure(5, minsize=70, weight=0)
         self.apply_gain_button = ttk.Button(gain_panel, text="应用", command=self.apply_gain_settings, state=DISABLED, width=6)
-        self.apply_gain_button.grid(row=0, column=7, padx=(6, 0), pady=1, sticky="e")
+        self.apply_gain_button.grid(row=0, column=5, padx=(6, 0), pady=1, sticky="e")
         self._labeled_entry(gain_panel, "值", self.gain_var, 4, 1, 0)
         self._labeled_entry(gain_panel, "下限", self.auto_gain_lower_var, 4, 1, 2)
         self._labeled_entry(gain_panel, "上限", self.auto_gain_upper_var, 4, 1, 4)
@@ -2228,7 +2231,7 @@ class StereoCaptureOnlyApp:
         exposure_panel = ttk.Frame(param_panel, style="Panel.TFrame", padding=(4, 2))
         exposure_panel.grid(row=1, column=0, sticky="ew", padx=0, pady=(0, 4))
         self._configure_parameter_grid(exposure_panel)
-        ttk.Label(exposure_panel, text="曝光", style="Panel.TLabel").grid(
+        ttk.Label(exposure_panel, text="曝 光", style="Panel.TLabel").grid(
             row=0, column=0, padx=(0, 5), pady=1, sticky="w"
         )
         ttk.OptionMenu(
@@ -2238,11 +2241,13 @@ class StereoCaptureOnlyApp:
             "Off",
             "Once",
             "Continuous",
-        ).grid(row=0, column=1, columnspan=5, padx=2, pady=1, sticky="w")
+        ).grid(row=0, column=1, columnspan=2, padx=2, pady=1, sticky="w")
+        exposure_panel.grid_columnconfigure(4, weight=1)
+        exposure_panel.grid_columnconfigure(5, minsize=70, weight=0)
         self.apply_exposure_button = ttk.Button(
             exposure_panel, text="应用", command=self.apply_exposure_settings, state=DISABLED, width=6
         )
-        self.apply_exposure_button.grid(row=0, column=7, padx=(6, 0), pady=1, sticky="e")
+        self.apply_exposure_button.grid(row=0, column=5, padx=(6, 0), pady=1, sticky="e")
         self._labeled_entry(exposure_panel, "us", self.exposure_time_var, 9, 1, 0)
         self._labeled_entry(exposure_panel, "下限", self.auto_exposure_lower_var, 9, 1, 2)
         self._labeled_entry(exposure_panel, "上限", self.auto_exposure_upper_var, 9, 1, 4)
@@ -2261,35 +2266,42 @@ class StereoCaptureOnlyApp:
             "Once",
             "Continuous",
         ).grid(row=0, column=1, columnspan=2, padx=2, pady=1, sticky="w")
+        wb_panel.grid_columnconfigure(4, weight=1)
+        wb_panel.grid_columnconfigure(5, minsize=70, weight=0)
         self.apply_wb_button = ttk.Button(
             wb_panel, text="应用", command=self.apply_white_balance_settings, state=DISABLED, width=6
         )
-        self.apply_wb_button.grid(row=0, column=3, padx=(6, 0), pady=1, sticky="e")
+        self.apply_wb_button.grid(row=0, column=5, padx=(6, 0), pady=1, sticky="e")
 
-        wb_rgb_row = ttk.Frame(wb_panel, style="Panel.TFrame")
-        wb_rgb_row.grid(row=1, column=0, columnspan=4, sticky="ew", pady=(1, 0))
-        wb_rgb_row.grid_columnconfigure(0, weight=1)
-        wb_rgb_row.grid_columnconfigure(7, weight=1)
         for index, (label, variable) in enumerate(
             (("R", self.balance_red_var), ("G", self.balance_green_var), ("B", self.balance_blue_var))
         ):
-            col = index * 2 + 1
-            ttk.Label(wb_rgb_row, text=label, style="Panel.TLabel", anchor="e").grid(
-                row=0, column=col, padx=(2, 2), pady=1, sticky="e"
+            col = index * 2
+            ttk.Label(wb_panel, text=label, style="Panel.TLabel", anchor="e").grid(
+                row=1, column=col, padx=(2, 2), pady=1, sticky="e"
             )
-            ttk.Entry(wb_rgb_row, textvariable=variable, width=7).grid(
-                row=0, column=col + 1, padx=(0, 6), pady=1, sticky="w"
+            ttk.Entry(wb_panel, textvariable=variable, width=7).grid(
+                row=1, column=col + 1, padx=(0, 6), pady=1, sticky="w"
             )
 
         correction_panel = ttk.Frame(param_panel, style="Panel.TFrame", padding=(4, 2))
         correction_panel.grid(row=3, column=0, sticky="ew", padx=0, pady=(0, 4))
         self._configure_parameter_grid(correction_panel)
+        for column in (1, 3, 5):
+            correction_panel.grid_columnconfigure(column, minsize=46, weight=0)
         ttk.Label(correction_panel, text="图像校正", style="Panel.TLabel").grid(
             row=0, column=0, padx=(0, 5), pady=1, sticky="w"
         )
-        self._labeled_entry(correction_panel, "Black", self.black_level_var, 5, 1, 0)
-        self._labeled_entry(correction_panel, "Shift", self.digital_shift_var, 5, 1, 2)
-        self._labeled_entry(correction_panel, "Gamma", self.gamma_var, 5, 1, 4)
+        for index, (label, variable) in enumerate(
+            (("Black", self.black_level_var), ("Shift", self.digital_shift_var), ("Gamma", self.gamma_var))
+        ):
+            col = index * 2
+            ttk.Label(correction_panel, text=label, style="Panel.TLabel", anchor="e").grid(
+                row=1, column=col, padx=(4, 1), pady=1, sticky="e"
+            )
+            ttk.Entry(correction_panel, textvariable=variable, width=4).grid(
+                row=1, column=col + 1, padx=(0, 2), pady=1, sticky="w"
+            )
         self.apply_correction_button = ttk.Button(
             correction_panel, text="应用", command=self.apply_image_correction_settings, state=DISABLED, width=6
         )
@@ -2301,16 +2313,24 @@ class StereoCaptureOnlyApp:
         ttk.Label(roi_panel, text="ROI", style="Panel.TLabel").grid(
             row=0, column=0, columnspan=4, padx=(0, 5), pady=1, sticky="w"
         )
+        def grid_roi_entry(label: str, variable: StringVar, row: int, column: int) -> None:
+            ttk.Label(roi_panel, text=label, style="Panel.TLabel", anchor="e").grid(
+                row=row, column=column, padx=(4, 1), pady=1, sticky="e"
+            )
+            ttk.Entry(roi_panel, textvariable=variable, width=6).grid(
+                row=row, column=column + 1, padx=(0, 2), pady=1, sticky="w"
+            )
+
         ttk.Label(roi_panel, text="左", style="Panel.TLabel").grid(row=1, column=0, padx=(0, 3), pady=1, sticky="w")
-        self._labeled_entry(roi_panel, "W", self.left_roi_width_var, 5, 1, 1)
-        self._labeled_entry(roi_panel, "H", self.left_roi_height_var, 5, 1, 3)
-        self._labeled_entry(roi_panel, "X", self.left_roi_offset_x_var, 5, 2, 1)
-        self._labeled_entry(roi_panel, "Y", self.left_roi_offset_y_var, 5, 2, 3)
+        grid_roi_entry("W", self.left_roi_width_var, 1, 1)
+        grid_roi_entry("H", self.left_roi_height_var, 1, 3)
+        grid_roi_entry("X", self.left_roi_offset_x_var, 2, 1)
+        grid_roi_entry("Y", self.left_roi_offset_y_var, 2, 3)
         ttk.Label(roi_panel, text="右", style="Panel.TLabel").grid(row=3, column=0, padx=(0, 3), pady=1, sticky="w")
-        self._labeled_entry(roi_panel, "W", self.right_roi_width_var, 5, 3, 1)
-        self._labeled_entry(roi_panel, "H", self.right_roi_height_var, 5, 3, 3)
-        self._labeled_entry(roi_panel, "X", self.right_roi_offset_x_var, 5, 4, 1)
-        self._labeled_entry(roi_panel, "Y", self.right_roi_offset_y_var, 5, 4, 3)
+        grid_roi_entry("W", self.right_roi_width_var, 3, 1)
+        grid_roi_entry("H", self.right_roi_height_var, 3, 3)
+        grid_roi_entry("X", self.right_roi_offset_x_var, 4, 1)
+        grid_roi_entry("Y", self.right_roi_offset_y_var, 4, 3)
         self.edit_roi_button = ttk.Button(roi_panel, text="框选ROI", command=self.toggle_roi_edit_mode)
         self.edit_roi_button.grid(row=5, column=0, columnspan=2, padx=(0, 6), pady=(4, 1), sticky="ew")
         self.reset_roi_button = ttk.Button(roi_panel, text="重置", command=self.reset_roi_settings)
@@ -2334,6 +2354,13 @@ class StereoCaptureOnlyApp:
             padding=(8, 4),
         )
         self.status_label.pack(side=LEFT, fill=X, expand=True)
+        ttk.Label(
+            status_bar,
+            text=APP_VERSION,
+            style="StatusVersion.TLabel",
+            anchor="e",
+            padding=(8, 4),
+        ).pack(side=RIGHT)
 
     def _configure_style(self) -> None:
         self.style = ttk.Style()
@@ -2355,6 +2382,12 @@ class StereoCaptureOnlyApp:
         self.style.configure("StatusBar.TFrame", background=SURFACE_COLOR)
         self.style.configure("PaneHeader.TFrame", background=PANEL_COLOR)
         self.style.configure("TLabel", background=BG_COLOR, foreground=TEXT_COLOR, font=(FONT_FAMILY, BASE_FONT_SIZE))
+        self.style.configure(
+            "StatusVersion.TLabel",
+            background=SURFACE_COLOR,
+            foreground=SUBTLE_TEXT_COLOR,
+            font=(FONT_FAMILY, BASE_FONT_SIZE, "bold"),
+        )
         self.style.configure(
             "Panel.TLabel", background=PANEL_COLOR, foreground=TEXT_COLOR, font=(FONT_FAMILY, BASE_FONT_SIZE)
         )
@@ -2386,7 +2419,7 @@ class StereoCaptureOnlyApp:
             "ParamTitle.TLabel",
             background=SURFACE_COLOR,
             foreground=TEXT_COLOR,
-            font=(FONT_FAMILY, BASE_FONT_SIZE, "bold"),
+            font=(FONT_FAMILY, TITLE_FONT_SIZE, "bold"),
         )
         self.style.configure(
             "HeaderValue.TLabel",

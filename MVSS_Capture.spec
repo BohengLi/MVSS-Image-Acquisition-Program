@@ -69,7 +69,7 @@ exe = EXE(
     a.binaries,
     a.datas,
     [],
-    name='MVSS_Capture',
+    name='MVSS图像采集程序_V2_20260612',
     debug=False,
     bootloader_ignore_signals=False,
     strip=False,
