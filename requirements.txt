@@ -1,0 +1,9 @@
+Pillow>=10.0
+numpy>=1.24
+opencv-python>=4.8
+# Hikrobot MVS SDK is not distributed on PyPI.
+# Install MVS manually and make its MvImport/runtime paths available.
+# External tools (required for full functionality):
+#   ffmpeg: for post-recording MP4 generation (auto_make_mp4 feature)
+#     Download: https://ffmpeg.org/download.html
+#     Must be available on system PATH.
