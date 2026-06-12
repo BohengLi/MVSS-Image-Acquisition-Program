@@ -2217,13 +2217,13 @@ class StereoCaptureOnlyApp:
         self._configure_parameter_grid(gain_panel)
         ttk.Label(gain_panel, text="增益", style="Panel.TLabel").grid(row=0, column=0, padx=(0, 5), pady=1, sticky="w")
         ttk.OptionMenu(gain_panel, self.gain_auto_var, self.gain_auto_var.get(), "Off", "Once", "Continuous").grid(
-            row=0, column=1, columnspan=3, padx=2, pady=1, sticky="w"
+            row=0, column=1, columnspan=5, padx=2, pady=1, sticky="w"
         )
+        self.apply_gain_button = ttk.Button(gain_panel, text="应用", command=self.apply_gain_settings, state=DISABLED, width=6)
+        self.apply_gain_button.grid(row=0, column=7, padx=(6, 0), pady=1, sticky="e")
         self._labeled_entry(gain_panel, "值", self.gain_var, 4, 1, 0)
         self._labeled_entry(gain_panel, "下限", self.auto_gain_lower_var, 4, 1, 2)
         self._labeled_entry(gain_panel, "上限", self.auto_gain_upper_var, 4, 1, 4)
-        self.apply_gain_button = ttk.Button(gain_panel, text="应用", command=self.apply_gain_settings, state=DISABLED, width=6)
-        self.apply_gain_button.grid(row=1, column=6, padx=(6, 0), pady=1, sticky="e")
 
         exposure_panel = ttk.Frame(param_panel, style="Panel.TFrame", padding=(4, 2))
         exposure_panel.grid(row=1, column=0, sticky="ew", padx=0, pady=(0, 4))
@@ -2238,14 +2238,14 @@ class StereoCaptureOnlyApp:
             "Off",
             "Once",
             "Continuous",
-        ).grid(row=0, column=1, columnspan=3, padx=2, pady=1, sticky="w")
-        self._labeled_entry(exposure_panel, "us", self.exposure_time_var, 9, 1, 0)
-        self._labeled_entry(exposure_panel, "下限", self.auto_exposure_lower_var, 9, 1, 2)
-        self._labeled_entry(exposure_panel, "上限", self.auto_exposure_upper_var, 9, 1, 4)
+        ).grid(row=0, column=1, columnspan=5, padx=2, pady=1, sticky="w")
         self.apply_exposure_button = ttk.Button(
             exposure_panel, text="应用", command=self.apply_exposure_settings, state=DISABLED, width=6
         )
-        self.apply_exposure_button.grid(row=1, column=6, padx=(6, 0), pady=1, sticky="e")
+        self.apply_exposure_button.grid(row=0, column=7, padx=(6, 0), pady=1, sticky="e")
+        self._labeled_entry(exposure_panel, "us", self.exposure_time_var, 9, 1, 0)
+        self._labeled_entry(exposure_panel, "下限", self.auto_exposure_lower_var, 9, 1, 2)
+        self._labeled_entry(exposure_panel, "上限", self.auto_exposure_upper_var, 9, 1, 4)
 
         wb_panel = ttk.Frame(param_panel, style="Panel.TFrame", padding=(4, 2))
         wb_panel.grid(row=2, column=0, sticky="ew", padx=0, pady=(0, 4))
@@ -2268,14 +2268,17 @@ class StereoCaptureOnlyApp:
 
         wb_rgb_row = ttk.Frame(wb_panel, style="Panel.TFrame")
         wb_rgb_row.grid(row=1, column=0, columnspan=4, sticky="ew", pady=(1, 0))
+        wb_rgb_row.grid_columnconfigure(0, weight=1)
+        wb_rgb_row.grid_columnconfigure(7, weight=1)
         for index, (label, variable) in enumerate(
             (("R", self.balance_red_var), ("G", self.balance_green_var), ("B", self.balance_blue_var))
         ):
-            ttk.Label(wb_rgb_row, text=label, style="Panel.TLabel", anchor="e").pack(
-                side=LEFT, padx=((0 if index == 0 else 8), 2)
+            col = index * 2 + 1
+            ttk.Label(wb_rgb_row, text=label, style="Panel.TLabel", anchor="e").grid(
+                row=0, column=col, padx=(2, 2), pady=1, sticky="e"
             )
-            ttk.Entry(wb_rgb_row, textvariable=variable, width=5).pack(
-                side=LEFT, fill=X, expand=True, padx=(0, 0 if index == 2 else 4)
+            ttk.Entry(wb_rgb_row, textvariable=variable, width=7).grid(
+                row=0, column=col + 1, padx=(0, 6), pady=1, sticky="w"
             )
 
         correction_panel = ttk.Frame(param_panel, style="Panel.TFrame", padding=(4, 2))
@@ -2296,24 +2299,24 @@ class StereoCaptureOnlyApp:
         roi_panel.grid(row=4, column=0, sticky="ew", padx=0)
         self._configure_parameter_grid(roi_panel)
         ttk.Label(roi_panel, text="ROI", style="Panel.TLabel").grid(
-            row=0, column=0, columnspan=8, padx=(0, 5), pady=1, sticky="w"
+            row=0, column=0, columnspan=4, padx=(0, 5), pady=1, sticky="w"
         )
         ttk.Label(roi_panel, text="左", style="Panel.TLabel").grid(row=1, column=0, padx=(0, 3), pady=1, sticky="w")
         self._labeled_entry(roi_panel, "W", self.left_roi_width_var, 5, 1, 1)
         self._labeled_entry(roi_panel, "H", self.left_roi_height_var, 5, 1, 3)
-        self._labeled_entry(roi_panel, "X", self.left_roi_offset_x_var, 5, 1, 5)
-        self._labeled_entry(roi_panel, "Y", self.left_roi_offset_y_var, 5, 1, 7)
-        ttk.Label(roi_panel, text="右", style="Panel.TLabel").grid(row=2, column=0, padx=(0, 3), pady=1, sticky="w")
-        self._labeled_entry(roi_panel, "W", self.right_roi_width_var, 5, 2, 1)
-        self._labeled_entry(roi_panel, "H", self.right_roi_height_var, 5, 2, 3)
-        self._labeled_entry(roi_panel, "X", self.right_roi_offset_x_var, 5, 2, 5)
-        self._labeled_entry(roi_panel, "Y", self.right_roi_offset_y_var, 5, 2, 7)
+        self._labeled_entry(roi_panel, "X", self.left_roi_offset_x_var, 5, 2, 1)
+        self._labeled_entry(roi_panel, "Y", self.left_roi_offset_y_var, 5, 2, 3)
+        ttk.Label(roi_panel, text="右", style="Panel.TLabel").grid(row=3, column=0, padx=(0, 3), pady=1, sticky="w")
+        self._labeled_entry(roi_panel, "W", self.right_roi_width_var, 5, 3, 1)
+        self._labeled_entry(roi_panel, "H", self.right_roi_height_var, 5, 3, 3)
+        self._labeled_entry(roi_panel, "X", self.right_roi_offset_x_var, 5, 4, 1)
+        self._labeled_entry(roi_panel, "Y", self.right_roi_offset_y_var, 5, 4, 3)
         self.edit_roi_button = ttk.Button(roi_panel, text="框选ROI", command=self.toggle_roi_edit_mode)
-        self.edit_roi_button.grid(row=3, column=0, columnspan=2, padx=(0, 6), pady=(4, 1), sticky="ew")
+        self.edit_roi_button.grid(row=5, column=0, columnspan=2, padx=(0, 6), pady=(4, 1), sticky="ew")
         self.reset_roi_button = ttk.Button(roi_panel, text="重置", command=self.reset_roi_settings)
-        self.reset_roi_button.grid(row=3, column=2, padx=(0, 6), pady=(4, 1), sticky="ew")
+        self.reset_roi_button.grid(row=5, column=2, padx=(0, 6), pady=(4, 1), sticky="ew")
         self.apply_roi_button = ttk.Button(roi_panel, text="应用", command=self.apply_roi_settings, state=DISABLED)
-        self.apply_roi_button.grid(row=3, column=3, padx=(0, 6), pady=(4, 1), sticky="ew")
+        self.apply_roi_button.grid(row=5, column=3, padx=(0, 6), pady=(4, 1), sticky="ew")
         self.param_panel_body.pack(side=TOP, fill=X, pady=(5, 0))
 
         self.quality_panel = ttk.Frame(self.root, style="Toolbar.TFrame", padding=(12, 0, 12, 0))
