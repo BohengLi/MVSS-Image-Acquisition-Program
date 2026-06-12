@@ -155,10 +155,28 @@ LOGGER = logging.getLogger("mvss_capture")
 UI_QUEUE_EVENT = "<<MvssUiQueue>>"
 DEFAULT_HOST_TIMESTAMP_DELTA_NS = 10_000_000
 _CONFIG_MISSING = object()
+TRIGGER_SOURCE_CN = {
+    "Software": "软触发",
+    "Continuous": "连续采集",
+    "Cascade": "硬触发级联",
+    "Line0": "外部硬触发",
+}
+TRIGGER_SOURCE_FROM_CN = {v: k for k, v in TRIGGER_SOURCE_CN.items()}
+TRIGGER_SOURCE_CN_ORDER = ("软触发", "连续采集", "硬触发级联", "外部硬触发")
+
+def canonical_trigger_source(value: object) -> str:
+    text = str(value or "").strip()
+    return TRIGGER_SOURCE_FROM_CN.get(text, text)
+
+def display_trigger_source(value: object) -> str:
+    text = str(value or "").strip()
+    return TRIGGER_SOURCE_CN.get(text, text)
+
 DEFAULT_PREVIEW_FPS = 15.0
 DEFAULT_RECORD_QUEUE_SECONDS = 10.0
 RAW_FRAME_FORMATS = {"npy", "png16", "tiff16", "exr"}
 DIC_CAPTURE_MODE = "dic_capture"
+DIC_PIXEL_FORMATS = ("Mono16", "Mono12", "Mono10", "Mono8")
 DIC_CAPTURE_CONFIG = {
     "trigger_source": "Cascade",
     "trigger_activation": "RisingEdge",
@@ -207,7 +225,20 @@ DIC_CAPTURE_CONFIG = {
     "record_force_image_format": False,
     "save_raw_frames": True,
     "raw_frame_format": "tiff16",
-    "capture_quality_gate": {"enabled": False},
+    "viewable_sidecar_enabled": True,
+    "viewable_sidecar_format": "png",
+    "capture_quality_gate": {
+        "enabled": False,
+        "strict_mode": False,
+        "checks": {
+            "focus": True,
+            "focus_consistency": True,
+            "overexposure_max_pct": 5.0,
+            "underexposure_max_pct": 5.0,
+            "brightness_min": 40,
+            "brightness_max": 220,
+        },
+    },
 }
 
 
@@ -326,7 +357,9 @@ def default_presets() -> dict[str, dict[str, object]]:
 
 def dic_capture_defaults() -> dict[str, object]:
     values = dict(DIC_CAPTURE_CONFIG)
-    values["capture_quality_gate"] = dict(DIC_CAPTURE_CONFIG["capture_quality_gate"])
+    gate = dict(DIC_CAPTURE_CONFIG["capture_quality_gate"])
+    gate["checks"] = dict(gate["checks"])
+    values["capture_quality_gate"] = gate
     return values
 
 
@@ -742,6 +775,24 @@ def frame_raw_estimated_bytes(frame: CameraFrame | None) -> int:
     if getattr(frame, "image", None) is None:
         return int(getattr(frame, "width", 0) or 0) * int(getattr(frame, "height", 0) or 0)
     return image_estimated_bytes(frame.image)
+
+
+def contiguous_frame_buffer(data: bytes | bytearray | memoryview, count: int | None = None) -> bytes | bytearray | memoryview:
+    if count is None and isinstance(data, (bytes, bytearray)):
+        return data
+    view = memoryview(data)
+    if not view.c_contiguous:
+        raw = view.tobytes()
+        return raw[:count] if count is not None else raw
+    if view.format != "B" or view.ndim != 1:
+        view = view.cast("B")
+    if count is not None:
+        view = view[:count]
+    if view.c_contiguous and view.ndim == 1:
+        if count is not None and isinstance(data, (bytes, bytearray)) and count == len(data):
+            return data
+        return view
+    return view.tobytes()
 
 
 def format_bytes(value: object) -> str:
@@ -1655,11 +1706,12 @@ class StereoCaptureOnlyApp:
 
     def _cached_trigger_source(self) -> str:
         with self._state_lock:
-            return str(getattr(self, "_trigger_source_cache", self.config.get("trigger_source", "Software")))
+            raw = str(getattr(self, "_trigger_source_cache", self.config.get("trigger_source", "Software")))
+            return canonical_trigger_source(raw)
 
     def _set_cached_trigger_source(self, value: str) -> None:
         with self._state_lock:
-            self._trigger_source_cache = str(value)
+            self._trigger_source_cache = canonical_trigger_source(value)
 
     def _config_snapshot(self) -> dict:
         if isinstance(self.config, ThreadSafeConfig):
@@ -1891,7 +1943,7 @@ class StereoCaptureOnlyApp:
         presets = self.config.get("presets", {})
         default_preset = "室内低光" if "室内低光" in presets else next(iter(presets), "室内低光")
         self.preset_var = StringVar(value=default_preset)
-        self.trigger_source_var = StringVar(value=str(self.config.get("trigger_source", "Software")))
+        self.trigger_source_var = StringVar(value=display_trigger_source(self.config.get("trigger_source", "Software")))
         self.exposure_auto_var = StringVar(value=str(self.config.get("exposure_auto", "Off")))
         self.exposure_time_var = StringVar(value=str(self.config.get("exposure_time_us", 10000.0)))
         self.auto_exposure_lower_var = StringVar(value=optional_config_text(self.config, "auto_exposure_lower_limit", "100.0"))
@@ -1928,6 +1980,12 @@ class StereoCaptureOnlyApp:
             else DIC_CAPTURE_CONFIG["record_fps"]
         )
         self.dic_record_fps_var = StringVar(value=str(dic_record_fps))
+        dic_pixel_format = (
+            str(dic_section.get("pixel_format", DIC_CAPTURE_CONFIG["pixel_format"]))
+            if isinstance(dic_section, dict)
+            else str(DIC_CAPTURE_CONFIG["pixel_format"])
+        )
+        self.dic_pixel_format_var = StringVar(value=dic_pixel_format if dic_pixel_format in DIC_PIXEL_FORMATS else "Mono16")
         self.record_max_seconds_var = StringVar(value=optional_config_text(self.config, "record_max_seconds", "0"))
         exposure_monitor = self._ensure_config_section("exposure_monitor")
         self.preview_quality_analysis_var = BooleanVar(
@@ -1946,7 +2004,10 @@ class StereoCaptureOnlyApp:
         self.temperature_status_var = StringVar(value="Temp --")
         self.camera_health_var = StringVar(value="Health --")
         fixed_offset = self.config.get("camera_timestamp_offset_fixed")
-        offset_text = f"Camera offset {fixed_offset}" if fixed_offset not in (None, "") else "Camera offset --"
+        if fixed_offset not in (None, ""):
+            offset_text = self._format_camera_timestamp_offset(int(fixed_offset))
+        else:
+            offset_text = "相机时基差 --"
         self.timestamp_offset_var = StringVar(value=offset_text)
         field_correction = self._ensure_config_section("field_correction")
         self.field_correction_enabled_var = BooleanVar(value=config_bool(field_correction, "enabled", False, False))
@@ -2047,10 +2108,7 @@ class StereoCaptureOnlyApp:
             trigger_panel,
             self.trigger_source_var,
             self.trigger_source_var.get(),
-            "Software",
-            "Cascade",
-            "Line0",
-            "Continuous",
+            *TRIGGER_SOURCE_CN_ORDER,
         ).grid(row=0, column=1, padx=3, pady=2)
         self.apply_trigger_button = ttk.Button(
             trigger_panel, text="应用触发", command=self.apply_trigger_settings, state=DISABLED
@@ -2094,6 +2152,16 @@ class StereoCaptureOnlyApp:
         )
         self.dic_capture_button.grid(row=0, column=12, padx=(0, 4), pady=2)
         self.dic_record_fps_entry = self._labeled_entry(interval_panel, "DIC fps", self.dic_record_fps_var, 6, 0, 13)
+        ttk.Label(interval_panel, text="输出", style="Panel.TLabel", anchor="e").grid(
+            row=0, column=15, padx=(4, 1), pady=1, sticky="e"
+        )
+        self.dic_pixel_format_menu = ttk.OptionMenu(
+            interval_panel,
+            self.dic_pixel_format_var,
+            self.dic_pixel_format_var.get(),
+            *DIC_PIXEL_FORMATS,
+        )
+        self.dic_pixel_format_menu.grid(row=0, column=16, padx=(0, 2), pady=1, sticky="ew")
 
         info = ttk.Frame(toolbar, style="InfoBar.TFrame", padding=(8, 4))
         info.pack(side=TOP, fill=X, pady=(5, 0))
@@ -3343,6 +3411,20 @@ class StereoCaptureOnlyApp:
             return 0
         return sum(info is not None for info in (self.camera_system.left_info, self.camera_system.right_info))
 
+    @staticmethod
+    def _format_camera_timestamp_offset(offset: int) -> str:
+        abs_ns = abs(offset)
+        if abs_ns >= 1_000_000_000:
+            formatted = f"{abs_ns / 1_000_000_000:.2f} s"
+        elif abs_ns >= 1_000_000:
+            formatted = f"{abs_ns / 1_000_000:.2f} ms"
+        elif abs_ns >= 1_000:
+            formatted = f"{abs_ns / 1_000:.1f} μs"
+        else:
+            formatted = f"{abs_ns} ns"
+        direction = "左比右早" if offset >= 0 else "右比左早"
+        return f"{direction} {formatted}"
+
     def _apply_fixed_camera_timestamp_offset(self) -> None:
         if self.camera_system is None or not hasattr(self.camera_system, "set_camera_timestamp_offset"):
             return
@@ -3352,7 +3434,7 @@ class StereoCaptureOnlyApp:
         try:
             self.camera_system.set_camera_timestamp_offset(int(offset))
             if hasattr(self, "timestamp_offset_var"):
-                self.timestamp_offset_var.set(f"Camera offset {int(offset)}")
+                self.timestamp_offset_var.set(self._format_camera_timestamp_offset(int(offset)))
         except (TypeError, ValueError):
             LOGGER.warning("invalid fixed camera timestamp offset: %s", offset)
 
@@ -4082,14 +4164,45 @@ class StereoCaptureOnlyApp:
             raise ValueError("DIC FPS must be greater than 0")
         return fps
 
-    def _apply_dic_record_fps_to_config(self, config_snapshot: dict[str, object]) -> dict[str, object]:
+    def _dic_pixel_format_from_entry(self) -> str:
+        if not hasattr(self, "dic_pixel_format_var"):
+            section = self.config.get("dic_capture", {}) if hasattr(self, "config") else {}
+            value = str(section.get("pixel_format", DIC_CAPTURE_CONFIG["pixel_format"]) if isinstance(section, dict) else DIC_CAPTURE_CONFIG["pixel_format"])
+            return value if value in DIC_PIXEL_FORMATS else "Mono16"
+        value = str(self.dic_pixel_format_var.get() or "Mono16").strip()
+        if value not in DIC_PIXEL_FORMATS:
+            raise ValueError("unsupported DIC pixel format")
+        return value
+
+    def _apply_dic_ui_settings_to_config(self, config_snapshot: dict[str, object]) -> dict[str, object]:
         snapshot = dict(config_snapshot)
         fps = self._dic_record_fps_from_entry()
+        pixel_format = self._dic_pixel_format_from_entry()
         snapshot["record_fps"] = fps
+        snapshot["pixel_format"] = pixel_format
+        high_bit_depth = pixel_format != "Mono8"
+        snapshot["save_raw_frames"] = high_bit_depth
+        snapshot["record_force_image_format"] = not high_bit_depth
+        snapshot["image_format"] = "png"
+        snapshot["viewable_sidecar_enabled"] = True
+        snapshot["viewable_sidecar_format"] = "png"
+        if high_bit_depth:
+            snapshot["raw_frame_format"] = str(snapshot.get("raw_frame_format") or "tiff16")
         dic_section = dict(snapshot.get("dic_capture", {}) if isinstance(snapshot.get("dic_capture"), dict) else {})
         dic_section["record_fps"] = fps
+        dic_section["pixel_format"] = pixel_format
+        dic_section["save_raw_frames"] = high_bit_depth
+        dic_section["record_force_image_format"] = not high_bit_depth
+        dic_section["image_format"] = "png"
+        dic_section["viewable_sidecar_enabled"] = True
+        dic_section["viewable_sidecar_format"] = "png"
+        if high_bit_depth:
+            dic_section["raw_frame_format"] = str(snapshot.get("raw_frame_format") or "tiff16")
         snapshot["dic_capture"] = dic_section
         return snapshot
+
+    def _apply_dic_record_fps_to_config(self, config_snapshot: dict[str, object]) -> dict[str, object]:
+        return self._apply_dic_ui_settings_to_config(config_snapshot)
 
     def start_dic_capture(self) -> None:
         if self.camera_system is None:
@@ -4101,9 +4214,9 @@ class StereoCaptureOnlyApp:
             self.status_var.set("定时拍照中不能启动 DIC 图像采集。")
             return
         try:
-            config_snapshot = self._apply_dic_record_fps_to_config(self._dic_capture_config())
+            config_snapshot = self._apply_dic_ui_settings_to_config(self._dic_capture_config())
         except ValueError:
-            self.status_var.set("DIC FPS 必须是大于 0 的数字。")
+            self.status_var.set("DIC FPS 必须是大于 0 的数字，输出格式需为 Mono16/Mono12/Mono10/Mono8。")
             return
         self._load_vars_from_snapshot(config_snapshot, include_record_fps=False)
         self.status_var.set("正在应用 DIC 图像采集参数...")
@@ -4228,18 +4341,22 @@ class StereoCaptureOnlyApp:
         pixel_name = str(getattr(frame, "pixel_type_name", "") or "").lower()
         raw_len = int(getattr(frame, "raw_frame_len", 0) or len(raw_data))
         if "rgb" in pixel_name and raw_len >= width * height * 3:
-            rgb = np.frombuffer(raw_data, dtype=np.uint8, count=width * height * 3).reshape((height, width, 3))
+            payload = contiguous_frame_buffer(raw_data, width * height * 3)
+            rgb = np.frombuffer(payload, dtype=np.uint8, count=width * height * 3).reshape((height, width, 3))
             return cv2.cvtColor(rgb, cv2.COLOR_RGB2BGR)
         if "bgr" in pixel_name and raw_len >= width * height * 3:
-            return np.frombuffer(raw_data, dtype=np.uint8, count=width * height * 3).reshape((height, width, 3)).copy()
+            payload = contiguous_frame_buffer(raw_data, width * height * 3)
+            return np.frombuffer(payload, dtype=np.uint8, count=width * height * 3).reshape((height, width, 3)).copy()
         if ("mono16" in pixel_name or "mono12" in pixel_name or "mono10" in pixel_name) and raw_len >= width * height * 2:
-            gray16 = np.frombuffer(raw_data, dtype="<u2", count=width * height).reshape((height, width))
+            payload = contiguous_frame_buffer(raw_data, width * height * 2)
+            gray16 = np.frombuffer(payload, dtype="<u2", count=width * height).reshape((height, width))
             bit_depth = max(int(getattr(frame, "raw_bit_depth", 16) or 16), 9)
             scale = 255.0 / float((1 << min(bit_depth, 16)) - 1)
             gray8 = np.clip(gray16.astype(np.float32) * scale, 0, 255).astype(np.uint8)
             return cv2.cvtColor(gray8, cv2.COLOR_GRAY2BGR)
         if "mono8" in pixel_name and raw_len >= width * height:
-            gray = np.frombuffer(raw_data, dtype=np.uint8, count=width * height).reshape((height, width))
+            payload = contiguous_frame_buffer(raw_data, width * height)
+            gray = np.frombuffer(payload, dtype=np.uint8, count=width * height).reshape((height, width))
             return cv2.cvtColor(gray, cv2.COLOR_GRAY2BGR)
         if "bayer" in pixel_name:
             bayer = self._raw_bayer_to_8bit(frame, raw_data, raw_len, width, height, pixel_name)
@@ -4251,19 +4368,21 @@ class StereoCaptureOnlyApp:
     def _raw_bayer_to_8bit(
         self,
         frame: CameraFrame,
-        raw_data: bytes,
+        raw_data: bytes | bytearray | memoryview,
         raw_len: int,
         width: int,
         height: int,
         pixel_name: str,
     ) -> np.ndarray | None:
         if raw_len >= width * height * 2 and any(token in pixel_name for token in ("16", "12", "10")):
-            bayer16 = np.frombuffer(raw_data, dtype="<u2", count=width * height).reshape((height, width))
+            payload = contiguous_frame_buffer(raw_data, width * height * 2)
+            bayer16 = np.frombuffer(payload, dtype="<u2", count=width * height).reshape((height, width))
             bit_depth = max(int(getattr(frame, "raw_bit_depth", 16) or 16), 9)
             scale = 255.0 / float((1 << min(bit_depth, 16)) - 1)
             return np.clip(bayer16.astype(np.float32) * scale, 0, 255).astype(np.uint8)
         if raw_len >= width * height:
-            return np.frombuffer(raw_data, dtype=np.uint8, count=width * height).reshape((height, width))
+            payload = contiguous_frame_buffer(raw_data, width * height)
+            return np.frombuffer(payload, dtype=np.uint8, count=width * height).reshape((height, width))
         return None
 
     def _bayer_color_code(self, pixel_name: str) -> int:
@@ -4916,6 +5035,9 @@ class StereoCaptureOnlyApp:
                     "record_worker_stop_timeout",
                     f"录像写入线程 {worker.name or worker.ident} 停止超时，已继续收尾。",
                 )
+        for queue in queues:
+            if getattr(queue, "unfinished_tasks", 0) > 0:
+                self._drain_queue(queue, "queue_drain_after_stop_timeout")
 
     def _drain_queue(self, queue: Queue, reason: str) -> None:
         while True:
@@ -4927,6 +5049,19 @@ class StereoCaptureOnlyApp:
                 if isinstance(item, dict):
                     self._record_skipped(reason, int(item.get("index", 0) or 0))
                 queue.task_done()
+
+    def _get_record_writer_item(self, writer_queue: Queue, timeout_s: float = 0.2) -> dict | None:
+        while True:
+            try:
+                item = writer_queue.get(timeout=timeout_s)
+            except Empty:
+                if not self.recording and writer_queue.empty():
+                    return None
+            else:
+                if item is None:
+                    writer_queue.task_done()
+                    return None
+                return item
 
     def _put_record_item(self, queue: Queue, item: dict, *, clone_frames: bool = True) -> bool:
         frame_index = int(item.get("index", 0) or 0)
@@ -4985,9 +5120,8 @@ class StereoCaptureOnlyApp:
         self._require_record_dir()
         batch_size = max(config_int(config_snapshot, "record_writer_batch_size", 4), 1)
         while True:
-            first_item = writer_queue.get()
+            first_item = self._get_record_writer_item(writer_queue)
             if first_item is None:
-                writer_queue.task_done()
                 return
             batch: list[dict] = [first_item]
             for _ in range(batch_size - 1):
@@ -5102,9 +5236,8 @@ class StereoCaptureOnlyApp:
         writers: dict[tuple[str, int], cv2.VideoWriter] = {}
         try:
             while True:
-                item = writer_queue.get()
+                item = self._get_record_writer_item(writer_queue)
                 if item is None:
-                    writer_queue.task_done()
                     break
                 try:
                     started = time.perf_counter()
@@ -5684,8 +5817,8 @@ class StereoCaptureOnlyApp:
         if self.camera_system is not None and hasattr(self.camera_system, "set_camera_timestamp_offset"):
             self.camera_system.set_camera_timestamp_offset(None)
         self._update_config({"camera_timestamp_offset_fixed": None})
-        self.timestamp_offset_var.set("Camera offset --")
-        self.status_var.set("CameraTimestamp Offset 已清除。")
+        self.timestamp_offset_var.set("相机时基差 --")
+        self.status_var.set("相机时间偏置已清除。")
 
     def apply_roi_settings(self, restart_stream: bool = True) -> None:
         if self.camera_system is None:
@@ -5747,17 +5880,17 @@ class StereoCaptureOnlyApp:
     def apply_trigger_settings(self) -> None:
         if self.camera_system is None:
             return
-        trigger_source = self.trigger_source_var.get()
+        trigger_source = canonical_trigger_source(self.trigger_source_var.get())
         self._set_cached_trigger_source(trigger_source)
         self.apply_trigger_button.configure(state=DISABLED)
         if trigger_source == "Cascade":
-            self.status_var.set("正在应用 Cascade 级联硬触发：左相机 Line2 输出，右相机 Line0 接收。")
+            self.status_var.set("正在应用硬触发级联：左相机 Line2 输出，右相机 Line0 接收。")
         elif trigger_source == "Line0":
-            self.status_var.set("正在应用 Line0 外触发模式；请确认两台相机 Line0 已接入同一个上升沿触发脉冲。")
+            self.status_var.set("正在应用外部硬触发；请确认两台相机 Line0 已接入同一个上升沿触发脉冲。")
         elif trigger_source == "Continuous":
-            self.status_var.set("正在应用 Continuous 连续采集模式；相机会按曝光和带宽能力自由运行。")
+            self.status_var.set("正在应用连续采集；相机会按曝光和带宽能力自由运行。")
         else:
-            self.status_var.set("正在应用触发模式...")
+            self.status_var.set("正在应用软触发模式...")
 
         def worker() -> None:
             try:
@@ -5766,11 +5899,11 @@ class StereoCaptureOnlyApp:
                 self._set_cached_trigger_source(trigger_source)
                 message = self._format_apply_result("触发模式已应用", warnings)
                 if trigger_source == "Cascade":
-                    message += "；Cascade 模式只软件触发 Master，相机间同步由 Master 输出线驱动 Slave。"
+                    message += "；硬触发级联只软件触发主相机，从相机由 Line0 硬件脉冲同步曝光。"
                 elif trigger_source == "Line0":
-                    message += "；Line0 模式不会发送软件触发，若没有外部脉冲会持续超时。"
+                    message += "；外部硬触发不会发送软件触发，若没有外部脉冲会持续超时。"
                 elif trigger_source == "Continuous":
-                    message += "；Continuous 模式关闭帧触发，预览/录像会读取相机连续输出的最新帧。"
+                    message += "；连续采集关闭帧触发，预览/录像读取相机连续输出的最新帧。"
                 self.ui_queue.put(("status", message))
             except Exception as exc:
                 self.ui_queue.put(("error", exc))
@@ -5873,7 +6006,11 @@ class StereoCaptureOnlyApp:
                         message = str(payload.get("message", "MP4 --"))
                         self._set_mp4_progress(percent, message, visible=True)
                 elif kind == "timestamp_offset":
-                    self.timestamp_offset_var.set(f"Camera offset {payload}")
+                    try:
+                        formatted = self._format_camera_timestamp_offset(int(payload))
+                    except (TypeError, ValueError):
+                        formatted = f"Camera offset {payload}"
+                    self.timestamp_offset_var.set(formatted)
                 elif kind == "shutter_flash":
                     self._flash_shutter_feedback()
                 elif kind == "photo_done":
@@ -6076,9 +6213,11 @@ class StereoCaptureOnlyApp:
         self._ui_queue_fallback_after_id = self.root.after(250, self._schedule_ui_queue_fallback)
 
     def _set_capture_buttons(self, state: str) -> None:
-        def set_dic_fps_entry(enabled: bool) -> None:
+        def set_dic_options_enabled(enabled: bool) -> None:
             if hasattr(self, "dic_record_fps_entry"):
                 self.dic_record_fps_entry.configure(state=NORMAL if enabled else DISABLED)
+            if hasattr(self, "dic_pixel_format_menu"):
+                self.dic_pixel_format_menu.configure(state=NORMAL if enabled else DISABLED)
 
         if self.camera_system is None:
             self.connect_button.configure(state=NORMAL)
@@ -6089,7 +6228,7 @@ class StereoCaptureOnlyApp:
             self.record_button.configure(state=DISABLED)
             if hasattr(self, "dic_capture_button"):
                 self.dic_capture_button.configure(state=DISABLED)
-            set_dic_fps_entry(False)
+            set_dic_options_enabled(False)
             self.record_preflight_button.configure(state=NORMAL)
             self.calibration_wizard_button.configure(state=NORMAL)
             return
@@ -6105,7 +6244,7 @@ class StereoCaptureOnlyApp:
             self.record_button.configure(state=DISABLED if self._dic_recording else state)
             if hasattr(self, "dic_capture_button"):
                 self.dic_capture_button.configure(state=state if self._dic_recording else DISABLED)
-            set_dic_fps_entry(False)
+            set_dic_options_enabled(False)
         elif self.interval_capturing:
             self.preview_button.configure(state=state)
             self.photo_button.configure(state=DISABLED)
@@ -6114,7 +6253,7 @@ class StereoCaptureOnlyApp:
             self.record_button.configure(state=DISABLED)
             if hasattr(self, "dic_capture_button"):
                 self.dic_capture_button.configure(state=DISABLED)
-            set_dic_fps_entry(False)
+            set_dic_options_enabled(False)
         elif self.previewing:
             self.preview_button.configure(state=state)
             self.photo_button.configure(state=state)
@@ -6123,7 +6262,7 @@ class StereoCaptureOnlyApp:
             self.record_button.configure(state=state)
             if hasattr(self, "dic_capture_button"):
                 self.dic_capture_button.configure(state=state)
-            set_dic_fps_entry(True)
+            set_dic_options_enabled(True)
         else:
             self.preview_button.configure(state=state)
             self.photo_button.configure(state=state)
@@ -6132,7 +6271,7 @@ class StereoCaptureOnlyApp:
             self.record_button.configure(state=state)
             if hasattr(self, "dic_capture_button"):
                 self.dic_capture_button.configure(state=state)
-            set_dic_fps_entry(True)
+            set_dic_options_enabled(True)
 
     def _set_parameter_buttons(self, state: str) -> None:
         self.apply_gain_button.configure(state=state)
@@ -6514,31 +6653,31 @@ class StereoCaptureOnlyApp:
         right_size = plan.get("right_size") if isinstance(plan.get("right_size"), list) else [0, 0]
         measured_mbps = float(plan.get("measured_mbps") or 0.0)
         suggested_fps = float(plan.get("suggested_max_fps") or 0.0)
-        speed_text = f"{measured_mbps:.1f} MB/s" if measured_mbps > 0 else "not measured"
-        suggested_text = f"{suggested_fps:.1f} fps" if suggested_fps > 0 else "run benchmark first"
+        speed_text = f"{measured_mbps:.1f} MB/s" if measured_mbps > 0 else "未测试"
+        suggested_text = f"{suggested_fps:.1f} fps" if suggested_fps > 0 else "请先运行磁盘测速"
         save_sequence = bool(plan.get("record_save_image_sequence"))
-        output_mode = f"MP4 video; image sequence: {'on' if save_sequence else 'off'}"
+        output_mode = "MP4视频" + (" | 图像序列：开" if save_sequence else " | 图像序列：关")
         status = str(plan.get("status", "unknown"))
         if status == "ok":
-            verdict = "Current settings are expected to write steadily."
+            verdict = "当前设置预计可以稳定写入。"
         elif status == "warn":
-            verdict = "Current settings may not keep up. Lower FPS, shrink ROI, lower bitrate, or keep image sequence off."
+            verdict = "当前设置可能无法稳定写入。建议降低 FPS、缩小 ROI、降低码率，或关闭图像序列。"
         else:
-            verdict = "Disk benchmark has not run yet. Benchmark before high-bandwidth recording."
+            verdict = "磁盘测速尚未执行。进行高码率录像前请先执行测速。"
         return "\n".join(
             [
-                "Recording preflight",
+                "录像性能评估",
                 "",
-                f"ROI: left {left_size[0]}x{left_size[1]}, right {right_size[0]}x{right_size[1]}",
-                f"Pixel format: {plan.get('pixel_format', '--')}; output: {output_mode}",
-                f"Target FPS: {float(plan.get('target_fps') or 0.0):.1f}",
-                f"Estimated stereo frame group size: {format_bytes(plan.get('pair_bytes'))}",
-                f"Estimated write bandwidth: {float(plan.get('required_mbps') or 0.0):.1f} MB/s",
-                f"Measured disk write: {speed_text}",
-                f"Safety margin: {float(plan.get('margin') or 1.0):.2f}x",
-                f"Suggested max FPS: {suggested_text}",
-                f"Estimated 1-minute size: {format_bytes(plan.get('one_minute_bytes'))}",
-                f"Free space: {format_bytes(plan.get('free_bytes'))}",
+                f"ROI: 左 {left_size[0]}x{left_size[1]}, 右 {right_size[0]}x{right_size[1]}",
+                f"像素格式: {plan.get('pixel_format', '--')}; 输出: {output_mode}",
+                f"目标帧率: {float(plan.get('target_fps') or 0.0):.1f} fps",
+                f"估计双目组帧大小: {format_bytes(plan.get('pair_bytes'))}",
+                f"估计写入带宽: {float(plan.get('required_mbps') or 0.0):.1f} MB/s",
+                f"实测磁盘写入: {speed_text}",
+                f"安全系数: {float(plan.get('margin') or 1.0):.2f}x",
+                f"建议最大帧率: {suggested_text}",
+                f"估计 1 分钟数据量: {format_bytes(plan.get('one_minute_bytes'))}",
+                f"剩余空间: {format_bytes(plan.get('free_bytes'))}",
                 "",
                 verdict,
             ]
@@ -7521,7 +7660,7 @@ class StereoCaptureOnlyApp:
         }
 
     def _load_vars_from_snapshot(self, snapshot: dict[str, object], *, include_record_fps: bool = True) -> None:
-        self.trigger_source_var.set(str(snapshot.get("trigger_source", "Software")))
+        self.trigger_source_var.set(display_trigger_source(snapshot.get("trigger_source", "Software")))
         self._set_cached_trigger_source(str(snapshot.get("trigger_source", "Software")))
         self.exposure_auto_var.set(str(snapshot.get("exposure_auto", "Off")))
         self.exposure_time_var.set(str(snapshot.get("exposure_time_us", 10000.0)))
@@ -7543,6 +7682,9 @@ class StereoCaptureOnlyApp:
         if include_record_fps:
             self.record_fps_var.set(str(snapshot.get("record_fps", 5.0)))
         self.dic_record_fps_var.set(str(snapshot.get("record_fps", DIC_CAPTURE_CONFIG["record_fps"])))
+        if hasattr(self, "dic_pixel_format_var"):
+            pixel_format = str(snapshot.get("pixel_format", DIC_CAPTURE_CONFIG["pixel_format"]))
+            self.dic_pixel_format_var.set(pixel_format if pixel_format in DIC_PIXEL_FORMATS else "Mono16")
 
     def _apply_capture_config_to_camera(self, config_snapshot: dict[str, object]) -> list[str]:
         camera_system = self._require_camera_system()
@@ -7628,8 +7770,21 @@ class StereoCaptureOnlyApp:
             dic_record_fps = self._dic_record_fps_from_entry()
         except ValueError:
             dic_record_fps = config_float(self.config.get("dic_capture", {}), "record_fps", DIC_CAPTURE_CONFIG["record_fps"])
+        try:
+            dic_pixel_format = self._dic_pixel_format_from_entry()
+        except ValueError:
+            dic_pixel_format = str(self.config.get("dic_capture", {}).get("pixel_format", DIC_CAPTURE_CONFIG["pixel_format"]))
         dic_capture = dict(self.config.get("dic_capture", {}) if isinstance(self.config.get("dic_capture"), dict) else {})
         dic_capture["record_fps"] = dic_record_fps
+        dic_capture["pixel_format"] = dic_pixel_format
+        high_bit_depth = dic_pixel_format != "Mono8"
+        dic_capture["save_raw_frames"] = high_bit_depth
+        dic_capture["record_force_image_format"] = not high_bit_depth
+        dic_capture["image_format"] = "png"
+        dic_capture["viewable_sidecar_enabled"] = True
+        dic_capture["viewable_sidecar_format"] = "png"
+        if high_bit_depth:
+            dic_capture["raw_frame_format"] = str(dic_capture.get("raw_frame_format") or "tiff16")
         values["dic_capture"] = dic_capture
         self._update_config(values, save=False)
         self._set_cached_trigger_source(str(values.get("trigger_source", "Software")))
@@ -7655,7 +7810,7 @@ class StereoCaptureOnlyApp:
 
     def _load_vars_from_config(self) -> None:
         self._ensure_default_full_resolution()
-        self.trigger_source_var.set(str(self.config.get("trigger_source", "Software")))
+        self.trigger_source_var.set(display_trigger_source(self.config.get("trigger_source", "Software")))
         self._set_cached_trigger_source(str(self.config.get("trigger_source", "Software")))
         self.exposure_auto_var.set(str(self.config.get("exposure_auto", "Off")))
         self.exposure_time_var.set(str(self.config.get("exposure_time_us", 10000.0)))
@@ -8939,10 +9094,12 @@ Output {esc('MP4 + image sequence' if config_bool(config_snapshot, 'record_save_
         pixel_name = str(getattr(frame, "pixel_type_name", "") or "").lower()
         raw_len = int(getattr(frame, "raw_frame_len", 0) or len(raw_data))
         if width > 0 and height > 0 and raw_len >= width * height * 2 and bit_depth > 8:
-            return np.frombuffer(raw_data, dtype="<u2", count=width * height).reshape((height, width)).copy()
+            payload = contiguous_frame_buffer(raw_data, width * height * 2)
+            return np.frombuffer(payload, dtype="<u2", count=width * height).reshape((height, width)).copy()
         if width > 0 and height > 0 and raw_len >= width * height and ("mono" in pixel_name or "bayer" in pixel_name):
-            return np.frombuffer(raw_data, dtype=np.uint8, count=width * height).reshape((height, width)).copy()
-        return np.frombuffer(raw_data, dtype=np.uint8).copy()
+            payload = contiguous_frame_buffer(raw_data, width * height)
+            return np.frombuffer(payload, dtype=np.uint8, count=width * height).reshape((height, width)).copy()
+        return np.frombuffer(contiguous_frame_buffer(raw_data), dtype=np.uint8).copy()
 
     def _frame_to_correction_array(self, frame: CameraFrame | None) -> np.ndarray | None:
         if frame is None:
@@ -9054,6 +9211,7 @@ Output {esc('MP4 + image sequence' if config_bool(config_snapshot, 'record_save_
                     raise MvsError("OpenCV EXR writer returned failure; enable OpenEXR support or choose png16/tiff16")
             else:
                 raise MvsError(f"unsupported raw_frame_format: {fmt}")
+            self._save_viewable_sidecar(array, raw_path, config_snapshot)
         except Exception as exc:
             LOGGER.exception("原始帧保存失败: %s", raw_path)
             try:
@@ -9062,6 +9220,41 @@ Output {esc('MP4 + image sequence' if config_bool(config_snapshot, 'record_save_
                 LOGGER.warning("原始帧保存失败后清理残留文件失败: %s", raw_path, exc_info=True)
             raise MvsError(f"原始帧保存失败：{raw_path}；{exc}") from exc
         return raw_path
+
+    def _save_viewable_sidecar(self, array: np.ndarray, raw_path: Path, config_snapshot: dict) -> None:
+        if not config_bool(config_snapshot, "viewable_sidecar_enabled", True, True):
+            return
+        if array.size == 0 or array.ndim < 2:
+            return
+        fmt = str(config_snapshot.get("viewable_sidecar_format", config_snapshot.get("image_format", "png"))).lower().strip()
+        if fmt in {"jpg", "jpeg"}:
+            ext = "jpg"
+            quality = max(min(int(config_snapshot.get("record_jpeg_quality", 95) or 95), 100), 1)
+        else:
+            ext = "png"
+            quality = None
+        view_path = raw_path.with_suffix(f".view.{ext}")
+        if array.dtype == np.uint8:
+            work = array
+        elif array.dtype in (np.uint16, np.int32, np.int64):
+            vmin = int(array.min())
+            vmax = int(array.max())
+            value_range = vmax - vmin
+            if value_range <= 0:
+                view8 = np.full(array.shape, 128, dtype=np.uint8)
+            else:
+                view8 = np.clip((array.astype(np.float64) - vmin) * 255.0 / value_range, 0, 255).astype(np.uint8)
+            work = view8
+        else:
+            work = np.clip(array.astype(np.float64) * 255.0, 0, 255).astype(np.uint8)
+        try:
+            image = Image.fromarray(work)
+            if ext == "jpg":
+                image.save(view_path, format="JPEG", quality=quality)
+            else:
+                image.save(view_path, format="PNG")
+        except Exception as exc:
+            LOGGER.debug("可查看侧车图保存失败: %s (%s)", view_path, exc, exc_info=True)
 
     def _save_image(self, image: Image.Image, path: Path, config_snapshot: dict | None = None) -> Path:
         config_snapshot = config_snapshot or self._config_snapshot()

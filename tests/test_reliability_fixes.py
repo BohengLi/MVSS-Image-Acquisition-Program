@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import ctypes
 import tempfile
 import threading
 import unittest
@@ -58,6 +59,26 @@ class _FakeGrabCamera:
             host_timestamp=frame_number,
             camera_timestamp=frame_number,
         )
+
+
+class _FakeRoiCamera:
+    is_ready = True
+
+    def __init__(self, actuals: list[tuple[int, int, int, int]]):
+        self.actuals = list(actuals)
+        self.calls: list[tuple[int | None, int | None, int, int, bool]] = []
+
+    def apply_roi_settings(
+        self,
+        width: int | None,
+        height: int | None,
+        offset_x: int,
+        offset_y: int,
+        restart_stream: bool = True,
+    ):
+        self.calls.append((width, height, offset_x, offset_y, restart_stream))
+        actual = self.actuals.pop(0)
+        return mvs_camera.RoiApplyResult([], actual)
 
 
 class _FakeNodeCamera:
@@ -161,9 +182,18 @@ class ReliabilityFixTests(unittest.TestCase):
             "__file__": str(spec_path),
         }
         original_find_spec = importlib.util.find_spec
+        original_path_exists = Path.exists
+        runtime_dir = str(Path(r"C:\Program Files (x86)\Common Files\MVS\Runtime\Win64_x64"))
+
+        def fake_path_exists(path: Path) -> bool:
+            if str(path) == runtime_dir:
+                return False
+            return original_path_exists(path)
+
         importlib.util.find_spec = lambda name: None if name == "hikrobot" else original_find_spec(name)
         try:
-            exec(compile(spec_path.read_text(encoding="utf-8"), str(spec_path), "exec"), namespace)
+            with patch.object(Path, "exists", fake_path_exists):
+                exec(compile(spec_path.read_text(encoding="utf-8"), str(spec_path), "exec"), namespace)
         finally:
             importlib.util.find_spec = original_find_spec
 
@@ -250,6 +280,17 @@ class ReliabilityFixTests(unittest.TestCase):
         self.assertEqual(seen["mode"], "L")
         self.assertEqual(seen["size"], (3, 2))
         self.assertIs(seen["data"], payload)
+
+    def test_packet_to_image_accepts_non_contiguous_memoryview_payload(self) -> None:
+        camera = MvsCamera.__new__(MvsCamera)
+        source = np.arange(8, dtype=np.uint8).reshape(2, 4)[:, :3]
+        packet = RawFramePacket(memoryview(source), source.nbytes, 3, 2, 1, 1, 0, 0)
+
+        with patch.object(mvs_camera, "sdk", return_value={"PixelType_Gvsp_Mono8": 1}):
+            image = camera._packet_to_image(packet)
+
+        self.assertEqual(image.size, (3, 2))
+        self.assertEqual(list(image.getdata()), [0, 1, 2, 4, 5, 6])
 
     def test_frame_from_packet_keeps_raw_payload_metadata(self) -> None:
         camera = MvsCamera.__new__(MvsCamera)
@@ -365,6 +406,58 @@ class ReliabilityFixTests(unittest.TestCase):
 
         self.assertEqual(seen, [True])
 
+    def test_grab_frame_with_timeout_uses_fallback_payload_when_payload_size_is_zero(self) -> None:
+        camera = MvsCamera.__new__(MvsCamera)
+        camera.info = _Info()
+        camera._payload_lock = threading.Lock()
+        camera._payload_size = 0
+        camera._payload_size_snapshot = lambda: 0
+        camera._try_get_int = lambda key: {"Width": 3, "Height": 2}.get(key, 0)
+        camera._try_get_string = lambda key: "Mono16" if key == "PixelFormat" else None
+        seen: dict[str, int] = {}
+
+        class _FrameInfo(ctypes.Structure):
+            _fields_ = [
+                ("nWidth", ctypes.c_uint),
+                ("nHeight", ctypes.c_uint),
+                ("nFrameLen", ctypes.c_uint),
+                ("enPixelType", ctypes.c_uint),
+                ("nFrameNum", ctypes.c_uint),
+                ("nDevTimeStampHigh", ctypes.c_uint),
+                ("nDevTimeStampLow", ctypes.c_uint),
+            ]
+
+        class _Camera:
+            def MV_CC_GetOneFrameTimeout(self, _buffer, payload_size, frame_info, _timeout_ms):
+                seen["payload_size"] = payload_size
+                frame_info.nWidth = 3
+                frame_info.nHeight = 2
+                frame_info.nFrameLen = 12
+                frame_info.enPixelType = 1
+                frame_info.nFrameNum = 1
+                frame_info.nDevTimeStampHigh = 0
+                frame_info.nDevTimeStampLow = 0
+                return 0
+
+        camera._cam = _Camera()
+        camera._raw_packet_from_pointer = lambda _buffer, frame_info: RawFramePacket(
+            b"\x00" * frame_info.nFrameLen,
+            frame_info.nFrameLen,
+            frame_info.nWidth,
+            frame_info.nHeight,
+            frame_info.enPixelType,
+            frame_info.nFrameNum,
+            0,
+            0,
+        )
+        camera._frame_from_packet = lambda packet, convert_image=True: packet
+
+        with patch.object(mvs_camera, "sdk", return_value={"MV_FRAME_OUT_INFO_EX": _FrameInfo}):
+            packet = camera._grab_frame_with_timeout(100)
+
+        self.assertEqual(seen["payload_size"], 12)
+        self.assertEqual(packet.frame_len, 12)
+
     def test_image_correction_settings_apply_optional_float_nodes(self) -> None:
         camera = MvsCamera.__new__(MvsCamera)
         camera.info = _Info()
@@ -467,6 +560,28 @@ class ReliabilityFixTests(unittest.TestCase):
         self.assertEqual(video_frame.shape, (2, 2, 3))
         self.assertEqual(int(video_frame[0, 0, 0]), 0)
         self.assertEqual(int(video_frame[0, 1, 0]), 255)
+
+    def test_raw_frame_to_video_frame_accepts_non_contiguous_memoryview(self) -> None:
+        app = StereoCaptureOnlyApp.__new__(StereoCaptureOnlyApp)
+        source = np.arange(8, dtype=np.uint8).reshape(2, 4)[:, :3]
+        frame = Frame(
+            image=None,
+            frame_number=1,
+            width=3,
+            height=2,
+            host_timestamp=0,
+            camera_timestamp=0,
+            raw_data=memoryview(source),
+            raw_frame_len=source.nbytes,
+            pixel_type_name="PixelType_Gvsp_Mono8",
+            raw_bit_depth=8,
+            raw_array_shape=(2, 3),
+        )
+
+        video_frame = app._raw_frame_to_video_frame(frame)
+
+        self.assertEqual(video_frame.shape, (2, 3, 3))
+        self.assertEqual(int(video_frame[1, 2, 0]), 6)
 
     def test_record_preview_due_updates_every_half_second_at_two_fps(self) -> None:
         due, next_time = stereo_capture_only.record_preview_due(0.0, 0.0, 2.0)
@@ -625,6 +740,44 @@ class ReliabilityFixTests(unittest.TestCase):
         self.assertIn(path.suffix, {".tiff", ".tif"})
         self.assertEqual(saved.tolist(), [[0, 65535], [32768, 1024]])
 
+    def test_high_bit_depth_frames_save_viewable_png_sidecar(self) -> None:
+        app = StereoCaptureOnlyApp.__new__(StereoCaptureOnlyApp)
+        raw = np.array([[100, 200], [300, 400]], dtype=np.uint16).tobytes()
+        frame = Frame(
+            image=object(),
+            frame_number=1,
+            width=2,
+            height=2,
+            host_timestamp=0,
+            camera_timestamp=0,
+            raw_data=raw,
+            raw_frame_len=len(raw),
+            pixel_type_name="PixelType_Gvsp_Mono16",
+            raw_bit_depth=16,
+            raw_array_shape=(2, 2),
+        )
+
+        with tempfile.TemporaryDirectory() as tmp:
+            path = app._save_frame(
+                frame,
+                Path(tmp) / "left_000001.bmp",
+                {
+                    "save_raw_frames": True,
+                    "raw_frame_format": "tiff16",
+                    "image_format": "png",
+                    "viewable_sidecar_enabled": True,
+                    "viewable_sidecar_format": "png",
+                },
+            )
+            view_path = path.with_suffix(".view.png")
+            self.assertTrue(view_path.exists())
+            with Image.open(view_path) as view:
+                view_mode = view.mode
+                view_size = view.size
+
+        self.assertEqual(view_mode, "L")
+        self.assertEqual(view_size, (2, 2))
+
     def test_packed_high_bit_depth_raw_is_not_miswritten_as_png16(self) -> None:
         app = StereoCaptureOnlyApp.__new__(StereoCaptureOnlyApp)
         frame = Frame(
@@ -778,6 +931,29 @@ class ReliabilityFixTests(unittest.TestCase):
 
         self.assertEqual(config["record_fps"], 8.0)
         self.assertEqual(config["dic_capture"]["record_fps"], 8.0)
+
+    def test_dic_capture_pixel_format_entry_controls_raw_and_png_outputs(self) -> None:
+        app = StereoCaptureOnlyApp.__new__(StereoCaptureOnlyApp)
+        app.dic_record_fps_var = _Var()
+        app.dic_record_fps_var.set("5")
+        app.dic_pixel_format_var = _Var()
+
+        app.dic_pixel_format_var.set("Mono8")
+        mono8_config = app._apply_dic_ui_settings_to_config({"dic_capture": {"record_fps": 5.0}})
+
+        self.assertEqual(mono8_config["pixel_format"], "Mono8")
+        self.assertEqual(mono8_config["image_format"], "png")
+        self.assertFalse(mono8_config["save_raw_frames"])
+        self.assertTrue(mono8_config["record_force_image_format"])
+
+        app.dic_pixel_format_var.set("Mono16")
+        mono16_config = app._apply_dic_ui_settings_to_config({"dic_capture": {"record_fps": 5.0}})
+
+        self.assertEqual(mono16_config["pixel_format"], "Mono16")
+        self.assertEqual(mono16_config["image_format"], "png")
+        self.assertTrue(mono16_config["save_raw_frames"])
+        self.assertFalse(mono16_config["record_force_image_format"])
+        self.assertEqual(mono16_config["viewable_sidecar_format"], "png")
 
     def test_dic_record_queue_uses_configured_capacity(self) -> None:
         self.assertEqual(
@@ -994,6 +1170,47 @@ class ReliabilityFixTests(unittest.TestCase):
 
         self.assertIs(left, left_packets[1])
         self.assertIs(right, right_packets[1])
+
+    def test_continuous_frame_number_gap_is_logged(self) -> None:
+        system = StereoCameraSystem.__new__(StereoCameraSystem)
+        packets = [
+            RawFramePacket(b"1", 1, 1, 1, 1, 10, 100, 0),
+            RawFramePacket(b"2", 1, 1, 1, 1, 14, 101, 0),
+        ]
+
+        with self.assertLogs("mvss_capture", level="WARNING") as captured:
+            system._warn_continuous_frame_number_gaps(packets, "left")
+
+        self.assertIn("frame number gap", "\n".join(captured.output))
+        self.assertIn("previous=10", "\n".join(captured.output))
+
+    def test_selected_continuous_frame_number_gap_is_logged_across_batches(self) -> None:
+        system = StereoCameraSystem.__new__(StereoCameraSystem)
+        system._last_continuous_frame_numbers = {}
+        first_left = RawFramePacket(b"l1", 1, 1, 1, 1, 10, 100, 0)
+        first_right = RawFramePacket(b"r1", 1, 1, 1, 1, 11, 101, 0)
+        second_left = RawFramePacket(b"l2", 1, 1, 1, 1, 15, 102, 0)
+        second_right = RawFramePacket(b"r2", 1, 1, 1, 1, 16, 103, 0)
+
+        system._warn_selected_continuous_frame_numbers(first_left, first_right)
+        with self.assertLogs("mvss_capture", level="WARNING") as captured:
+            system._warn_selected_continuous_frame_numbers(second_left, second_right)
+
+        text = "\n".join(captured.output)
+        self.assertIn("selected frame number gap", text)
+        self.assertIn("previous=10", text)
+
+    def test_selected_continuous_left_right_frame_number_delta_is_logged(self) -> None:
+        system = StereoCameraSystem.__new__(StereoCameraSystem)
+        system._last_continuous_frame_numbers = {}
+
+        with self.assertLogs("mvss_capture", level="WARNING") as captured:
+            system._warn_selected_continuous_frame_numbers(
+                RawFramePacket(b"l", 1, 1, 1, 1, 10, 100, 0),
+                RawFramePacket(b"r", 1, 1, 1, 1, 20, 101, 0),
+            )
+
+        self.assertIn("left/right frame number delta", "\n".join(captured.output))
 
     def test_preview_analysis_accepts_unlimited_preview_fps(self) -> None:
         app = StereoCaptureOnlyApp.__new__(StereoCaptureOnlyApp)
@@ -1267,6 +1484,24 @@ class ReliabilityFixTests(unittest.TestCase):
         self.assertEqual(warnings, [])
         self.assertEqual(left.grab_timeouts, [400, 400])
         self.assertEqual(right.grab_timeouts, [400, 400])
+
+    def test_side_roi_adjusts_right_size_to_match_left_while_preserving_offset(self) -> None:
+        system = StereoCameraSystem.__new__(StereoCameraSystem)
+        system._capture_lock = threading.Lock()
+        system.config = {"roi_restart_settle_seconds": 0, "roi_warmup_frames": 0}
+        system.trigger_source = "Software"
+        left = _FakeRoiCamera([(100, 80, 0, 0)])
+        right = _FakeRoiCamera([(96, 80, 20, 10), (100, 80, 20, 10)])
+        system._connected_cameras = lambda: [("left", left), ("right", right)]
+
+        results, warnings = system.apply_side_roi_settings(
+            {"left": (100, 80, 0, 0), "right": (96, 80, 20, 10)},
+            restart_stream=False,
+        )
+
+        self.assertEqual(results["right"].actual_roi, (100, 80, 20, 10))
+        self.assertEqual(right.calls[-1], (100, 80, 20, 10, False))
+        self.assertTrue(any("Right camera ROI size adjusted" in warning for warning in warnings))
 
     def test_stream_stats_are_aggregated_for_ui(self) -> None:
         system = StereoCameraSystem.__new__(StereoCameraSystem)

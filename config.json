@@ -3,13 +3,13 @@
   "right_serial": "DB0371907",
   "bind_camera_serials": true,
   "save_dir": "captures",
-  "trigger_source": "Software",
+  "trigger_source": "软触发",
   "exposure_time_us": 20000.0,
-  "exposure_auto": "Off",
+  "exposure_auto": "Once",
   "auto_exposure_lower_limit": 1000.0,
   "auto_exposure_upper_limit": 100000.0,
   "gain": 0.0,
-  "gain_auto": "Off",
+  "gain_auto": "Once",
   "auto_gain_lower_limit": 0.0,
   "auto_gain_upper_limit": 15.0,
   "balance_white_auto": "Off",
@@ -289,7 +289,16 @@
     "board_pattern_rows": 6
   },
   "capture_quality_gate": {
-    "enabled": false
+    "enabled": false,
+    "strict_mode": false,
+    "checks": {
+      "focus": true,
+      "focus_consistency": true,
+      "overexposure_max_pct": 5.0,
+      "underexposure_max_pct": 5.0,
+      "brightness_min": 40,
+      "brightness_max": 220
+    }
   },
   "record_meta_flush_every": 32,
   "focus_peaking_overlay_interval_seconds": 0.2,
@@ -416,9 +425,20 @@
     "preview_quality_analysis_enabled": false,
     "record_force_image_format": false,
     "capture_quality_gate": {
-      "enabled": false
+      "enabled": false,
+      "strict_mode": false,
+      "checks": {
+        "focus": true,
+        "focus_consistency": true,
+        "overexposure_max_pct": 5.0,
+        "underexposure_max_pct": 5.0,
+        "brightness_min": 40,
+        "brightness_max": 220
+      }
     },
     "raw_frame_format": "tiff16",
+    "viewable_sidecar_enabled": true,
+    "viewable_sidecar_format": "png",
     "trigger_activation": "RisingEdge",
     "require_hardware_trigger": true,
     "hardware_sync_enabled": true,
@@ -442,8 +462,8 @@
   "hardware_sync_master_trigger_source": "Software",
   "field_correction": {
     "enabled": false,
-    "dark_frame_path": "",
-    "flat_field_path": "",
+    "dark_frame_path": "calib\\field_correction\\dark_20260612_113355.npz",
+    "flat_field_path": "calib\\field_correction\\flat_20260612_113418.npz",
     "sample_count": 16
   },
   "dic_analysis": {
@@ -452,5 +472,8 @@
     "output_schema_version": 1,
     "overlay_path": ""
   },
-  "camera_timestamp_offset_fixed": null
+  "camera_timestamp_offset_fixed": -724904689,
+  "black_level": null,
+  "digital_shift": null,
+  "gamma": null
 }

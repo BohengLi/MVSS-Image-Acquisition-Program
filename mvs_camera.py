@@ -272,6 +272,24 @@ def _decode_c_ubyte_array(value: Any) -> str:
     return data.split(b"\x00", 1)[0].decode("utf-8", errors="ignore").strip()
 
 
+def _contiguous_buffer(data: bytes | bytearray | memoryview, count: int | None = None) -> bytes | bytearray | memoryview:
+    if count is None and isinstance(data, (bytes, bytearray)):
+        return data
+    view = memoryview(data)
+    if not view.c_contiguous:
+        raw = view.tobytes()
+        return raw[:count] if count is not None else raw
+    if view.format != "B" or view.ndim != 1:
+        view = view.cast("B")
+    if count is not None:
+        view = view[:count]
+    if view.c_contiguous and view.ndim == 1:
+        if count is not None and isinstance(data, (bytes, bytearray)) and count == len(data):
+            return data
+        return view
+    return view.tobytes()
+
+
 @dataclass(frozen=True)
 class CameraInfo:
     index: int
@@ -622,6 +640,7 @@ class MvsCamera:
             LOGGER.warning(warning)
 
         self._set_payload_size(self._get_int("PayloadSize"))
+        self._log_configured_parameters()
 
     def apply_pixel_format_settings(self, pixel_format: str | None, restart_stream: bool = True) -> list[str]:
         warnings: list[str] = []
@@ -759,7 +778,7 @@ class MvsCamera:
 
     def _normalize_trigger_source(self, trigger_source: str) -> str:
         value = str(trigger_source).strip().lower()
-        if value in {"line0", "line 0", "hardware", "硬件", "外触发"}:
+        if value in {"line0", "line 0", "hardware", "硬件", "外触发", "外部硬触发", "外部触发"}:
             return "Line0"
         if value in {"line1", "line 1"}:
             return "Line1"
@@ -767,8 +786,10 @@ class MvsCamera:
             return "Line2"
         if value in {"line3", "line 3"}:
             return "Line3"
-        if value in {"continuous", "freerun", "free-run", "free run", "off", "none", "trigger off", "no trigger"}:
+        if value in {"continuous", "freerun", "free-run", "free run", "off", "none", "trigger off", "no trigger", "连续采集", "连续"}:
             return "Continuous"
+        if value in {"软触发", "软件触发"}:
+            return "Software"
         return "Software"
 
     def _normalize_line_selector(self, line: str | None) -> str:
@@ -1278,6 +1299,15 @@ class MvsCamera:
         with self._payload_lock:
             self._payload_size = int(payload_size)
 
+    def _fallback_payload_size(self) -> int:
+        width = self._try_get_int("Width") or self._try_get_int("SensorWidth") or 0
+        height = self._try_get_int("Height") or self._try_get_int("SensorHeight") or 0
+        if width <= 0 or height <= 0:
+            return 1
+        pixel_format = (self._try_get_string("PixelFormat") or "").lower()
+        bytes_per_pixel = 3 if any(token in pixel_format for token in ("rgb", "bgr")) else 2
+        return max(int(width) * int(height) * bytes_per_pixel, 1)
+
     def _payload_size_snapshot(self) -> int:
         with self._payload_lock:
             payload_size = self._payload_size
@@ -1328,6 +1358,10 @@ class MvsCamera:
     def _grab_frame_with_timeout(self, timeout_ms: int, convert_image: bool = True) -> Frame:
         s = sdk()
         payload_size = self._payload_size_snapshot()
+        if payload_size <= 0:
+            payload_size = self._fallback_payload_size()
+            self._set_payload_size(payload_size)
+            LOGGER.warning("%s: PayloadSize is 0; using fallback frame buffer size %s.", self.info.label, payload_size)
         raw_buffer = (c_ubyte * payload_size)()
         frame_info = s["MV_FRAME_OUT_INFO_EX"]()
         memset(byref(frame_info), 0, sizeof(frame_info))
@@ -1422,7 +1456,7 @@ class MvsCamera:
         s = sdk()
         expected_len = packet.width * packet.height
         if packet.pixel_type == s["PixelType_Gvsp_Mono8"] and packet.frame_len >= expected_len:
-            payload = packet.data if len(packet.data) == expected_len else memoryview(packet.data)[:expected_len]
+            payload = _contiguous_buffer(packet.data, expected_len)
             return Image.frombytes("L", (packet.width, packet.height), payload)
         pixel_type_name = self._pixel_type_name(packet.pixel_type).lower()
         if (
@@ -1430,7 +1464,7 @@ class MvsCamera:
             and expected_len > 0
             and len(packet.data) >= expected_len * 2
         ):
-            payload = packet.data if len(packet.data) == expected_len * 2 else memoryview(packet.data)[: expected_len * 2]
+            payload = _contiguous_buffer(packet.data, expected_len * 2)
             raw = np.frombuffer(payload, dtype="<u2", count=expected_len).reshape((packet.height, packet.width))
             if "mono16" in pixel_type_name:
                 display = (raw >> 8).astype(np.uint8)
@@ -1565,6 +1599,30 @@ class MvsCamera:
             if value is not None:
                 return value
         return None
+
+    def _log_configured_parameters(self) -> None:
+        label = getattr(getattr(self, "info", None), "label", "camera")
+
+        def read(key: str, getter: Callable[[str], object]) -> object:
+            try:
+                return getter(key)
+            except Exception as exc:
+                LOGGER.debug("%s: failed to read back %s after configuration: %s", label, key, exc, exc_info=True)
+                return None
+
+        values = {
+            "Width": read("Width", self._try_get_int),
+            "Height": read("Height", self._try_get_int),
+            "OffsetX": read("OffsetX", self._try_get_int),
+            "OffsetY": read("OffsetY", self._try_get_int),
+            "ExposureAuto": read("ExposureAuto", self._try_get_string),
+            "ExposureTime": read("ExposureTime", self._try_get_float),
+            "GainAuto": read("GainAuto", self._try_get_string),
+            "Gain": read("Gain", self._try_get_float),
+            "PixelFormat": read("PixelFormat", self._try_get_string),
+            "PayloadSize": read("PayloadSize", self._try_get_int),
+        }
+        LOGGER.info("%s effective camera parameters: %s", label, values)
 
     def _align_to_increment(self, value: int, minimum: int, maximum: int, increment: int, direction: str) -> int:
         if maximum < minimum:
@@ -1819,12 +1877,14 @@ class StereoCameraSystem:
         )
         self._camera_timestamp_offset: int | None = None
         self._camera_timestamp_offset_samples: deque[int] = deque(maxlen=self.camera_timestamp_offset_window)
+        self._last_continuous_frame_numbers: dict[str, int] = {}
         self._capture_lock = threading.Lock()
         self._executor = ThreadPoolExecutor(max_workers=4, thread_name_prefix="mvss-capture")
 
     def connect(self) -> tuple[CameraInfo | None, CameraInfo | None]:
         self._camera_timestamp_offset = None
         self._camera_timestamp_offset_samples = deque(maxlen=self.camera_timestamp_offset_window)
+        self._last_continuous_frame_numbers = {}
         left_info, right_info, dev_list = select_capture_devices(
             str(self.config.get("left_serial", "")).strip(),
             str(self.config.get("right_serial", "")).strip(),
@@ -2117,7 +2177,28 @@ class StereoCameraSystem:
                 and right_result is not None
                 and left_result.actual_roi
                 and right_result.actual_roi
-                and left_result.actual_roi != right_result.actual_roi
+                and left_result.actual_roi[:2] != right_result.actual_roi[:2]
+            ):
+                right_cam = next((cam for name, cam in cameras if name == "right"), None)
+                if right_cam is not None:
+                    left_w, left_h = left_result.actual_roi[:2]
+                    _right_w, _right_h, right_x, right_y = right_result.actual_roi
+                    retry_result = right_cam.apply_roi_settings(left_w, left_h, right_x, right_y, restart_stream=restart_stream)
+                    results["right"] = retry_result
+                    right_result = retry_result
+                    warnings.extend(retry_result)
+                    if retry_result.actual_roi and retry_result.actual_roi[:2] == left_result.actual_roi[:2]:
+                        warnings.append(
+                            "Right camera ROI size adjusted to match the left camera; right ROI offset was preserved when valid."
+                        )
+                    else:
+                        warnings.append("Right camera ROI size could not be adjusted to match the left camera.")
+            if (
+                left_result is not None
+                and right_result is not None
+                and left_result.actual_roi
+                and right_result.actual_roi
+                and left_result.actual_roi[:2] != right_result.actual_roi[:2]
             ):
                 warnings.append(
                     "左右相机实际 ROI 不一致："
@@ -2146,6 +2227,28 @@ class StereoCameraSystem:
                 result = cam.apply_roi_settings(width, height, offset_x, offset_y, restart_stream=restart_stream)
                 results[name] = result
                 warnings.extend(result)
+            left_result = results.get("left")
+            right_result = results.get("right")
+            if (
+                left_result is not None
+                and right_result is not None
+                and left_result.actual_roi
+                and right_result.actual_roi
+                and left_result.actual_roi[:2] != right_result.actual_roi[:2]
+            ):
+                right_cam = next((cam for name, cam in cameras if name == "right"), None)
+                if right_cam is not None:
+                    left_w, left_h = left_result.actual_roi[:2]
+                    _right_w, _right_h, right_x, right_y = right_result.actual_roi
+                    retry_result = right_cam.apply_roi_settings(left_w, left_h, right_x, right_y, restart_stream=restart_stream)
+                    results["right"] = retry_result
+                    warnings.extend(retry_result)
+                    if retry_result.actual_roi and retry_result.actual_roi[:2] == left_result.actual_roi[:2]:
+                        warnings.append(
+                            "Right camera ROI size adjusted to match the left camera; right ROI offset was preserved when valid."
+                        )
+                    else:
+                        warnings.append("Right camera ROI size could not be adjusted to match the left camera.")
             if restart_stream:
                 warnings.extend(self._warm_up_after_roi_locked())
             return results, warnings
@@ -2327,6 +2430,8 @@ class StereoCameraSystem:
             self._release_packets(right_packets)
             raise FrameTimeoutError(f"continuous stream did not provide both stereo frames within {effective_timeout_ms} ms")
 
+        self._warn_continuous_frame_number_gaps(left_packets, "left")
+        self._warn_continuous_frame_number_gaps(right_packets, "right")
         left_packet, right_packet = self._select_best_continuous_packet_pair(left_packets, right_packets)
         for packet in left_packets:
             if packet is not left_packet:
@@ -2382,7 +2487,53 @@ class StereoCameraSystem:
                     best_left = left
                     best_right = right
                     best_delta = delta
+        self._warn_selected_continuous_frame_numbers(best_left, best_right)
         return best_left, best_right
+
+    def _warn_continuous_frame_number_gaps(self, packets: list[RawFramePacket], side: str) -> None:
+        previous: int | None = None
+        for packet in packets:
+            frame_number = int(packet.frame_number)
+            if previous is not None:
+                gap = frame_number - previous
+                if gap > 2:
+                    LOGGER.warning(
+                        "%s continuous stream frame number gap detected: previous=%s current=%s gap=%s",
+                        side,
+                        previous,
+                        frame_number,
+                        gap,
+                    )
+            previous = frame_number
+
+    def _warn_selected_continuous_frame_numbers(self, left: RawFramePacket, right: RawFramePacket) -> None:
+        left_number = int(left.frame_number)
+        right_number = int(right.frame_number)
+        pair_delta = abs(left_number - right_number)
+        if pair_delta > 2:
+            LOGGER.warning(
+                "continuous stream selected left/right frame number delta detected: left=%s right=%s delta=%s",
+                left_number,
+                right_number,
+                pair_delta,
+            )
+        last_numbers = getattr(self, "_last_continuous_frame_numbers", None)
+        if not isinstance(last_numbers, dict):
+            last_numbers = {}
+            self._last_continuous_frame_numbers = last_numbers
+        for side, current in (("left", left_number), ("right", right_number)):
+            previous = last_numbers.get(side)
+            if previous is not None:
+                gap = current - int(previous)
+                if gap > 2:
+                    LOGGER.warning(
+                        "%s continuous selected frame number gap detected: previous=%s current=%s gap=%s",
+                        side,
+                        previous,
+                        current,
+                        gap,
+                    )
+            last_numbers[side] = current
 
     def _release_packets(self, packets: list[RawFramePacket]) -> None:
         for packet in packets:
@@ -2396,12 +2547,14 @@ class StereoCameraSystem:
 
     def _normalized_system_trigger_source(self) -> str:
         value = str(self.trigger_source).strip().lower()
-        if value in {"continuous", "freerun", "free-run", "free run", "off", "none", "trigger off", "no trigger"}:
+        if value in {"continuous", "freerun", "free-run", "free run", "off", "none", "trigger off", "no trigger", "连续采集", "连续"}:
             return "continuous"
-        if value in {"cascade", "hardwarecascade", "hardware-cascade", "hardwaresync", "hardware-sync", "级联", "硬触发级联"}:
+        if value in {"cascade", "hardwarecascade", "hardware-cascade", "hardwaresync", "hardware-sync", "级联", "硬触发级联", "硬触发"}:
             return "cascade"
-        if value in {"line0", "line 0", "hardware"}:
+        if value in {"line0", "line 0", "hardware", "外部硬触发", "外部触发", "外触发"}:
             return "line0"
+        if value in {"软触发", "软件触发"}:
+            return "software"
         return "software"
 
     def _executor_snapshot(self) -> ThreadPoolExecutor:
