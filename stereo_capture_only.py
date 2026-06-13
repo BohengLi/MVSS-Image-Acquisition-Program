@@ -309,12 +309,42 @@ def default_presets() -> dict[str, dict[str, object]]:
             "balance_ratio_blue": None,
             "pixel_format": "Mono8",
             "chunk_data_enabled": True,
-
-(Showing lines 305-364 of 9682. Use offset=365 to continue.)            "pixel_format": "Mono8",
+            "chunk_selectors": ["Timestamp", "FrameCounter", "ExposureTime", "Gain"],
+        },
+        "户外强光": {
+            **common_roi,
+            **scientific_defaults,
+            "trigger_source": "Continuous",
+            "exposure_auto": "Off",
+            "exposure_time_us": 3000.0,
+            "auto_exposure_lower_limit": 100.0,
+            "auto_exposure_upper_limit": 20000.0,
+            "gain_auto": "Off",
+            "gain": 0.0,
+            "auto_gain_lower_limit": 0.0,
+            "auto_gain_upper_limit": 6.0,
+            "balance_white_auto": "Off",
+            "balance_ratio_red": None,
+            "balance_ratio_green": None,
+            "balance_ratio_blue": None,
+            "pixel_format": "Mono8",
             "chunk_data_enabled": True,
-
-(Showing lines 305-364 of 9682. Use offset=365 to continue.)            "pixel_format": "Mono8",
-            "image_format": "png",
+            "chunk_selectors": ["Timestamp", "FrameCounter", "ExposureTime", "Gain"],
+        },
+        "DIC 标准": {
+            **common_roi,
+            **scientific_defaults,
+            "trigger_source": "Continuous",
+            "trigger_activation": "RisingEdge",
+            "require_hardware_trigger": False,
+            "hardware_sync_enabled": False,
+            "hardware_sync_master": "left",
+            "hardware_sync_master_line": "Line2",
+            "hardware_sync_master_line_source": "ExposureActive",
+            "hardware_sync_slave_line": "Line0",
+            "hardware_sync_slave_activation": "RisingEdge",
+            "hardware_sync_master_trigger_source": "Software",
+            "pixel_format": "Mono8",
             "image_format": "png",
             "record_force_image_format": False,
             "save_raw_frames": True,
@@ -4267,7 +4297,7 @@ class StereoCaptureOnlyApp:
         if not hasattr(self, "dic_pixel_format_var"):
             section = self.config.get("dic_capture", {}) if hasattr(self, "config") else {}
             value = str(section.get("pixel_format", DIC_CAPTURE_CONFIG["pixel_format"]) if isinstance(section, dict) else DIC_CAPTURE_CONFIG["pixel_format"])
-return value if value in DIC_PIXEL_FORMATS else "Mono8"
+            return value if value in DIC_PIXEL_FORMATS else "Mono8"
         value = str(self.dic_pixel_format_var.get() or "Mono8").strip()
         if value not in DIC_PIXEL_FORMATS:
             raise ValueError("unsupported DIC pixel format")
@@ -9165,6 +9195,7 @@ Output {esc('MP4 + image sequence' if config_bool(config_snapshot, 'record_save_
                 "dic_speckle": dic_speckle,
                 "quality_report": quality_report or self._quality_report_from_metrics(quality_metrics),
             },
+            scan_roots=[meta_dir, left_dir, right_dir],
         )
         self.project_manager.register_session(
             mode,
@@ -9406,6 +9437,7 @@ Output {esc('MP4 + image sequence' if config_bool(config_snapshot, 'record_save_
         session_dir: Path,
         capture_summary: dict[str, object],
         config_snapshot: dict | None = None,
+        scan_roots: list[Path] | None = None,
     ) -> dict[str, object]:
         config_snapshot = config_snapshot or self._config_snapshot()
         camera_settings = self._capture_settings_snapshot(config_snapshot)
@@ -9422,6 +9454,7 @@ Output {esc('MP4 + image sequence' if config_bool(config_snapshot, 'record_save_
             camera_settings=camera_settings,
             environment=environment,
             algorithm=self._checksum_algorithm(config_snapshot),
+            scan_roots=scan_roots,
         )
 
     def _capture_settings_snapshot(self, config_snapshot: dict | None = None) -> dict[str, object]:

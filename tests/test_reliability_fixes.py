@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import ctypes
+import csv
 import tempfile
 import threading
 import unittest
@@ -559,7 +560,11 @@ class ReliabilityFixTests(unittest.TestCase):
             self.assertEqual([path.parent.name for path in saved_paths], ["left", "right"])
             self.assertTrue(all(path.parent.parent == project_dir for path in saved_paths))
             self.assertTrue((meta_dir / "meta.json").exists())
-            self.assertTrue((meta_dir / "exports" / "file_manifest.csv").exists())
+            manifest_csv = meta_dir / "exports" / "file_manifest.csv"
+            self.assertTrue(manifest_csv.exists())
+            with manifest_csv.open("r", newline="", encoding="utf-8-sig") as fh:
+                manifest_paths = {row["path"] for row in csv.DictReader(fh)}
+            self.assertTrue(all(str(path) in manifest_paths for path in saved_paths))
             self.assertFalse((project_dir / "photos").exists())
 
     def test_guide_mode_key_supports_grid_and_cross_combinations(self) -> None:
@@ -953,7 +958,7 @@ class ReliabilityFixTests(unittest.TestCase):
         self.assertFalse(presets["DIC 标准"]["hardware_sync_enabled"])
         self.assertEqual(presets["DIC 标准"]["hardware_sync_master_line"], "Line2")
         self.assertEqual(presets["DIC 标准"]["hardware_sync_slave_line"], "Line0")
-        self.assertEqual(presets["DIC 标准"]["pixel_format"], "Mono16")
+        self.assertEqual(presets["DIC 标准"]["pixel_format"], "Mono8")
         self.assertEqual(presets["DIC 标准"]["image_format"], "png")
         self.assertTrue(presets["DIC 标准"]["save_raw_frames"])
         self.assertEqual(presets["DIC 标准"]["raw_frame_format"], "tiff16")
@@ -983,7 +988,7 @@ class ReliabilityFixTests(unittest.TestCase):
         self.assertFalse(config["hardware_sync_enabled"])
         self.assertEqual(config["hardware_sync_master_line"], "Line2")
         self.assertEqual(config["hardware_sync_slave_line"], "Line0")
-        self.assertEqual(config["pixel_format"], "Mono16")
+        self.assertEqual(config["pixel_format"], "Mono8")
         self.assertEqual(config["image_format"], "png")
         self.assertTrue(config["save_raw_frames"])
         self.assertEqual(config["raw_frame_format"], "tiff16")

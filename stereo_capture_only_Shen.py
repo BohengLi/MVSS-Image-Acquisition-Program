@@ -4175,7 +4175,7 @@ class StereoCaptureOnlyApp:
         if not hasattr(self, "dic_pixel_format_var"):
             section = self.config.get("dic_capture", {}) if hasattr(self, "config") else {}
             value = str(section.get("pixel_format", DIC_CAPTURE_CONFIG["pixel_format"]) if isinstance(section, dict) else DIC_CAPTURE_CONFIG["pixel_format"])
-return value if value in DIC_PIXEL_FORMATS else "Mono8"
+            return value if value in DIC_PIXEL_FORMATS else "Mono8"
         value = str(self.dic_pixel_format_var.get() or "Mono8").strip()
         if value not in DIC_PIXEL_FORMATS:
             raise ValueError("unsupported DIC pixel format")
