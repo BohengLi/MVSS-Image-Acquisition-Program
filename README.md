@@ -1,6 +1,6 @@
 # 海康威视双目相机同步采集 GUI
 
-本目录是双目采集专用版本，保留相机连接、实时预览、同步拍照、定时拍照、录像、参数设置和采集质量辅助。程序不提供在线标定求解，但支持加载并应用已有标定参数。
+本目录是双目采集专用版本，保留相机连接、实时预览、同步拍照、定时拍照、DIC 采集、录像、参数设置、标定向导和采集质量辅助。程序支持加载并应用已有标定参数；界面中的在线标定求解依赖相邻目录 `MVSS_Biaoding_CalibrationOnly` 中的标定程序接口，若该目录不存在或接口不匹配，仍可使用本程序完成采集和已有标定参数加载。
 
 ## 运行
 
@@ -38,19 +38,34 @@ python stereo_capture_only.py
 采集配置位于 `config.json`。常用字段包括：
 
 ```text
-left_serial / right_serial          左右相机序列号
-save_dir                            数据根目录
-trigger_source                      Software 或 Line0
-exposure_auto / exposure_time_us    自动曝光和手动曝光时间
-gain_auto / gain                    自动增益和手动增益
-roi_width / roi_height              ROI 宽高
-pixel_format / image_format         相机像素格式和保存格式
-preview_fps / record_fps            预览和录像目标帧率
-record_disk_benchmark_*             录像前写入测速设置
-temperature_monitor                 温度轮询间隔和告警阈值
-hdr_bracketing.ev_offsets           HDR 包围 EV 序列
-project                             项目保存设置
+left_serial / right_serial              左右相机序列号
+save_dir                                数据根目录
+trigger_source                          Software 或 Continuous
+exposure_auto / exposure_time_us        自动曝光和手动曝光时间
+gain_auto / gain                        自动增益和手动增益
+roi_width / roi_height                  ROI 宽高
+pixel_format / image_format             相机像素格式和保存格式
+preview_fps / record_fps                预览和录像目标帧率
+record_disk_benchmark_*                 录像前写入测速设置
+temperature_monitor                     温度轮询间隔和告警阈值
+hdr_bracketing.ev_offsets               HDR 包围 EV 序列
+project                                 项目保存设置
+dic_capture                             DIC 专用采集设置
 ```
+
+当前 GUI 主流程仅启用 `Software` 和 `Continuous` 两种触发方式。历史配置或旧文档中出现的 `Line0`、`Cascade`、`hardware_sync_enabled`、`require_hardware_trigger` 字段会被安全配置逻辑回退为软触发/非硬同步，不代表当前版本已经启用外部硬触发或级联硬同步。
+
+## DIC 采集
+
+当前 `config.json` 中的 DIC 专用配置位于 `dic_capture` 段，默认使用软触发 `Software`、`Mono8` 像素格式、`png` 图像格式、`record_save_image_sequence=true`、`record_realtime_mp4=true`、`auto_make_mp4=false`、`save_raw_frames=true` 和 `raw_frame_format=tiff16`。这表示 DIC 采集会保存左右图像序列并实时写入 MP4，同时保留原始帧输出策略。
+
+当前版本不会按旧说明自动启用 `Cascade` 级联硬触发，也不会默认使用 `Mono16` 和 JPEG。若实验流程要求微秒级硬同步或 16 位原始灰度数据，应先在代码和配置中恢复并验证硬触发链路，再更新现场操作说明。
+
+## 标定向导
+
+程序提供“标定向导”入口，可采集左右相机标定样本，并尝试调用相邻目录 `../MVSS_Biaoding_CalibrationOnly` 中的 `calibration.py` 和 `biaoding_app.py` 完成在线标定与导出。该目录不是当前采集程序的内部模块；如果目录缺失、依赖未安装或接口发生变化，在线标定会报错。
+
+不使用在线标定时，可直接把已有 `left.yaml`、`right.yaml`、`stereo.yaml` 放入 `calib/`，并在 `config.json` 中启用 `calibration.enabled` 后加载使用。
 
 标定文件引用示例：
 
