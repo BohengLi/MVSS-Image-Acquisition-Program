@@ -188,7 +188,7 @@ DIC_CAPTURE_CONFIG = {
     "hardware_sync_slave_line": "Line0",
     "hardware_sync_slave_activation": "RisingEdge",
     "hardware_sync_master_trigger_source": "Software",
-    "pixel_format": "Mono16",
+    "pixel_format": "Mono8",
     "image_format": "png",
     "record_jpeg_quality": 100,
     "exposure_auto": "Off",
@@ -283,7 +283,7 @@ def default_presets() -> dict[str, dict[str, object]]:
             "balance_ratio_red": None,
             "balance_ratio_green": None,
             "balance_ratio_blue": None,
-            "pixel_format": "Mono16",
+            "pixel_format": "Mono8",
             "chunk_data_enabled": True,
             "chunk_selectors": ["Timestamp", "FrameCounter", "ExposureTime", "Gain"],
         },
@@ -303,7 +303,7 @@ def default_presets() -> dict[str, dict[str, object]]:
             "balance_ratio_red": None,
             "balance_ratio_green": None,
             "balance_ratio_blue": None,
-            "pixel_format": "Mono16",
+            "pixel_format": "Mono8",
             "chunk_data_enabled": True,
             "chunk_selectors": ["Timestamp", "FrameCounter", "ExposureTime", "Gain"],
         },
@@ -320,7 +320,7 @@ def default_presets() -> dict[str, dict[str, object]]:
             "hardware_sync_slave_line": "Line0",
             "hardware_sync_slave_activation": "RisingEdge",
             "hardware_sync_master_trigger_source": "Software",
-            "pixel_format": "Mono16",
+            "pixel_format": "Mono8",
             "image_format": "png",
             "record_force_image_format": False,
             "save_raw_frames": True,
@@ -1985,7 +1985,7 @@ class StereoCaptureOnlyApp:
             if isinstance(dic_section, dict)
             else str(DIC_CAPTURE_CONFIG["pixel_format"])
         )
-        self.dic_pixel_format_var = StringVar(value=dic_pixel_format if dic_pixel_format in DIC_PIXEL_FORMATS else "Mono16")
+        self.dic_pixel_format_var = StringVar(value=dic_pixel_format if dic_pixel_format in DIC_PIXEL_FORMATS else "Mono8")
         self.record_max_seconds_var = StringVar(value=optional_config_text(self.config, "record_max_seconds", "0"))
         exposure_monitor = self._ensure_config_section("exposure_monitor")
         self.preview_quality_analysis_var = BooleanVar(
@@ -4175,8 +4175,8 @@ class StereoCaptureOnlyApp:
         if not hasattr(self, "dic_pixel_format_var"):
             section = self.config.get("dic_capture", {}) if hasattr(self, "config") else {}
             value = str(section.get("pixel_format", DIC_CAPTURE_CONFIG["pixel_format"]) if isinstance(section, dict) else DIC_CAPTURE_CONFIG["pixel_format"])
-            return value if value in DIC_PIXEL_FORMATS else "Mono16"
-        value = str(self.dic_pixel_format_var.get() or "Mono16").strip()
+return value if value in DIC_PIXEL_FORMATS else "Mono8"
+        value = str(self.dic_pixel_format_var.get() or "Mono8").strip()
         if value not in DIC_PIXEL_FORMATS:
             raise ValueError("unsupported DIC pixel format")
         return value
@@ -7691,7 +7691,7 @@ class StereoCaptureOnlyApp:
         self.dic_record_fps_var.set(str(snapshot.get("record_fps", DIC_CAPTURE_CONFIG["record_fps"])))
         if hasattr(self, "dic_pixel_format_var"):
             pixel_format = str(snapshot.get("pixel_format", DIC_CAPTURE_CONFIG["pixel_format"]))
-            self.dic_pixel_format_var.set(pixel_format if pixel_format in DIC_PIXEL_FORMATS else "Mono16")
+            self.dic_pixel_format_var.set(pixel_format if pixel_format in DIC_PIXEL_FORMATS else "Mono8")
 
     def _apply_capture_config_to_camera(self, config_snapshot: dict[str, object]) -> list[str]:
         camera_system = self._require_camera_system()

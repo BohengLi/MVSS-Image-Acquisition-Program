@@ -3,7 +3,7 @@
   "right_serial": "DB0371907",
   "bind_camera_serials": true,
   "save_dir": "captures",
-  "trigger_source": "软触发",
+  "trigger_source": "Software",
   "exposure_time_us": 20000.0,
   "exposure_auto": "Once",
   "auto_exposure_lower_limit": 1000.0,
@@ -20,7 +20,7 @@
   "roi_height": 3648,
   "roi_offset_x": 0,
   "roi_offset_y": 0,
-  "pixel_format": "Mono16",
+  "pixel_format": "Mono8",
   "image_format": "png",
   "frame_timeout_ms": 800,
   "preview_frame_timeout_ms": 300,
@@ -108,7 +108,7 @@
       "gamma": null,
       "save_raw_frames": true,
       "raw_frame_format": "tiff16",
-      "pixel_format": "Mono16",
+      "pixel_format": "Mono8",
       "chunk_data_enabled": true,
       "chunk_selectors": [
         "Timestamp",
@@ -124,7 +124,8 @@
       "hardware_sync_slave_activation": "RisingEdge",
       "hardware_sync_master_trigger_source": "Software",
       "image_format": "png",
-      "record_force_image_format": false
+      "record_force_image_format": false,
+      "require_hardware_trigger": false
     },
     "室外强光": {
       "trigger_source": "Continuous",
@@ -157,7 +158,7 @@
       "gamma": null,
       "save_raw_frames": true,
       "raw_frame_format": "tiff16",
-      "pixel_format": "Mono16",
+      "pixel_format": "Mono8",
       "chunk_data_enabled": true,
       "chunk_selectors": [
         "Timestamp",
@@ -173,7 +174,8 @@
       "hardware_sync_slave_activation": "RisingEdge",
       "hardware_sync_master_trigger_source": "Software",
       "image_format": "png",
-      "record_force_image_format": false
+      "record_force_image_format": false,
+      "require_hardware_trigger": false
     },
     "DIC 标准": {
       "roi_width": 5472,
@@ -193,10 +195,10 @@
       "gamma": null,
       "save_raw_frames": true,
       "raw_frame_format": "tiff16",
-      "trigger_source": "Cascade",
+      "trigger_source": "Software",
       "trigger_activation": "RisingEdge",
-      "require_hardware_trigger": true,
-      "pixel_format": "Mono16",
+      "require_hardware_trigger": false,
+      "pixel_format": "Mono8",
       "image_format": "png",
       "record_force_image_format": false,
       "record_save_image_sequence": true,
@@ -214,7 +216,7 @@
         "Gain"
       ],
       "timestamp_reject_enabled": false,
-      "hardware_sync_enabled": true,
+      "hardware_sync_enabled": false,
       "hardware_sync_master": "left",
       "hardware_sync_master_line": "Line2",
       "hardware_sync_master_line_source": "ExposureActive",
@@ -261,12 +263,13 @@
       "hardware_sync_master_line_source": "ExposureActive",
       "hardware_sync_slave_line": "Line0",
       "hardware_sync_slave_activation": "RisingEdge",
-      "hardware_sync_master_trigger_source": "Software"
+      "hardware_sync_master_trigger_source": "Software",
+      "require_hardware_trigger": false
     }
   },
   "focus_roi": {
-    "x_frac": 0.29733187134502925,
-    "y_frac": 0.3061951754385965,
+    "x_frac": 0.6728801169590644,
+    "y_frac": 0.5441337719298246,
     "w_frac": 0.03654970760233918,
     "h_frac": 0.05482456140350877
   },
@@ -324,8 +327,8 @@
   "project": {
     "enabled": true,
     "projects_subdir": "projects",
-    "current_project_id": "20260611_083931_202",
-    "current_project_name": "Project 20260611_083931_202"
+    "current_project_id": "20260612_223308_524",
+    "current_project_name": "Project 20260612_223308_524"
   },
   "hdr_bracketing": {
     "enabled": true,
@@ -388,8 +391,8 @@
   "record_preview_fps": 2.0,
   "record_clone_frames_for_writer": false,
   "dic_capture": {
-    "trigger_source": "Cascade",
-    "pixel_format": "Mono16",
+    "trigger_source": "Software",
+    "pixel_format": "Mono8",
     "image_format": "png",
     "record_jpeg_quality": 100,
     "exposure_auto": "Off",
@@ -440,8 +443,8 @@
     "viewable_sidecar_enabled": true,
     "viewable_sidecar_format": "png",
     "trigger_activation": "RisingEdge",
-    "require_hardware_trigger": true,
-    "hardware_sync_enabled": true,
+    "require_hardware_trigger": false,
+    "hardware_sync_enabled": false,
     "hardware_sync_master": "left",
     "hardware_sync_master_line": "Line2",
     "hardware_sync_master_line_source": "ExposureActive",
@@ -475,5 +478,7 @@
   "camera_timestamp_offset_fixed": -724904689,
   "black_level": null,
   "digital_shift": null,
-  "gamma": null
+  "gamma": null,
+  "viewable_sidecar_enabled": true,
+  "viewable_sidecar_format": "png"
 }

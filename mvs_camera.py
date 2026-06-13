@@ -1841,15 +1841,18 @@ class StereoCameraSystem:
         self.right: MvsCamera | None = None
         self.left_info: CameraInfo | None = None
         self.right_info: CameraInfo | None = None
-        self.trigger_source = str(config.get("trigger_source", "Software"))
+        self.trigger_source = self._safe_trigger_source(config.get("trigger_source", "Software"))
+        self.config["trigger_source"] = self.trigger_source
         self.timeout_ms = int(config.get("frame_timeout_ms", 3000))
         self.timestamp_reject_enabled = config_bool(config, "timestamp_reject_enabled", True, False)
         self.max_camera_timestamp_delta = int(config.get("max_camera_timestamp_delta", 0) or 0)
         self.max_host_timestamp_delta = int(config.get("max_host_timestamp_delta", DEFAULT_HOST_TIMESTAMP_DELTA_NS) or 0)
         if self.max_camera_timestamp_delta <= 0 and self.max_host_timestamp_delta <= 0:
             self.timestamp_reject_enabled = False
-        self.require_hardware_trigger = config_bool(config, "require_hardware_trigger", False, False)
-        self.hardware_sync_enabled = config_bool(config, "hardware_sync_enabled", False, False)
+        self.require_hardware_trigger = False
+        self.hardware_sync_enabled = False
+        self.config["require_hardware_trigger"] = False
+        self.config["hardware_sync_enabled"] = False
         self.hardware_sync_master = str(config.get("hardware_sync_master", "left") or "left").strip().lower()
         self.hardware_sync_master_line = str(config.get("hardware_sync_master_line", "Line2") or "Line2")
         self.hardware_sync_master_line_source = str(
@@ -1973,7 +1976,7 @@ class StereoCameraSystem:
         return int(value)
 
     def _hardware_sync_active(self) -> bool:
-        return self.hardware_sync_enabled or self._normalized_system_trigger_source() == "cascade"
+        return False
 
     def _hardware_sync_master_side(self) -> str:
         return "right" if self.hardware_sync_master == "right" else "left"
@@ -2285,17 +2288,14 @@ class StereoCameraSystem:
             raise MvsError("相机尚未连接。")
         with self._capture_lock:
             warnings: list[str] = []
+            trigger_source = self._safe_trigger_source(trigger_source)
             self.trigger_source = trigger_source
-            if self._normalized_system_trigger_source() == "cascade":
-                self.hardware_sync_enabled = True
-                self.config["hardware_sync_enabled"] = True
-                for name, cam in cameras:
-                    warnings.extend(self._apply_hardware_sync_role(cam, name))
-            else:
-                self.hardware_sync_enabled = False
-                self.config["hardware_sync_enabled"] = False
-                for _name, cam in cameras:
-                    warnings.extend(cam.apply_trigger_settings(trigger_source))
+            self.hardware_sync_enabled = False
+            self.require_hardware_trigger = False
+            self.config["hardware_sync_enabled"] = False
+            self.config["require_hardware_trigger"] = False
+            for _name, cam in cameras:
+                warnings.extend(cam.apply_trigger_settings(trigger_source))
             self.config["trigger_source"] = trigger_source
             self.trigger_source = trigger_source
             return warnings
@@ -2329,7 +2329,11 @@ class StereoCameraSystem:
     ) -> tuple[Frame | None, Frame | None, float]:
         trigger_mode = self._normalized_system_trigger_source()
         if self.require_hardware_trigger and trigger_mode in {"software", "continuous"}:
-            raise MvsError("Hardware trigger is required, but trigger_source is Software/Continuous.")
+            self.require_hardware_trigger = False
+            self.hardware_sync_enabled = False
+            if hasattr(self, "config"):
+                self.config["require_hardware_trigger"] = False
+                self.config["hardware_sync_enabled"] = False
 
         trigger_time = time.time()
         if trigger_mode == "cascade":
@@ -2408,7 +2412,11 @@ class StereoCameraSystem:
         convert_image: bool = True,
     ) -> tuple[Frame | None, Frame | None, float]:
         if self.require_hardware_trigger:
-            raise MvsError("Hardware trigger is required, but trigger_source is Continuous.")
+            self.require_hardware_trigger = False
+            self.hardware_sync_enabled = False
+            if hasattr(self, "config"):
+                self.config["require_hardware_trigger"] = False
+                self.config["hardware_sync_enabled"] = False
         if any(not hasattr(cam, "_frame_from_packet") for _name, cam in cameras):
             return self._capture_pair_with_executor(cameras, effective_timeout_ms, convert_image=convert_image)
         trigger_time = time.time()
@@ -2549,13 +2557,15 @@ class StereoCameraSystem:
         value = str(self.trigger_source).strip().lower()
         if value in {"continuous", "freerun", "free-run", "free run", "off", "none", "trigger off", "no trigger", "连续采集", "连续"}:
             return "continuous"
-        if value in {"cascade", "hardwarecascade", "hardware-cascade", "hardwaresync", "hardware-sync", "级联", "硬触发级联", "硬触发"}:
-            return "cascade"
-        if value in {"line0", "line 0", "hardware", "外部硬触发", "外部触发", "外触发"}:
-            return "line0"
         if value in {"软触发", "软件触发"}:
             return "software"
         return "software"
+
+    def _safe_trigger_source(self, trigger_source: Any) -> str:
+        mode = str(trigger_source or "").strip().lower()
+        if mode in {"continuous", "freerun", "free-run", "free run", "off", "none", "trigger off", "no trigger", "连续采集", "连续"}:
+            return "Continuous"
+        return "Software"
 
     def _executor_snapshot(self) -> ThreadPoolExecutor:
         executor = getattr(self, "_executor", None)

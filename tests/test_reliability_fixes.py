@@ -15,6 +15,7 @@ import mvs_camera
 import numpy as np
 from PIL import Image
 from mvs_camera import Frame, MvsCamera, MvsError, RawFramePacket, StereoCameraSystem
+from project_manager import ProjectManager
 import stereo_capture_only
 from stereo_capture_only import StereoCaptureOnlyApp
 
@@ -163,6 +164,11 @@ class _FakeStatsSystem:
     def stream_stats(self):
         self.stream_reads += 1
         return {"left": {"buffered_frames": 0, "dropped_frames": 2, "callback_enabled": True}}
+
+
+class _FakeCalibration:
+    def meta(self):
+        return {}
 
 
 class ReliabilityFixTests(unittest.TestCase):
@@ -500,6 +506,76 @@ class ReliabilityFixTests(unittest.TestCase):
             finally:
                 stereo_capture_only.LOGGER.disabled = previous_disabled
             self.assertFalse(path.exists())
+
+    def test_project_creation_prepares_flat_left_right_image_dirs(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            config = {"project": {"enabled": True, "projects_subdir": "projects"}}
+            manager = ProjectManager(Path(tmp), config)
+
+            project_dir = manager.create_project()
+
+            self.assertTrue((project_dir / "left").is_dir())
+            self.assertTrue((project_dir / "right").is_dir())
+            self.assertTrue((project_dir / "videos").is_dir())
+            self.assertFalse((project_dir / "photos").exists())
+
+    def test_photo_pair_saves_images_to_project_left_right_without_capture_subdirs(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            config = {"image_format": "png", "project": {"enabled": True, "projects_subdir": "projects"}}
+            app = StereoCaptureOnlyApp.__new__(StereoCaptureOnlyApp)
+            app.config = config
+            app.project_manager = ProjectManager(Path(tmp), config)
+            app.project_manager.create_project()
+            app.calibration = _FakeCalibration()
+            app.camera_system = None
+            app._latest_temperatures = {}
+            app._latest_stream_stats = {}
+            app._temperature_samples = []
+            app._device_versions = {}
+            app._quality_metrics_for_pair = lambda _left, _right: {
+                "focus": {},
+                "left_exposure": None,
+                "right_exposure": None,
+            }
+            app._quality_report_from_metrics = lambda _metrics=None: {"ok": True, "results": []}
+            app._capture_settings_snapshot = lambda _snapshot=None: {}
+            app._checksum_algorithm = lambda _snapshot=None: "sha256"
+            saved_paths: list[Path] = []
+
+            def fake_save_frame(_frame, path, _snapshot=None):
+                path.parent.mkdir(parents=True, exist_ok=True)
+                path.write_bytes(b"image")
+                saved_paths.append(path)
+                return path
+
+            app._save_frame = fake_save_frame
+            image = Image.fromarray(np.zeros((2, 2), dtype=np.uint8), "L")
+            left = Frame(image, 1, 2, 2, 0, 0)
+            right = Frame(image, 2, 2, 2, 0, 0)
+
+            meta_dir = app._save_photo_pair(left, right, 1.0, mode="photo")
+            project_dir = app.project_manager.active_project_dir
+
+            self.assertEqual([path.parent.name for path in saved_paths], ["left", "right"])
+            self.assertTrue(all(path.parent.parent == project_dir for path in saved_paths))
+            self.assertTrue((meta_dir / "meta.json").exists())
+            self.assertTrue((meta_dir / "exports" / "file_manifest.csv").exists())
+            self.assertFalse((project_dir / "photos").exists())
+
+    def test_guide_mode_key_supports_grid_and_cross_combinations(self) -> None:
+        app = StereoCaptureOnlyApp.__new__(StereoCaptureOnlyApp)
+        app.guide_mode_var = _Var()
+
+        for text, expected in (
+            ("关闭", "off"),
+            ("仅十字线", "center"),
+            ("中心十字", "center"),
+            ("仅网格线", "grid"),
+            ("十字+网格", "full"),
+            ("全部网格线", "full"),
+        ):
+            app.guide_mode_var.set(text)
+            self.assertEqual(app._guide_mode_key(), expected)
 
     def test_record_queue_full_drops_frame_without_blocking(self) -> None:
         app = StereoCaptureOnlyApp.__new__(StereoCaptureOnlyApp)
@@ -873,8 +949,8 @@ class ReliabilityFixTests(unittest.TestCase):
         presets = stereo_capture_only.default_presets()
 
         self.assertIn("DIC 标准", presets)
-        self.assertEqual(presets["DIC 标准"]["trigger_source"], "Cascade")
-        self.assertTrue(presets["DIC 标准"]["hardware_sync_enabled"])
+        self.assertEqual(presets["DIC 标准"]["trigger_source"], "Continuous")
+        self.assertFalse(presets["DIC 标准"]["hardware_sync_enabled"])
         self.assertEqual(presets["DIC 标准"]["hardware_sync_master_line"], "Line2")
         self.assertEqual(presets["DIC 标准"]["hardware_sync_slave_line"], "Line0")
         self.assertEqual(presets["DIC 标准"]["pixel_format"], "Mono16")
@@ -902,9 +978,9 @@ class ReliabilityFixTests(unittest.TestCase):
 
         config = app._dic_capture_config()
 
-        self.assertEqual(config["trigger_source"], "Cascade")
-        self.assertTrue(config["require_hardware_trigger"])
-        self.assertTrue(config["hardware_sync_enabled"])
+        self.assertEqual(config["trigger_source"], "Continuous")
+        self.assertFalse(config["require_hardware_trigger"])
+        self.assertFalse(config["hardware_sync_enabled"])
         self.assertEqual(config["hardware_sync_master_line"], "Line2")
         self.assertEqual(config["hardware_sync_slave_line"], "Line0")
         self.assertEqual(config["pixel_format"], "Mono16")
@@ -921,6 +997,19 @@ class ReliabilityFixTests(unittest.TestCase):
         self.assertFalse(config["timestamp_reject_enabled"])
         self.assertFalse(config["capture_quality_gate"]["enabled"])
         self.assertFalse(config["record_capture_priority_mode"])
+
+    def test_safe_trigger_config_clears_hardware_trigger_residue(self) -> None:
+        config = stereo_capture_only.safe_trigger_config(
+            {
+                "trigger_source": "硬触发级联（无功能）",
+                "require_hardware_trigger": True,
+                "hardware_sync_enabled": True,
+            }
+        )
+
+        self.assertEqual(config["trigger_source"], "Software")
+        self.assertFalse(config["require_hardware_trigger"])
+        self.assertFalse(config["hardware_sync_enabled"])
 
     def test_dic_capture_fps_entry_overrides_dic_record_fps_only(self) -> None:
         app = StereoCaptureOnlyApp.__new__(StereoCaptureOnlyApp)
@@ -1074,7 +1163,7 @@ class ReliabilityFixTests(unittest.TestCase):
         self.assertEqual(left.trigger_count, 0)
         self.assertEqual(right.trigger_count, 0)
 
-    def test_hardware_cascade_capture_triggers_master_only(self) -> None:
+    def test_disabled_hardware_cascade_capture_falls_back_to_software_trigger(self) -> None:
         system = StereoCameraSystem.__new__(StereoCameraSystem)
         system._capture_lock = threading.Lock()
         system.trigger_source = "Cascade"
@@ -1094,9 +1183,11 @@ class ReliabilityFixTests(unittest.TestCase):
         self.assertEqual(left.grab_timeouts, [250])
         self.assertEqual(right.grab_timeouts, [250])
         self.assertEqual(left.trigger_count, 1)
-        self.assertEqual(right.trigger_count, 0)
+        self.assertEqual(right.trigger_count, 1)
+        self.assertFalse(system.require_hardware_trigger)
+        self.assertFalse(system.hardware_sync_enabled)
 
-    def test_system_apply_trigger_settings_configures_cascade_roles(self) -> None:
+    def test_system_apply_trigger_settings_disables_cascade_roles(self) -> None:
         system = StereoCameraSystem.__new__(StereoCameraSystem)
         system._capture_lock = threading.Lock()
         system.config = {
@@ -1121,18 +1212,23 @@ class ReliabilityFixTests(unittest.TestCase):
         left.info = _Info()
         left._cam = _FakeLineNodeCamera()
         left._try_set_enum = lambda *_args, **_kwargs: False
+        left._try_set_enum_by_string = lambda key, value: left._cam.enum_strings.append((key, value)) or True
         right = MvsCamera.__new__(MvsCamera)
         right.info = _Info()
         right._cam = _FakeLineNodeCamera()
         right._try_set_enum = lambda *_args, **_kwargs: False
+        right._try_set_enum_by_string = lambda key, value: right._cam.enum_strings.append((key, value)) or True
         system._connected_cameras = lambda: [("left", left), ("right", right)]
 
         warnings = system.apply_trigger_settings("Cascade")
 
         self.assertEqual(warnings, [])
-        self.assertTrue(system.config["hardware_sync_enabled"])
-        self.assertIn(("LineSource", "ExposureActive"), left._cam.enum_strings)
-        self.assertIn(("TriggerSource", "Line0"), right._cam.enum_strings)
+        self.assertEqual(system.config["trigger_source"], "Software")
+        self.assertFalse(system.config["hardware_sync_enabled"])
+        self.assertFalse(system.config["require_hardware_trigger"])
+        self.assertIn(("TriggerSource", "Software"), left._cam.enum_strings)
+        self.assertIn(("TriggerSource", "Software"), right._cam.enum_strings)
+        self.assertNotIn(("TriggerSource", "Line0"), right._cam.enum_strings)
 
     def test_continuous_raw_capture_skips_pil_conversion(self) -> None:
         system = StereoCameraSystem.__new__(StereoCameraSystem)
@@ -1388,7 +1484,9 @@ class ReliabilityFixTests(unittest.TestCase):
         app._apply_capture_config_to_camera(
             {
                 "pixel_format": "Mono16",
-                "trigger_source": "Software",
+                "trigger_source": "Line0",
+                "require_hardware_trigger": True,
+                "hardware_sync_enabled": True,
                 "exposure_auto": "Off",
                 "exposure_time_us": 1000.0,
                 "gain_auto": "Off",
@@ -1400,6 +1498,9 @@ class ReliabilityFixTests(unittest.TestCase):
         )
 
         self.assertEqual(calls, [(0.0, None, None)])
+        self.assertEqual(camera_system.trigger_source, "Software")
+        self.assertFalse(camera_system.require_hardware_trigger)
+        self.assertFalse(camera_system.hardware_sync_enabled)
 
     def test_field_correction_subtracts_dark_and_preserves_uint16_raw(self) -> None:
         app = StereoCaptureOnlyApp.__new__(StereoCaptureOnlyApp)

@@ -72,20 +72,26 @@ captures/
   projects/
     20260525_103012_123/
       project.json
-      photos/
-        YYYYMMDD_HHMMSS_mmm/
-          left.bmp
-          right.bmp
-          meta.json
-          exports/
-            file_manifest.csv
-            capture_summary.json
-        YYYYMMDD_HHMMSS_mmm_hdr/
-          ev_-2.0_left.bmp
-          ev_-2.0_right.bmp
-          ...
-          meta.json
-          exports/
+      left/
+        YYYYMMDD_HHMMSS_mmm_left.bmp
+        YYYYMMDD_HHMMSS_mmm_hdr_ev_m2p0_left.bmp
+        ...
+      right/
+        YYYYMMDD_HHMMSS_mmm_right.bmp
+        YYYYMMDD_HHMMSS_mmm_hdr_ev_m2p0_right.bmp
+        ...
+      exports/
+        captures/
+          YYYYMMDD_HHMMSS_mmm/
+            meta.json
+            exports/
+              file_manifest.csv
+              capture_summary.json
+          YYYYMMDD_HHMMSS_mmm_hdr/
+            meta.json
+            exports/
+              file_manifest.csv
+              capture_summary.json
       videos/
         YYYYMMDD_HHMMSS/
           left/
@@ -101,7 +107,7 @@ logs/
   capture.log
 ```
 
-如果 `project.enabled=false`，程序会退回到旧式 `captures/photos/` 和 `captures/videos/` 目录。
+每次启动程序都会创建新的项目文件夹。同步拍照、定时拍照和 HDR 包围拍照的图片直接保存到项目根目录下的 `left/`、`right/`，不再为每次拍照额外创建图片子文件夹；本次采集的 `meta.json` 和 manifest 保存到 `exports/captures/<capture_id>/`。如果 `project.enabled=false`，程序会退回到旧式 `captures/<mode>/` 目录。
 
 ## Configuration Safety
 

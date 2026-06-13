@@ -110,8 +110,10 @@ class ProjectManager:
         self.current_project_id = project_id
         self.current_project_name = name or f"Project {project_id}"
         project_dir = self.projects_root / project_id
-        (project_dir / "photos").mkdir(parents=True, exist_ok=True)
+        (project_dir / "left").mkdir(parents=True, exist_ok=True)
+        (project_dir / "right").mkdir(parents=True, exist_ok=True)
         (project_dir / "videos").mkdir(parents=True, exist_ok=True)
+        (project_dir / "calibration").mkdir(parents=True, exist_ok=True)
         (project_dir / "exports").mkdir(parents=True, exist_ok=True)
         self._write_project_json(project_dir, [])
         return project_dir
