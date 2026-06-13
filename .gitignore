@@ -6,6 +6,8 @@ dist/
 MVSS图像采集程序/
 captures/
 logs/
+calib/field_correction/*.npz
+*.npz
 *.zip
 *.exe
 *.exe.bak_*

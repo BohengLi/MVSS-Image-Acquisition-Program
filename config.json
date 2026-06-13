@@ -466,7 +466,7 @@
   "field_correction": {
     "enabled": false,
     "dark_frame_path": "calib\\field_correction\\dark_20260612_113355.npz",
-    "flat_field_path": "calib\\field_correction\\flat_20260612_113418.npz",
+    "flat_field_path": "",
     "sample_count": 16
   },
   "dic_analysis": {

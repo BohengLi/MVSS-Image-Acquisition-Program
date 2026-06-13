@@ -11,11 +11,15 @@
 python -m pip install -r requirements.txt
 ```
 
+`requirements.txt` 使用 `opencv-contrib-python`，因为在线标定中的 ArUco/ChArUco 功能依赖 OpenCV contrib 模块。海康 MVS SDK 不在 PyPI 分发，需单独安装并确保 `MvImport` 与 MVS Runtime 路径可用。
+
 3. 双击 `run_capture_only.bat`，或在当前目录运行：
 
 ```powershell
 python stereo_capture_only.py
 ```
+
+如需重新打包 Windows 可执行文件，使用 `MVSS_Capture.spec` 或 `MVSS_Capture_v2.spec`。两个 spec 均以 `stereo_capture_only.py` 为入口，并会尝试打包本机已安装的 MVS Runtime DLL。
 
 ## 主要功能
 
@@ -120,3 +124,7 @@ Calibration is disabled by default until real `calib/left.yaml`, `calib/right.ya
 `Line0` 模式需要外部硬件脉冲；该模式下程序等待外触发帧，不发送软件触发。`timestamp_reject_enabled=true` 只表示启用同步校验开关；只有 `max_camera_timestamp_delta` 或 `max_host_timestamp_delta` 大于 0 时才会按阈值拒绝不同步帧。两台独立相机未做硬件同步时，建议保持 `max_camera_timestamp_delta=0`，避免比较不同设备的相机内部时间戳导致所有帧都被丢弃。
 
 `MV-CS200-10UM` 等高分辨率 USB3 相机满幅数据量很大。5472 x 3648、双相机、5 fps、BMP 录制约需 200 MB/s 持续写入，建议使用 SSD，并尽量把两台相机接到不同 USB3 控制器。
+
+## Git 与数据文件
+
+仓库只跟踪程序源码、配置模板和文档。`captures/`、`logs/`、`build/`、`dist/`、`.idea/`、打包产物以及 `*.npz` 校正/采集数据默认忽略，不建议提交到 Git。若某个校正文件需要作为发布资产，请先确认体积和复现实验需求，再单独调整忽略规则。

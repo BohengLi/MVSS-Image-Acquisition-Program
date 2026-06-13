@@ -49,7 +49,7 @@ if MVS_RUNTIME_DIR.exists():
 
 
 a = Analysis(
-    ['stereo_capture_only_v2.py'],
+    ['stereo_capture_only.py'],
     pathex=[],
     binaries=binaries,
     datas=datas,
