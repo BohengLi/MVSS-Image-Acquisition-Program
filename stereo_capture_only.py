@@ -2010,6 +2010,8 @@ class StereoCaptureOnlyApp:
                 key = f"{side}_roi_{field}"
                 if self.config.get(key) in (None, ""):
                     self.config[key] = fallback
+        self.config["right_roi_width"] = self.config.get("left_roi_width", self.config["roi_width"])
+        self.config["right_roi_height"] = self.config.get("left_roi_height", self.config["roi_height"])
 
     def _ensure_config_section(self, key: str) -> dict[str, object]:
         section = self.config.get(key)
@@ -2044,8 +2046,8 @@ class StereoCaptureOnlyApp:
         self.left_roi_height_var = StringVar(value=str(self.config.get("left_roi_height", self.config.get("roi_height", CAPTURE_HEIGHT))))
         self.left_roi_offset_x_var = StringVar(value=str(self.config.get("left_roi_offset_x", self.config.get("roi_offset_x", 0))))
         self.left_roi_offset_y_var = StringVar(value=str(self.config.get("left_roi_offset_y", self.config.get("roi_offset_y", 0))))
-        self.right_roi_width_var = StringVar(value=str(self.config.get("right_roi_width", self.config.get("roi_width", CAPTURE_WIDTH))))
-        self.right_roi_height_var = StringVar(value=str(self.config.get("right_roi_height", self.config.get("roi_height", CAPTURE_HEIGHT))))
+        self.right_roi_width_var = StringVar(value=str(self.config.get("left_roi_width", self.config.get("roi_width", CAPTURE_WIDTH))))
+        self.right_roi_height_var = StringVar(value=str(self.config.get("left_roi_height", self.config.get("roi_height", CAPTURE_HEIGHT))))
         self.right_roi_offset_x_var = StringVar(value=str(self.config.get("right_roi_offset_x", self.config.get("roi_offset_x", 0))))
         self.right_roi_offset_y_var = StringVar(value=str(self.config.get("right_roi_offset_y", self.config.get("roi_offset_y", 0))))
         self.interval_seconds_var = StringVar(value=optional_config_text(self.config, "interval_capture_seconds", "5.0"))
@@ -2397,7 +2399,7 @@ class StereoCaptureOnlyApp:
         for column in range(1, 5):
             roi_values.grid_columnconfigure(column, weight=1, uniform="roi_field")
 
-        def grid_roi_entry(label: str, variable: StringVar, row: int, column: int) -> None:
+        def grid_roi_entry(label: str, variable: StringVar, row: int, column: int, *, readonly: bool = False) -> None:
             group = ttk.Frame(roi_values, style="Panel.TFrame")
             group.grid(row=row, column=column, padx=(0, 3 if column < 4 else 0), sticky="ew")
             group.grid_columnconfigure(0, minsize=16, weight=0)
@@ -2405,9 +2407,13 @@ class StereoCaptureOnlyApp:
             ttk.Label(group, text=label, style="Panel.TLabel", anchor="e", width=2).grid(
                 row=0, column=0, padx=(0, 2), pady=1, sticky="e"
             )
-            ttk.Entry(group, textvariable=variable, width=4, font=(MONO_FONT_FAMILY, max(BASE_FONT_SIZE - 1, 8))).grid(
-                row=0, column=1, pady=1, sticky="ew"
-            )
+            ttk.Entry(
+                group,
+                textvariable=variable,
+                width=4,
+                font=(MONO_FONT_FAMILY, max(BASE_FONT_SIZE - 1, 8)),
+                state="readonly" if readonly else NORMAL,
+            ).grid(row=0, column=1, pady=1, sticky="ew")
 
         ttk.Label(roi_values, text="左", style="Panel.TLabel").grid(row=0, column=0, padx=(0, 3), pady=1, sticky="w")
         grid_roi_entry("W", self.left_roi_width_var, 0, 1)
@@ -2415,8 +2421,8 @@ class StereoCaptureOnlyApp:
         grid_roi_entry("X", self.left_roi_offset_x_var, 0, 3)
         grid_roi_entry("Y", self.left_roi_offset_y_var, 0, 4)
         ttk.Label(roi_values, text="右", style="Panel.TLabel").grid(row=1, column=0, padx=(0, 3), pady=1, sticky="w")
-        grid_roi_entry("W", self.right_roi_width_var, 1, 1)
-        grid_roi_entry("H", self.right_roi_height_var, 1, 2)
+        grid_roi_entry("W", self.right_roi_width_var, 1, 1, readonly=True)
+        grid_roi_entry("H", self.right_roi_height_var, 1, 2, readonly=True)
         grid_roi_entry("X", self.right_roi_offset_x_var, 1, 3)
         grid_roi_entry("Y", self.right_roi_offset_y_var, 1, 4)
         self.param_panel_body.pack(side=TOP, fill=X, pady=(5, 0))
@@ -5764,7 +5770,15 @@ class StereoCaptureOnlyApp:
             self.left_roi_height_var.set(str(height))
             self.left_roi_offset_x_var.set(str(offset_x))
             self.left_roi_offset_y_var.set(str(offset_y))
+            self.right_roi_width_var.set(str(width))
+            self.right_roi_height_var.set(str(height))
         else:
+            try:
+                width = optional_int_text(self.left_roi_width_var.get()) or width
+                height = optional_int_text(self.left_roi_height_var.get()) or height
+            except ValueError:
+                self.status_var.set("ROI 参数必须是整数。")
+                return
             self.right_roi_width_var.set(str(width))
             self.right_roi_height_var.set(str(height))
             self.right_roi_offset_x_var.set(str(offset_x))
@@ -5774,6 +5788,32 @@ class StereoCaptureOnlyApp:
         self._set_roi_edit_mode(False)
         if self.camera_system is not None:
             self.apply_roi_settings()
+
+    def _side_roi_requests_from_controls(self) -> dict[str, tuple[int, int, int, int]]:
+        left_width = optional_int_text(self.left_roi_width_var.get()) or CAPTURE_WIDTH
+        left_height = optional_int_text(self.left_roi_height_var.get()) or CAPTURE_HEIGHT
+        left_offset_x = int(self.left_roi_offset_x_var.get() or 0)
+        left_offset_y = int(self.left_roi_offset_y_var.get() or 0)
+        right_offset_x = int(self.right_roi_offset_x_var.get() or 0)
+        right_offset_y = int(self.right_roi_offset_y_var.get() or 0)
+        self.right_roi_width_var.set(str(left_width))
+        self.right_roi_height_var.set(str(left_height))
+        return {
+            "left": (left_width, left_height, left_offset_x, left_offset_y),
+            "right": (left_width, left_height, right_offset_x, right_offset_y),
+        }
+
+    def _side_roi_requests_from_config(self, config_snapshot: dict) -> dict[str, tuple[int, int, int, int]]:
+        left_width = int(config_snapshot.get("left_roi_width", config_snapshot.get("roi_width", CAPTURE_WIDTH)) or CAPTURE_WIDTH)
+        left_height = int(config_snapshot.get("left_roi_height", config_snapshot.get("roi_height", CAPTURE_HEIGHT)) or CAPTURE_HEIGHT)
+        left_offset_x = int(config_snapshot.get("left_roi_offset_x", config_snapshot.get("roi_offset_x", 0)) or 0)
+        left_offset_y = int(config_snapshot.get("left_roi_offset_y", config_snapshot.get("roi_offset_y", 0)) or 0)
+        right_offset_x = int(config_snapshot.get("right_roi_offset_x", config_snapshot.get("roi_offset_x", 0)) or 0)
+        right_offset_y = int(config_snapshot.get("right_roi_offset_y", config_snapshot.get("roi_offset_y", 0)) or 0)
+        return {
+            "left": (left_width, left_height, left_offset_x, left_offset_y),
+            "right": (left_width, left_height, right_offset_x, right_offset_y),
+        }
 
     def reset_roi_settings(self) -> None:
         self.left_roi_width_var.set(str(CAPTURE_WIDTH))
@@ -6090,20 +6130,7 @@ class StereoCaptureOnlyApp:
         if self.camera_system is None:
             return
         try:
-            rois = {
-                "left": (
-                    optional_int_text(self.left_roi_width_var.get()) or CAPTURE_WIDTH,
-                    optional_int_text(self.left_roi_height_var.get()) or CAPTURE_HEIGHT,
-                    int(self.left_roi_offset_x_var.get() or 0),
-                    int(self.left_roi_offset_y_var.get() or 0),
-                ),
-                "right": (
-                    optional_int_text(self.right_roi_width_var.get()) or CAPTURE_WIDTH,
-                    optional_int_text(self.right_roi_height_var.get()) or CAPTURE_HEIGHT,
-                    int(self.right_roi_offset_x_var.get() or 0),
-                    int(self.right_roi_offset_y_var.get() or 0),
-                ),
-            }
+            rois = self._side_roi_requests_from_controls()
         except ValueError:
             self.status_var.set("ROI 参数必须是整数。")
             return
@@ -6800,15 +6827,8 @@ class StereoCaptureOnlyApp:
         return "off"
 
     def _record_roi_sizes_from_config(self, config_snapshot: dict) -> tuple[tuple[int, int], tuple[int, int]]:
-        left_size = (
-            int(config_snapshot.get("left_roi_width", config_snapshot.get("roi_width", CAPTURE_WIDTH)) or CAPTURE_WIDTH),
-            int(config_snapshot.get("left_roi_height", config_snapshot.get("roi_height", CAPTURE_HEIGHT)) or CAPTURE_HEIGHT),
-        )
-        right_size = (
-            int(config_snapshot.get("right_roi_width", config_snapshot.get("roi_width", CAPTURE_WIDTH)) or CAPTURE_WIDTH),
-            int(config_snapshot.get("right_roi_height", config_snapshot.get("roi_height", CAPTURE_HEIGHT)) or CAPTURE_HEIGHT),
-        )
-        return left_size, right_size
+        rois = self._side_roi_requests_from_config(config_snapshot)
+        return rois["left"][:2], rois["right"][:2]
 
     def _record_pair_bytes_from_config(self, config_snapshot: dict) -> int:
         if not config_bool(config_snapshot, "record_save_image_sequence", False, False):
@@ -7870,14 +7890,9 @@ class StereoCaptureOnlyApp:
         return metrics
 
     def _current_parameter_config(self) -> dict:
-        left_width = optional_int_text(self.left_roi_width_var.get()) or CAPTURE_WIDTH
-        left_height = optional_int_text(self.left_roi_height_var.get()) or CAPTURE_HEIGHT
-        left_offset_x = int(self.left_roi_offset_x_var.get() or 0)
-        left_offset_y = int(self.left_roi_offset_y_var.get() or 0)
-        right_width = optional_int_text(self.right_roi_width_var.get()) or CAPTURE_WIDTH
-        right_height = optional_int_text(self.right_roi_height_var.get()) or CAPTURE_HEIGHT
-        right_offset_x = int(self.right_roi_offset_x_var.get() or 0)
-        right_offset_y = int(self.right_roi_offset_y_var.get() or 0)
+        rois = self._side_roi_requests_from_controls()
+        left_width, left_height, left_offset_x, left_offset_y = rois["left"]
+        right_width, right_height, right_offset_x, right_offset_y = rois["right"]
         return {
             "trigger_source": safe_capture_trigger_source(self.trigger_source_var.get()),
             "exposure_auto": self.exposure_auto_var.get(),
@@ -7941,8 +7956,8 @@ class StereoCaptureOnlyApp:
         self.left_roi_height_var.set(str(snapshot.get("left_roi_height", snapshot.get("roi_height", CAPTURE_HEIGHT))))
         self.left_roi_offset_x_var.set(str(snapshot.get("left_roi_offset_x", snapshot.get("roi_offset_x", 0))))
         self.left_roi_offset_y_var.set(str(snapshot.get("left_roi_offset_y", snapshot.get("roi_offset_y", 0))))
-        self.right_roi_width_var.set(str(snapshot.get("right_roi_width", snapshot.get("roi_width", CAPTURE_WIDTH))))
-        self.right_roi_height_var.set(str(snapshot.get("right_roi_height", snapshot.get("roi_height", CAPTURE_HEIGHT))))
+        self.right_roi_width_var.set(str(snapshot.get("left_roi_width", snapshot.get("roi_width", CAPTURE_WIDTH))))
+        self.right_roi_height_var.set(str(snapshot.get("left_roi_height", snapshot.get("roi_height", CAPTURE_HEIGHT))))
         self.right_roi_offset_x_var.set(str(snapshot.get("right_roi_offset_x", snapshot.get("roi_offset_x", 0))))
         self.right_roi_offset_y_var.set(str(snapshot.get("right_roi_offset_y", snapshot.get("roi_offset_y", 0))))
         self.interval_seconds_var.set(optional_config_text(snapshot, "interval_capture_seconds", ""))
@@ -7990,20 +8005,7 @@ class StereoCaptureOnlyApp:
                     optional_config_float("gamma"),
                 )
             )
-        rois = {
-            "left": (
-                int(config_snapshot.get("left_roi_width", config_snapshot.get("roi_width", CAPTURE_WIDTH)) or CAPTURE_WIDTH),
-                int(config_snapshot.get("left_roi_height", config_snapshot.get("roi_height", CAPTURE_HEIGHT)) or CAPTURE_HEIGHT),
-                int(config_snapshot.get("left_roi_offset_x", config_snapshot.get("roi_offset_x", 0)) or 0),
-                int(config_snapshot.get("left_roi_offset_y", config_snapshot.get("roi_offset_y", 0)) or 0),
-            ),
-            "right": (
-                int(config_snapshot.get("right_roi_width", config_snapshot.get("roi_width", CAPTURE_WIDTH)) or CAPTURE_WIDTH),
-                int(config_snapshot.get("right_roi_height", config_snapshot.get("roi_height", CAPTURE_HEIGHT)) or CAPTURE_HEIGHT),
-                int(config_snapshot.get("right_roi_offset_x", config_snapshot.get("roi_offset_x", 0)) or 0),
-                int(config_snapshot.get("right_roi_offset_y", config_snapshot.get("roi_offset_y", 0)) or 0),
-            ),
-        }
+        rois = self._side_roi_requests_from_config(config_snapshot)
         _results, roi_warnings = camera_system.apply_side_roi_settings(rois, restart_stream=True)
         warnings.extend(roi_warnings)
         apply_chunk = getattr(camera_system, "apply_chunk_settings", None)
@@ -8093,8 +8095,8 @@ class StereoCaptureOnlyApp:
         self.left_roi_height_var.set(str(self.config.get("left_roi_height", self.config.get("roi_height", CAPTURE_HEIGHT))))
         self.left_roi_offset_x_var.set(str(self.config.get("left_roi_offset_x", self.config.get("roi_offset_x", 0))))
         self.left_roi_offset_y_var.set(str(self.config.get("left_roi_offset_y", self.config.get("roi_offset_y", 0))))
-        self.right_roi_width_var.set(str(self.config.get("right_roi_width", self.config.get("roi_width", CAPTURE_WIDTH))))
-        self.right_roi_height_var.set(str(self.config.get("right_roi_height", self.config.get("roi_height", CAPTURE_HEIGHT))))
+        self.right_roi_width_var.set(str(self.config.get("left_roi_width", self.config.get("roi_width", CAPTURE_WIDTH))))
+        self.right_roi_height_var.set(str(self.config.get("left_roi_height", self.config.get("roi_height", CAPTURE_HEIGHT))))
         self.right_roi_offset_x_var.set(str(self.config.get("right_roi_offset_x", self.config.get("roi_offset_x", 0))))
         self.right_roi_offset_y_var.set(str(self.config.get("right_roi_offset_y", self.config.get("roi_offset_y", 0))))
         self.record_max_seconds_var.set(optional_config_text(self.config, "record_max_seconds", "0"))
@@ -8106,15 +8108,8 @@ class StereoCaptureOnlyApp:
 
     def _side_roi_dimensions_from_config(self, config_snapshot: dict | None = None) -> tuple[tuple[int, int], tuple[int, int]]:
         config_snapshot = config_snapshot or self._config_snapshot()
-        left = (
-            int(config_snapshot.get("left_roi_width") or config_snapshot.get("roi_width") or CAPTURE_WIDTH),
-            int(config_snapshot.get("left_roi_height") or config_snapshot.get("roi_height") or CAPTURE_HEIGHT),
-        )
-        right = (
-            int(config_snapshot.get("right_roi_width") or config_snapshot.get("roi_width") or CAPTURE_WIDTH),
-            int(config_snapshot.get("right_roi_height") or config_snapshot.get("roi_height") or CAPTURE_HEIGHT),
-        )
-        return left, right
+        rois = self._side_roi_requests_from_config(config_snapshot)
+        return rois["left"][:2], rois["right"][:2]
 
     def _reset_stats(self) -> None:
         self._stat_last_time = time.perf_counter()

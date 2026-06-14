@@ -1605,6 +1605,66 @@ class ReliabilityFixTests(unittest.TestCase):
         self.assertEqual(right.calls[-1], (100, 80, 20, 10, False))
         self.assertTrue(any("Right camera ROI size adjusted" in warning for warning in warnings))
 
+    def test_left_preview_roi_syncs_right_size_for_stereo_capture(self) -> None:
+        app = StereoCaptureOnlyApp.__new__(StereoCaptureOnlyApp)
+        app.focus_roi_editing = False
+        app.camera_system = None
+        app.status_var = _Var()
+        app._set_roi_edit_mode = lambda enabled: setattr(app, "_roi_edit_mode", enabled)
+        app.left_roi_width_var = _Var()
+        app.left_roi_height_var = _Var()
+        app.left_roi_offset_x_var = _Var()
+        app.left_roi_offset_y_var = _Var()
+        app.right_roi_width_var = _Var()
+        app.right_roi_height_var = _Var()
+        app.right_roi_offset_x_var = _Var()
+        app.right_roi_offset_y_var = _Var()
+        app.right_roi_width_var.set("999")
+        app.right_roi_height_var.set("888")
+        app.right_roi_offset_x_var.set("60")
+        app.right_roi_offset_y_var.set("40")
+
+        app.set_roi_from_preview((10, 20, 320, 240), side="left")
+
+        self.assertEqual(app.left_roi_width_var.get(), "320")
+        self.assertEqual(app.left_roi_height_var.get(), "240")
+        self.assertEqual(app.left_roi_offset_x_var.get(), "10")
+        self.assertEqual(app.left_roi_offset_y_var.get(), "20")
+        self.assertEqual(app.right_roi_width_var.get(), "320")
+        self.assertEqual(app.right_roi_height_var.get(), "240")
+        self.assertEqual(app.right_roi_offset_x_var.get(), "60")
+        self.assertEqual(app.right_roi_offset_y_var.get(), "40")
+
+    def test_right_preview_roi_preserves_left_size_and_updates_right_position(self) -> None:
+        app = StereoCaptureOnlyApp.__new__(StereoCaptureOnlyApp)
+        app.focus_roi_editing = False
+        app.camera_system = None
+        app.status_var = _Var()
+        app._set_roi_edit_mode = lambda enabled: setattr(app, "_roi_edit_mode", enabled)
+        app.left_roi_width_var = _Var()
+        app.left_roi_height_var = _Var()
+        app.left_roi_offset_x_var = _Var()
+        app.left_roi_offset_y_var = _Var()
+        app.right_roi_width_var = _Var()
+        app.right_roi_height_var = _Var()
+        app.right_roi_offset_x_var = _Var()
+        app.right_roi_offset_y_var = _Var()
+        app.left_roi_width_var.set("320")
+        app.left_roi_height_var.set("240")
+        app.left_roi_offset_x_var.set("10")
+        app.left_roi_offset_y_var.set("20")
+
+        app.set_roi_from_preview((70, 55, 500, 400), side="right")
+
+        self.assertEqual(app.left_roi_width_var.get(), "320")
+        self.assertEqual(app.left_roi_height_var.get(), "240")
+        self.assertEqual(app.left_roi_offset_x_var.get(), "10")
+        self.assertEqual(app.left_roi_offset_y_var.get(), "20")
+        self.assertEqual(app.right_roi_width_var.get(), "320")
+        self.assertEqual(app.right_roi_height_var.get(), "240")
+        self.assertEqual(app.right_roi_offset_x_var.get(), "70")
+        self.assertEqual(app.right_roi_offset_y_var.get(), "55")
+
     def test_stream_stats_are_aggregated_for_ui(self) -> None:
         system = StereoCameraSystem.__new__(StereoCameraSystem)
         system._capture_lock = threading.Lock()
