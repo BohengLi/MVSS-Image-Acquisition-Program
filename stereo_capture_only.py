@@ -208,6 +208,7 @@ DEFAULT_RECORD_QUEUE_SECONDS = 10.0
 RAW_FRAME_FORMATS = {"npy", "png16", "tiff16", "exr"}
 DIC_CAPTURE_MODE = "dic_capture"
 CAPTURE_PIXEL_FORMAT = "Mono8"
+CAMERA_ASSIGNMENT_AUTO = "自动"
 DIC_CAPTURE_CONFIG = {
     "trigger_source": "Continuous",
     "trigger_activation": "RisingEdge",
@@ -1944,6 +1945,8 @@ class StereoCaptureOnlyApp:
         self.roi_editing = False
         self.focus_roi_editing = False
         self._last_device_status = "尚未刷新设备。"
+        self._available_cameras: list[object] = []
+        self._camera_choice_serials: dict[str, str] = {CAMERA_ASSIGNMENT_AUTO: ""}
         self._last_video_sides: list[str] = []
         self._last_quality_metrics: dict[str, object] | None = None
         self._last_left_frame_obj: CameraFrame | None = None
@@ -2025,6 +2028,8 @@ class StereoCaptureOnlyApp:
         default_preset = "室内低光" if "室内低光" in presets else next(iter(presets), "室内低光")
         self.preset_var = StringVar(value=default_preset)
         self.trigger_source_var = StringVar(value=display_trigger_source(self.config.get("trigger_source", "Software")))
+        self.left_camera_var = StringVar(value=CAMERA_ASSIGNMENT_AUTO)
+        self.right_camera_var = StringVar(value=CAMERA_ASSIGNMENT_AUTO)
         self.exposure_auto_var = StringVar(value=str(self.config.get("exposure_auto", "Off")))
         self.exposure_time_var = StringVar(value=str(self.config.get("exposure_time_us", 10000.0)))
         self.auto_exposure_lower_var = StringVar(value=optional_config_text(self.config, "auto_exposure_lower_limit", "100.0"))
@@ -2232,6 +2237,33 @@ class StereoCaptureOnlyApp:
         )
         self.dic_capture_button.grid(row=0, column=12, padx=(0, 4), pady=2)
         self.dic_record_fps_entry = self._labeled_entry(interval_panel, "DIC fps", self.dic_record_fps_var, 6, 0, 13)
+
+        assignment_panel = ttk.Frame(settings, style="Panel.TFrame", padding=(6, 4))
+        assignment_panel.pack(side=LEFT, fill="y", padx=(8, 0))
+        ttk.Label(assignment_panel, text="画面分配", style="Panel.TLabel").grid(
+            row=0, column=0, columnspan=4, padx=(0, 4), pady=2, sticky="w"
+        )
+        ttk.Label(assignment_panel, text="左", style="Panel.TLabel").grid(row=1, column=0, padx=(0, 2), pady=1)
+        self.left_camera_menu = ttk.OptionMenu(
+            assignment_panel,
+            self.left_camera_var,
+            self.left_camera_var.get(),
+            CAMERA_ASSIGNMENT_AUTO,
+            command=lambda _value: self._on_camera_assignment_changed(),
+        )
+        self.left_camera_menu.grid(row=1, column=1, padx=(0, 6), pady=1, sticky="ew")
+        ttk.Label(assignment_panel, text="右", style="Panel.TLabel").grid(row=1, column=2, padx=(0, 2), pady=1)
+        self.right_camera_menu = ttk.OptionMenu(
+            assignment_panel,
+            self.right_camera_var,
+            self.right_camera_var.get(),
+            CAMERA_ASSIGNMENT_AUTO,
+            command=lambda _value: self._on_camera_assignment_changed(),
+        )
+        self.right_camera_menu.grid(row=1, column=3, pady=1, sticky="ew")
+        assignment_panel.grid_columnconfigure(1, minsize=126, weight=1)
+        assignment_panel.grid_columnconfigure(3, minsize=126, weight=1)
+        self._sync_camera_assignment_controls()
 
         self._build_status_bar()
 
@@ -3683,6 +3715,91 @@ class StereoCaptureOnlyApp:
         connected_text = "\n".join(connected) if connected else "当前未连接相机。"
         return f"{self._last_device_status}\n{connected_text}"
 
+    def _camera_choice_label(self, camera: object) -> str:
+        serial = str(getattr(camera, "serial", "") or "").strip()
+        label = str(getattr(camera, "label", "") or "").strip()
+        transport = str(getattr(camera, "transport", "") or "").strip()
+        prefix = label or serial or f"Camera {getattr(camera, 'index', '')}".strip()
+        suffix = f" [{transport}]" if transport else ""
+        return f"{prefix}{suffix}"
+
+    def _camera_serial_from_choice(self, value: object) -> str:
+        text = str(value or "").strip()
+        if not text or text == CAMERA_ASSIGNMENT_AUTO:
+            return ""
+        return self._camera_choice_serials.get(text, "")
+
+    def _set_camera_assignment_menus(self, choices: list[str]) -> None:
+        for menu_widget, variable in (
+            (getattr(self, "left_camera_menu", None), self.left_camera_var),
+            (getattr(self, "right_camera_menu", None), self.right_camera_var),
+        ):
+            if menu_widget is None:
+                continue
+            menu = menu_widget["menu"]
+            menu.delete(0, "end")
+            for choice in choices:
+                menu.add_command(
+                    label=choice,
+                    command=lambda selected=choice, var=variable: self._select_camera_assignment(var, selected),
+                )
+
+    def _select_camera_assignment(self, variable: StringVar, value: str) -> None:
+        variable.set(value)
+        self._on_camera_assignment_changed()
+
+    def _sync_camera_assignment_controls(self, cameras: list[object] | None = None) -> None:
+        if cameras is not None:
+            self._available_cameras = list(cameras)
+        choices = [CAMERA_ASSIGNMENT_AUTO]
+        self._camera_choice_serials = {CAMERA_ASSIGNMENT_AUTO: ""}
+        for camera in self._available_cameras:
+            label = self._camera_choice_label(camera)
+            serial = str(getattr(camera, "serial", "") or "").strip()
+            if label in self._camera_choice_serials:
+                label = f"{label} #{getattr(camera, 'index', len(choices))}"
+            choices.append(label)
+            self._camera_choice_serials[label] = serial
+
+        left_serial = str(self.config.get("left_serial", "") or "").strip()
+        right_serial = str(self.config.get("right_serial", "") or "").strip()
+        known_serials = {serial for serial in self._camera_choice_serials.values() if serial}
+        for serial in (left_serial, right_serial):
+            if serial and serial not in known_serials:
+                label = f"已保存: {serial}"
+                choices.append(label)
+                self._camera_choice_serials[label] = serial
+                known_serials.add(serial)
+        selected_by_serial = {serial: label for label, serial in self._camera_choice_serials.items() if serial}
+        left_choice = selected_by_serial.get(left_serial, CAMERA_ASSIGNMENT_AUTO)
+        right_choice = selected_by_serial.get(right_serial, CAMERA_ASSIGNMENT_AUTO)
+        if self._camera_serial_from_choice(self.left_camera_var.get()) in selected_by_serial:
+            left_choice = self.left_camera_var.get()
+        if self._camera_serial_from_choice(self.right_camera_var.get()) in selected_by_serial:
+            right_choice = self.right_camera_var.get()
+        self.left_camera_var.set(left_choice)
+        self.right_camera_var.set(right_choice)
+        self._set_camera_assignment_menus(choices)
+
+    def _selected_camera_assignment_config(self) -> dict[str, object]:
+        left_serial = self._camera_serial_from_choice(self.left_camera_var.get())
+        right_serial = self._camera_serial_from_choice(self.right_camera_var.get())
+        if left_serial and right_serial and left_serial == right_serial:
+            raise ValueError("左右画面不能选择同一台相机。")
+        return {
+            "left_serial": left_serial,
+            "right_serial": right_serial,
+            "bind_camera_serials": bool(left_serial or right_serial),
+        }
+
+    def _on_camera_assignment_changed(self) -> None:
+        try:
+            values = self._selected_camera_assignment_config()
+        except ValueError as exc:
+            self.status_var.set(str(exc))
+            return
+        self._update_config(values, save=False)
+
     def _update_connected_titles(self, left_info, right_info) -> None:
         if left_info is not None:
             self.left_pane.set_title(f"左相机：{left_info.label}")
@@ -3898,6 +4015,12 @@ class StereoCaptureOnlyApp:
         except ValueError:
             self.status_var.set("连接前请先检查参数：曝光、增益、ROI、定时拍照和录像 FPS 必须为数字。")
             return
+        try:
+            assignment_config = self._selected_camera_assignment_config()
+        except ValueError as exc:
+            self.status_var.set(str(exc))
+            return
+        self._update_config(assignment_config, save=True)
         self.connect_button.configure(state=DISABLED)
         self.status_var.set("正在连接相机并应用采集参数...")
 
@@ -6236,10 +6359,15 @@ class StereoCaptureOnlyApp:
                     self.status_var.set(str(payload))
                 elif kind == "devices_refreshed":
                     _cameras, message = payload
+                    if isinstance(_cameras, list):
+                        self._sync_camera_assignment_controls(_cameras)
                     self._last_device_status = str(message)
                     self.status_var.set(str(message))
                 elif kind == "connected":
                     left_info, right_info = payload
+                    connected_cameras = [camera for camera in (left_info, right_info) if camera is not None]
+                    if connected_cameras:
+                        self._sync_camera_assignment_controls(connected_cameras)
                     self._update_connected_titles(left_info, right_info)
                     self._set_capture_buttons(NORMAL)
                     self._set_parameter_buttons(NORMAL)

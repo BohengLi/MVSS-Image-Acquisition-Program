@@ -167,6 +167,14 @@ class _FakeStatsSystem:
         return {"left": {"buffered_frames": 0, "dropped_frames": 2, "callback_enabled": True}}
 
 
+class _FakeCameraInfo:
+    def __init__(self, index: int, serial: str, label: str, transport: str = "USB3"):
+        self.index = index
+        self.serial = serial
+        self.label = label
+        self.transport = transport
+
+
 class _FakeCalibration:
     def meta(self):
         return {}
@@ -1604,6 +1612,75 @@ class ReliabilityFixTests(unittest.TestCase):
         self.assertEqual(results["right"].actual_roi, (100, 80, 20, 10))
         self.assertEqual(right.calls[-1], (100, 80, 20, 10, False))
         self.assertTrue(any("Right camera ROI size adjusted" in warning for warning in warnings))
+
+    def test_camera_assignment_maps_selected_devices_to_left_and_right_serials(self) -> None:
+        app = StereoCaptureOnlyApp.__new__(StereoCaptureOnlyApp)
+        app.config = {}
+        app.left_camera_var = _Var()
+        app.right_camera_var = _Var()
+        app._camera_choice_serials = {stereo_capture_only.CAMERA_ASSIGNMENT_AUTO: ""}
+        app._set_camera_assignment_menus = lambda _choices: None
+
+        cameras = [
+            _FakeCameraInfo(0, "LEFT123", "Camera A"),
+            _FakeCameraInfo(1, "RIGHT456", "Camera B"),
+        ]
+        app._sync_camera_assignment_controls(cameras)
+        labels = {serial: label for label, serial in app._camera_choice_serials.items() if serial}
+        app.left_camera_var.set(labels["LEFT123"])
+        app.right_camera_var.set(labels["RIGHT456"])
+
+        values = app._selected_camera_assignment_config()
+
+        self.assertEqual(values["left_serial"], "LEFT123")
+        self.assertEqual(values["right_serial"], "RIGHT456")
+        self.assertTrue(values["bind_camera_serials"])
+
+    def test_camera_assignment_rejects_same_camera_for_both_views(self) -> None:
+        app = StereoCaptureOnlyApp.__new__(StereoCaptureOnlyApp)
+        app.config = {}
+        app.left_camera_var = _Var()
+        app.right_camera_var = _Var()
+        app._camera_choice_serials = {stereo_capture_only.CAMERA_ASSIGNMENT_AUTO: ""}
+        app._set_camera_assignment_menus = lambda _choices: None
+
+        app._sync_camera_assignment_controls([_FakeCameraInfo(0, "CAM123", "Camera A")])
+        label = next(label for label, serial in app._camera_choice_serials.items() if serial == "CAM123")
+        app.left_camera_var.set(label)
+        app.right_camera_var.set(label)
+
+        with self.assertRaises(ValueError):
+            app._selected_camera_assignment_config()
+
+    def test_camera_assignment_preserves_saved_serials_before_refresh(self) -> None:
+        app = StereoCaptureOnlyApp.__new__(StereoCaptureOnlyApp)
+        app.config = {"left_serial": "SAVED_L", "right_serial": "SAVED_R", "bind_camera_serials": True}
+        app.left_camera_var = _Var()
+        app.right_camera_var = _Var()
+        app._camera_choice_serials = {stereo_capture_only.CAMERA_ASSIGNMENT_AUTO: ""}
+        app._available_cameras = []
+        app._set_camera_assignment_menus = lambda _choices: None
+
+        app._sync_camera_assignment_controls()
+        values = app._selected_camera_assignment_config()
+
+        self.assertEqual(values["left_serial"], "SAVED_L")
+        self.assertEqual(values["right_serial"], "SAVED_R")
+        self.assertTrue(values["bind_camera_serials"])
+
+    def test_single_bound_right_serial_connects_single_camera_as_right_view(self) -> None:
+        camera = _FakeCameraInfo(0, "RIGHT456", "Camera B")
+
+        with patch("mvs_camera.enumerate_cameras", return_value=([camera], object())):
+            left, right, _dev_list = mvs_camera.select_capture_devices(
+                left_serial="",
+                right_serial="RIGHT456",
+                allow_single=True,
+                bind_serials=True,
+            )
+
+        self.assertIsNone(left)
+        self.assertIs(right, camera)
 
     def test_left_preview_roi_syncs_right_size_for_stereo_capture(self) -> None:
         app = StereoCaptureOnlyApp.__new__(StereoCaptureOnlyApp)
