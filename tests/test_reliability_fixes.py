@@ -739,7 +739,7 @@ class ReliabilityFixTests(unittest.TestCase):
         self.assertEqual(bucket["frame_number_gaps"], 2)
         self.assertEqual(bucket["drop_reasons"]["left_frame_number_gap"], 2)
 
-    def test_high_bit_depth_frames_are_saved_as_raw_sidecar(self) -> None:
+    def test_high_bit_depth_frame_raw_helper_saves_npy(self) -> None:
         app = StereoCaptureOnlyApp.__new__(StereoCaptureOnlyApp)
         app._config_snapshot = lambda: {"save_raw_frames": False}
         raw = np.array([[0, 4095], [2048, 1024]], dtype=np.uint16).tobytes()
@@ -758,7 +758,7 @@ class ReliabilityFixTests(unittest.TestCase):
         )
 
         with tempfile.TemporaryDirectory() as tmp:
-            path = app._save_frame(frame, Path(tmp) / "left_000001.bmp", {"save_raw_frames": False})
+            path = app._save_raw_frame(frame, Path(tmp) / "left_000001.bmp", {"raw_frame_format": "npy"})
             saved = np.load(path)
 
         self.assertEqual(path.suffix, ".npy")
@@ -783,10 +783,10 @@ class ReliabilityFixTests(unittest.TestCase):
         )
 
         with tempfile.TemporaryDirectory() as tmp:
-            path = app._save_frame(
+            path = app._save_raw_frame(
                 frame,
                 Path(tmp) / "left_000001.bmp",
-                {"save_raw_frames": True, "raw_frame_format": "png16"},
+                {"raw_frame_format": "png16"},
             )
             saved = np.asarray(Image.open(path), dtype=np.uint16)
 
@@ -811,10 +811,10 @@ class ReliabilityFixTests(unittest.TestCase):
         )
 
         with tempfile.TemporaryDirectory() as tmp:
-            path = app._save_frame(
+            path = app._save_raw_frame(
                 frame,
                 Path(tmp) / "left_000001.bmp",
-                {"save_raw_frames": True, "raw_frame_format": "tiff16"},
+                {"raw_frame_format": "tiff16"},
             )
             saved = np.asarray(Image.open(path), dtype=np.uint16)
 
@@ -839,11 +839,10 @@ class ReliabilityFixTests(unittest.TestCase):
         )
 
         with tempfile.TemporaryDirectory() as tmp:
-            path = app._save_frame(
+            path = app._save_raw_frame(
                 frame,
                 Path(tmp) / "left_000001.bmp",
                 {
-                    "save_raw_frames": True,
                     "raw_frame_format": "tiff16",
                     "image_format": "png",
                     "viewable_sidecar_enabled": True,
@@ -876,10 +875,10 @@ class ReliabilityFixTests(unittest.TestCase):
 
         with tempfile.TemporaryDirectory() as tmp:
             with patch.object(stereo_capture_only.LOGGER, "exception"), self.assertRaises(MvsError):
-                app._save_frame(
+                app._save_raw_frame(
                     frame,
                     Path(tmp) / "left_000001.bmp",
-                    {"save_raw_frames": True, "raw_frame_format": "png16"},
+                    {"raw_frame_format": "png16"},
                 )
 
     def test_force_image_format_saves_high_bit_depth_frame_as_jpeg(self) -> None:
@@ -948,7 +947,8 @@ class ReliabilityFixTests(unittest.TestCase):
             "image_format": "jpg",
         }
 
-        self.assertEqual(app._capture_priority_record_config(original), original)
+        expected = dict(original, pixel_format="Mono8", save_raw_frames=False, record_force_image_format=True)
+        self.assertEqual(app._capture_priority_record_config(original), expected)
 
     def test_default_presets_include_dic_and_scientific_fields(self) -> None:
         presets = stereo_capture_only.default_presets()
@@ -960,11 +960,12 @@ class ReliabilityFixTests(unittest.TestCase):
         self.assertEqual(presets["DIC 标准"]["hardware_sync_slave_line"], "Line0")
         self.assertEqual(presets["DIC 标准"]["pixel_format"], "Mono8")
         self.assertEqual(presets["DIC 标准"]["image_format"], "png")
-        self.assertTrue(presets["DIC 标准"]["save_raw_frames"])
+        self.assertFalse(presets["DIC 标准"]["save_raw_frames"])
+        self.assertTrue(presets["DIC 标准"]["record_force_image_format"])
         self.assertEqual(presets["DIC 标准"]["raw_frame_format"], "tiff16")
         self.assertTrue(presets["DIC 标准"]["chunk_data_enabled"])
         self.assertIn("black_level", presets["室内低光"])
-        self.assertTrue(presets["室内低光"]["save_raw_frames"])
+        self.assertFalse(presets["室内低光"]["save_raw_frames"])
         self.assertEqual(presets["标定采集"]["pixel_format"], "Mono8")
         self.assertFalse(presets["标定采集"]["save_raw_frames"])
 
@@ -990,9 +991,9 @@ class ReliabilityFixTests(unittest.TestCase):
         self.assertEqual(config["hardware_sync_slave_line"], "Line0")
         self.assertEqual(config["pixel_format"], "Mono8")
         self.assertEqual(config["image_format"], "png")
-        self.assertTrue(config["save_raw_frames"])
+        self.assertFalse(config["save_raw_frames"])
         self.assertEqual(config["raw_frame_format"], "tiff16")
-        self.assertFalse(config["record_force_image_format"])
+        self.assertTrue(config["record_force_image_format"])
         self.assertEqual(config["record_jpeg_quality"], 100)
         self.assertEqual(config["record_fps"], 5.0)
         self.assertEqual(config["interval_capture_seconds"], 0.5)
@@ -1026,28 +1027,23 @@ class ReliabilityFixTests(unittest.TestCase):
         self.assertEqual(config["record_fps"], 8.0)
         self.assertEqual(config["dic_capture"]["record_fps"], 8.0)
 
-    def test_dic_capture_pixel_format_entry_controls_raw_and_png_outputs(self) -> None:
+    def test_dic_capture_always_uses_mono8_png_without_raw_outputs(self) -> None:
         app = StereoCaptureOnlyApp.__new__(StereoCaptureOnlyApp)
         app.dic_record_fps_var = _Var()
         app.dic_record_fps_var.set("5")
-        app.dic_pixel_format_var = _Var()
 
-        app.dic_pixel_format_var.set("Mono8")
-        mono8_config = app._apply_dic_ui_settings_to_config({"dic_capture": {"record_fps": 5.0}})
+        config = app._apply_dic_ui_settings_to_config(
+            {"pixel_format": "Mono16", "save_raw_frames": True, "dic_capture": {"record_fps": 5.0, "pixel_format": "Mono16"}}
+        )
 
-        self.assertEqual(mono8_config["pixel_format"], "Mono8")
-        self.assertEqual(mono8_config["image_format"], "png")
-        self.assertFalse(mono8_config["save_raw_frames"])
-        self.assertTrue(mono8_config["record_force_image_format"])
-
-        app.dic_pixel_format_var.set("Mono16")
-        mono16_config = app._apply_dic_ui_settings_to_config({"dic_capture": {"record_fps": 5.0}})
-
-        self.assertEqual(mono16_config["pixel_format"], "Mono16")
-        self.assertEqual(mono16_config["image_format"], "png")
-        self.assertTrue(mono16_config["save_raw_frames"])
-        self.assertFalse(mono16_config["record_force_image_format"])
-        self.assertEqual(mono16_config["viewable_sidecar_format"], "png")
+        self.assertEqual(config["pixel_format"], "Mono8")
+        self.assertEqual(config["image_format"], "png")
+        self.assertFalse(config["save_raw_frames"])
+        self.assertTrue(config["record_force_image_format"])
+        self.assertEqual(config["dic_capture"]["pixel_format"], "Mono8")
+        self.assertFalse(config["dic_capture"]["save_raw_frames"])
+        self.assertTrue(config["dic_capture"]["record_force_image_format"])
+        self.assertEqual(config["viewable_sidecar_format"], "png")
 
     def test_dic_record_queue_uses_configured_capacity(self) -> None:
         self.assertEqual(
