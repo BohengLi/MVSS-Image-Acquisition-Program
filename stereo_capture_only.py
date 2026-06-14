@@ -1946,6 +1946,7 @@ class StereoCaptureOnlyApp:
         self.focus_roi_editing = False
         self._last_device_status = "尚未刷新设备。"
         self._available_cameras: list[object] = []
+        self._camera_assignment_choices: list[str] = [CAMERA_ASSIGNMENT_AUTO]
         self._camera_choice_serials: dict[str, str] = {CAMERA_ASSIGNMENT_AUTO: ""}
         self._last_video_sides: list[str] = []
         self._last_quality_metrics: dict[str, object] | None = None
@@ -3779,6 +3780,7 @@ class StereoCaptureOnlyApp:
             right_choice = self.right_camera_var.get()
         self.left_camera_var.set(left_choice)
         self.right_camera_var.set(right_choice)
+        self._camera_assignment_choices = choices
         self._set_camera_assignment_menus(choices)
 
     def _selected_camera_assignment_config(self) -> dict[str, object]:
@@ -3799,6 +3801,60 @@ class StereoCaptureOnlyApp:
             self.status_var.set(str(exc))
             return
         self._update_config(values, save=False)
+
+    def show_camera_assignment_popup(self, cameras: list[object] | None = None) -> None:
+        if cameras is not None:
+            self._sync_camera_assignment_controls(cameras)
+        if not getattr(self, "_available_cameras", []):
+            messagebox.showwarning("画面分配", "未检测到相机，请先确认设备连接。", parent=self.root)
+            return
+        popup = Toplevel(self.root)
+        popup.title("画面分配")
+        popup.configure(bg=BG_COLOR)
+        popup.transient(self.root)
+        popup.geometry("+%d+%d" % (self.root.winfo_rootx() + 140, self.root.winfo_rooty() + 120))
+
+        body = ttk.LabelFrame(popup, text="选择左右相机", padding=(12, 10))
+        body.pack(side=TOP, fill=BOTH, expand=True, padx=12, pady=12)
+        body.grid_columnconfigure(1, weight=1)
+
+        left_choice = StringVar(value=self.left_camera_var.get())
+        right_choice = StringVar(value=self.right_camera_var.get())
+        choices = list(getattr(self, "_camera_assignment_choices", [CAMERA_ASSIGNMENT_AUTO]))
+
+        ttk.Label(body, text="左画面", style="Panel.TLabel").grid(row=0, column=0, padx=(0, 8), pady=5, sticky="e")
+        ttk.OptionMenu(body, left_choice, left_choice.get(), *choices).grid(row=0, column=1, pady=5, sticky="ew")
+        ttk.Label(body, text="右画面", style="Panel.TLabel").grid(row=1, column=0, padx=(0, 8), pady=5, sticky="e")
+        ttk.OptionMenu(body, right_choice, right_choice.get(), *choices).grid(row=1, column=1, pady=5, sticky="ew")
+
+        button_row = ttk.Frame(body, style="Panel.TFrame")
+        button_row.grid(row=2, column=0, columnspan=2, sticky="e", pady=(10, 0))
+
+        def save_assignment() -> None:
+            previous_left = self.left_camera_var.get()
+            previous_right = self.right_camera_var.get()
+            self.left_camera_var.set(left_choice.get())
+            self.right_camera_var.set(right_choice.get())
+            try:
+                values = self._selected_camera_assignment_config()
+            except ValueError as exc:
+                self.left_camera_var.set(previous_left)
+                self.right_camera_var.set(previous_right)
+                messagebox.showerror("画面分配错误", str(exc), parent=popup)
+                return
+            self._update_config(values, save=True)
+            self.status_var.set("画面分配已保存，连接相机时将按所选左右画面绑定。")
+            popup.destroy()
+
+        ttk.Button(button_row, text="取消", command=popup.destroy).pack(side=LEFT, padx=(0, 6))
+        ttk.Button(button_row, text="保存分配", command=save_assignment, style="Accent.TButton").pack(side=LEFT)
+        popup.protocol("WM_DELETE_WINDOW", popup.destroy)
+        popup.update_idletasks()
+        width = max(body.winfo_reqwidth() + 36, 440)
+        height = max(body.winfo_reqheight() + 40, 180)
+        popup.geometry(f"{width}x{height}+{self.root.winfo_rootx() + 140}+{self.root.winfo_rooty() + 120}")
+        popup.grab_set()
+        popup.focus_force()
 
     def _update_connected_titles(self, left_info, right_info) -> None:
         if left_info is not None:
@@ -6363,6 +6419,8 @@ class StereoCaptureOnlyApp:
                         self._sync_camera_assignment_controls(_cameras)
                     self._last_device_status = str(message)
                     self.status_var.set(str(message))
+                    if isinstance(_cameras, list) and _cameras:
+                        self.show_camera_assignment_popup(_cameras)
                 elif kind == "connected":
                     left_info, right_info = payload
                     connected_cameras = [camera for camera in (left_info, right_info) if camera is not None]

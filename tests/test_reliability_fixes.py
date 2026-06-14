@@ -1668,6 +1668,28 @@ class ReliabilityFixTests(unittest.TestCase):
         self.assertEqual(values["right_serial"], "SAVED_R")
         self.assertTrue(values["bind_camera_serials"])
 
+    def test_refresh_devices_event_opens_camera_assignment_popup(self) -> None:
+        app = StereoCaptureOnlyApp.__new__(StereoCaptureOnlyApp)
+        app._ui_queue_event_lock = threading.Lock()
+        app.ui_queue = Queue()
+        app.status_var = _Var()
+        app._last_device_status = ""
+        app.left_camera_var = _Var()
+        app.right_camera_var = _Var()
+        app.config = {}
+        app._camera_choice_serials = {stereo_capture_only.CAMERA_ASSIGNMENT_AUTO: ""}
+        app._available_cameras = []
+        app._set_camera_assignment_menus = lambda _choices: None
+        calls: list[list[object]] = []
+        app.show_camera_assignment_popup = lambda cameras=None: calls.append(list(cameras or []))
+        cameras = [_FakeCameraInfo(0, "LEFT123", "Camera A")]
+
+        app.ui_queue.put(("devices_refreshed", (cameras, "检测到 1 台相机")))
+        app.process_ui_queue()
+
+        self.assertEqual(calls, [cameras])
+        self.assertEqual(app.status_var.get(), "检测到 1 台相机")
+
     def test_single_bound_right_serial_connects_single_camera_as_right_view(self) -> None:
         camera = _FakeCameraInfo(0, "RIGHT456", "Camera B")
 
