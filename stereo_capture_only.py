@@ -2188,7 +2188,7 @@ class StereoCaptureOnlyApp:
         settings.pack(side=TOP, fill=X, pady=(5, 0))
 
         trigger_panel = ttk.Frame(settings, style="Panel.TFrame", padding=(6, 4))
-        trigger_panel.pack(side=LEFT, fill="y", padx=(0, 8))
+        trigger_panel.pack(side=LEFT, padx=(0, 8))
         ttk.Label(trigger_panel, text="触发", style="Panel.TLabel").grid(row=0, column=0, padx=(0, 4), pady=2)
         ttk.OptionMenu(
             trigger_panel,
