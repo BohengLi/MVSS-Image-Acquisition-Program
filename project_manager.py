@@ -81,6 +81,13 @@ def _relative_or_str(path: Path | None, root: Path) -> str | None:
         return str(path)
 
 
+def _manifest_path_label(path: Path, session_dir: Path) -> str:
+    try:
+        return str(path.relative_to(session_dir))
+    except ValueError:
+        return str(path)
+
+
 class ProjectManager:
     def __init__(self, root_dir: Path, config: dict[str, Any]):
         self.root_dir = root_dir
@@ -110,8 +117,10 @@ class ProjectManager:
         self.current_project_id = project_id
         self.current_project_name = name or f"Project {project_id}"
         project_dir = self.projects_root / project_id
-        (project_dir / "photos").mkdir(parents=True, exist_ok=True)
+        (project_dir / "left").mkdir(parents=True, exist_ok=True)
+        (project_dir / "right").mkdir(parents=True, exist_ok=True)
         (project_dir / "videos").mkdir(parents=True, exist_ok=True)
+        (project_dir / "calibration").mkdir(parents=True, exist_ok=True)
         (project_dir / "exports").mkdir(parents=True, exist_ok=True)
         self._write_project_json(project_dir, [])
         return project_dir
@@ -199,27 +208,35 @@ def write_data_manifest(
     camera_settings: dict[str, Any],
     environment: dict[str, Any],
     algorithm: str = "sha256",
+    scan_roots: list[Path] | None = None,
 ) -> dict[str, Any]:
     exports_dir = session_dir / "exports"
     exports_dir.mkdir(parents=True, exist_ok=True)
     csv_path = exports_dir / "file_manifest.csv"
     summary_path = exports_dir / "capture_summary.json"
     rows: list[dict[str, Any]] = []
-    for path in sorted(session_dir.rglob("*")):
-        if not path.is_file():
-            continue
-        if path == csv_path or path == summary_path:
-            continue
-        stat = path.stat()
-        rows.append(
-            {
-                "path": str(path.relative_to(session_dir)),
-                "size_bytes": stat.st_size,
-                "checksum_algorithm": "md5" if algorithm == "md5" else "sha256",
-                "checksum": _file_checksum(path, algorithm),
-                "modified_time": time.strftime("%Y-%m-%dT%H:%M:%S%z", time.localtime(stat.st_mtime)),
-            }
-        )
+    roots = scan_roots or [session_dir]
+    seen: set[Path] = set()
+    for root in roots:
+        for path in sorted(root.rglob("*")):
+            if not path.is_file():
+                continue
+            resolved = path.resolve()
+            if resolved in seen:
+                continue
+            seen.add(resolved)
+            if path == csv_path or path == summary_path:
+                continue
+            stat = path.stat()
+            rows.append(
+                {
+                    "path": _manifest_path_label(path, session_dir),
+                    "size_bytes": stat.st_size,
+                    "checksum_algorithm": "md5" if algorithm == "md5" else "sha256",
+                    "checksum": _file_checksum(path, algorithm),
+                    "modified_time": time.strftime("%Y-%m-%dT%H:%M:%S%z", time.localtime(stat.st_mtime)),
+                }
+            )
     with csv_path.open("w", newline="", encoding="utf-8-sig") as fh:
         writer = csv.DictWriter(
             fh,

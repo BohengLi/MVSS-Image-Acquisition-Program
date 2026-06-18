@@ -137,6 +137,9 @@ TITLE_FONT_SIZE = 12
 APP_TITLE_FONT_SIZE = 15
 INFO_FONT_SIZE = 9
 OVERLAY_FONT_SIZE = 10
+COMPACT_UI_FONT_SIZE = max(BASE_FONT_SIZE - 1, 8)
+STATUS_BAR_HEIGHT = 34
+STATUS_VERSION_WIDTH = max(len(APP_VERSION) + 2, 16)
 WINDOW_ASPECT_RATIO = 16 / 10
 TARGET_WINDOW_WIDTH = 1920
 TARGET_WINDOW_HEIGHT = 1200
@@ -148,8 +151,12 @@ CAMERA_ASPECT_RATIO = CAPTURE_WIDTH / CAPTURE_HEIGHT
 CAMERA_GAP = 18
 CAMERA_VERTICAL_PADDING = 0
 PARAM_SIDEBAR_WIDTH = 400
-QUALITY_MONITOR_MIN_HEIGHT = 300
-QUALITY_MONITOR_HIGH_RES_MIN_HEIGHT = 380
+MAGNIFIER_CANVAS_WIDTH = 320
+MAGNIFIER_CANVAS_HEIGHT = 72
+TASKBAR_RESERVED_HEIGHT = 96
+QUALITY_MONITOR_COMPACT_HEIGHT = 192
+QUALITY_MONITOR_HIGH_RES_COMPACT_HEIGHT = 232
+HISTOGRAM_CANVAS_HEIGHT = 92
 
 FramePair = tuple[CameraFrame | None, CameraFrame | None]
 LOGGER = logging.getLogger("mvss_capture")
@@ -159,37 +166,83 @@ _CONFIG_MISSING = object()
 TRIGGER_SOURCE_CN = {
     "Software": "软触发",
     "Continuous": "连续采集",
-    "Cascade": "硬触发级联",
-    "Line0": "外部硬触发",
+    "Cascade": "硬触发级联（无功能）",
+    "Line0": "外部硬触发（无功能）",
 }
 TRIGGER_SOURCE_FROM_CN = {v: k for k, v in TRIGGER_SOURCE_CN.items()}
-TRIGGER_SOURCE_CN_ORDER = ("软触发", "连续采集", "硬触发级联", "外部硬触发")
-
-def canonical_trigger_source(value: object) -> str:
-    text = str(value or "").strip()
-    return TRIGGER_SOURCE_FROM_CN.get(text, text)
-
-def display_trigger_source(value: object) -> str:
-    text = str(value or "").strip()
-    return TRIGGER_SOURCE_CN.get(text, text)
-
-DEFAULT_PREVIEW_FPS = 15.0
-DEFAULT_RECORD_QUEUE_SECONDS = 10.0
-RAW_FRAME_FORMATS = {"npy", "png16", "tiff16", "exr"}
-DIC_CAPTURE_MODE = "dic_capture"
-DIC_PIXEL_FORMATS = ("Mono16", "Mono12", "Mono10", "Mono8")
-DIC_CAPTURE_CONFIG = {
-    "trigger_source": "Cascade",
-    "trigger_activation": "RisingEdge",
-    "require_hardware_trigger": True,
-    "hardware_sync_enabled": True,
+TRIGGER_SOURCE_CN_ORDER = ("软触发", "连续采集", "硬触发级联（无功能）", "外部硬触发（无功能）")
+ENABLED_TRIGGER_SOURCES = {"Software", "Continuous"}
+DISABLED_TRIGGER_FALLBACK = "Software"
+TRIGGER_CONFIG_SAFE_DEFAULTS = {
+    "require_hardware_trigger": False,
+    "hardware_sync_enabled": False,
     "hardware_sync_master": "left",
     "hardware_sync_master_line": "Line2",
     "hardware_sync_master_line_source": "ExposureActive",
     "hardware_sync_slave_line": "Line0",
     "hardware_sync_slave_activation": "RisingEdge",
     "hardware_sync_master_trigger_source": "Software",
-    "pixel_format": "Mono16",
+}
+TRIGGER_CONFIG_KEYS = {"trigger_source", *TRIGGER_CONFIG_SAFE_DEFAULTS.keys()}
+
+def canonical_trigger_source(value: object) -> str:
+    text = str(value or "").strip()
+    return TRIGGER_SOURCE_FROM_CN.get(text, text)
+
+def safe_capture_trigger_source(value: object) -> str:
+    source = canonical_trigger_source(value)
+    return source if source in ENABLED_TRIGGER_SOURCES else DISABLED_TRIGGER_FALLBACK
+
+def safe_trigger_config(values: dict[str, object]) -> dict[str, object]:
+    normalized = dict(values)
+    normalized["trigger_source"] = safe_capture_trigger_source(normalized.get("trigger_source", DISABLED_TRIGGER_FALLBACK))
+    normalized.update(TRIGGER_CONFIG_SAFE_DEFAULTS)
+    return normalized
+
+def display_trigger_source(value: object) -> str:
+    text = canonical_trigger_source(value)
+    return TRIGGER_SOURCE_CN.get(text, text)
+
+DEFAULT_PREVIEW_FPS = 15.0
+DEFAULT_RECORD_QUEUE_SECONDS = 10.0
+RAW_FRAME_FORMATS = {"npy", "png16", "tiff16", "exr"}
+DIC_CAPTURE_MODE = "dic_capture"
+CAPTURE_PIXEL_FORMAT = "Mono8"
+CAMERA_ASSIGNMENT_AUTO = "自动"
+DIC_CAMERA_SETTING_KEYS = (
+    "exposure_auto",
+    "exposure_time_us",
+    "auto_exposure_lower_limit",
+    "auto_exposure_upper_limit",
+    "gain_auto",
+    "gain",
+    "auto_gain_lower_limit",
+    "auto_gain_upper_limit",
+    "roi_width",
+    "roi_height",
+    "roi_offset_x",
+    "roi_offset_y",
+    "left_roi_width",
+    "left_roi_height",
+    "left_roi_offset_x",
+    "left_roi_offset_y",
+    "right_roi_width",
+    "right_roi_height",
+    "right_roi_offset_x",
+    "right_roi_offset_y",
+)
+DIC_CAPTURE_CONFIG = {
+    "trigger_source": "Continuous",
+    "trigger_activation": "RisingEdge",
+    "require_hardware_trigger": False,
+    "hardware_sync_enabled": False,
+    "hardware_sync_master": "left",
+    "hardware_sync_master_line": "Line2",
+    "hardware_sync_master_line_source": "ExposureActive",
+    "hardware_sync_slave_line": "Line0",
+    "hardware_sync_slave_activation": "RisingEdge",
+    "hardware_sync_master_trigger_source": "Software",
+    "pixel_format": CAPTURE_PIXEL_FORMAT,
     "image_format": "png",
     "record_jpeg_quality": 100,
     "exposure_auto": "Off",
@@ -223,8 +276,8 @@ DIC_CAPTURE_CONFIG = {
     "record_preview_during_capture": True,
     "record_preview_fps": 2.0,
     "preview_quality_analysis_enabled": False,
-    "record_force_image_format": False,
-    "save_raw_frames": True,
+    "record_force_image_format": True,
+    "save_raw_frames": False,
     "raw_frame_format": "tiff16",
     "viewable_sidecar_enabled": True,
     "viewable_sidecar_format": "png",
@@ -241,6 +294,21 @@ DIC_CAPTURE_CONFIG = {
         },
     },
 }
+
+
+def mono8_capture_config(config: dict) -> dict:
+    normalized = dict(config)
+    normalized["pixel_format"] = CAPTURE_PIXEL_FORMAT
+    normalized["save_raw_frames"] = False
+    normalized["record_force_image_format"] = True
+    dic_capture = normalized.get("dic_capture")
+    if isinstance(dic_capture, dict):
+        dic_capture = dict(dic_capture)
+        dic_capture["pixel_format"] = CAPTURE_PIXEL_FORMAT
+        dic_capture["save_raw_frames"] = False
+        dic_capture["record_force_image_format"] = True
+        normalized["dic_capture"] = dic_capture
+    return normalized
 
 
 def default_presets() -> dict[str, dict[str, object]]:
@@ -262,10 +330,10 @@ def default_presets() -> dict[str, dict[str, object]]:
         "black_level": None,
         "digital_shift": None,
         "gamma": None,
-        "save_raw_frames": True,
+        "save_raw_frames": False,
         "raw_frame_format": "tiff16",
         "image_format": "png",
-        "record_force_image_format": False,
+        "record_force_image_format": True,
     }
     return {
         "室内低光": {
@@ -284,11 +352,11 @@ def default_presets() -> dict[str, dict[str, object]]:
             "balance_ratio_red": None,
             "balance_ratio_green": None,
             "balance_ratio_blue": None,
-            "pixel_format": "Mono16",
+            "pixel_format": "Mono8",
             "chunk_data_enabled": True,
             "chunk_selectors": ["Timestamp", "FrameCounter", "ExposureTime", "Gain"],
         },
-        "室外强光": {
+        "户外强光": {
             **common_roi,
             **scientific_defaults,
             "trigger_source": "Continuous",
@@ -304,27 +372,27 @@ def default_presets() -> dict[str, dict[str, object]]:
             "balance_ratio_red": None,
             "balance_ratio_green": None,
             "balance_ratio_blue": None,
-            "pixel_format": "Mono16",
+            "pixel_format": "Mono8",
             "chunk_data_enabled": True,
             "chunk_selectors": ["Timestamp", "FrameCounter", "ExposureTime", "Gain"],
         },
         "DIC 标准": {
             **common_roi,
             **scientific_defaults,
-            "trigger_source": "Cascade",
+            "trigger_source": "Continuous",
             "trigger_activation": "RisingEdge",
-            "require_hardware_trigger": True,
-            "hardware_sync_enabled": True,
+            "require_hardware_trigger": False,
+            "hardware_sync_enabled": False,
             "hardware_sync_master": "left",
             "hardware_sync_master_line": "Line2",
             "hardware_sync_master_line_source": "ExposureActive",
             "hardware_sync_slave_line": "Line0",
             "hardware_sync_slave_activation": "RisingEdge",
             "hardware_sync_master_trigger_source": "Software",
-            "pixel_format": "Mono16",
+            "pixel_format": "Mono8",
             "image_format": "png",
-            "record_force_image_format": False,
-            "save_raw_frames": True,
+            "record_force_image_format": True,
+            "save_raw_frames": False,
             "raw_frame_format": "tiff16",
             "record_save_image_sequence": True,
             "record_realtime_mp4": True,
@@ -573,6 +641,14 @@ def load_config() -> dict:
     if not isinstance(payload, dict):
         LOGGER.warning("config.json root is %s; starting with defaults.", type(payload).__name__)
         payload = {}
+    payload = mono8_capture_config(safe_trigger_config(payload))
+    if isinstance(payload.get("presets"), dict):
+        payload["presets"] = {
+            name: mono8_capture_config(safe_trigger_config(preset)) if isinstance(preset, dict) else preset
+            for name, preset in payload["presets"].items()
+        }
+    if isinstance(payload.get("dic_capture"), dict):
+        payload["dic_capture"] = mono8_capture_config(safe_trigger_config(payload["dic_capture"]))
     return ThreadSafeConfig(payload)
 
 
@@ -603,6 +679,16 @@ def optional_float_text(text: str) -> float | None:
 def optional_int_text(text: str) -> int | None:
     value = text.strip()
     if not value:
+        return None
+    return int(value)
+
+
+def optional_interval_limit_text(text: str) -> int | None:
+    value = str(text).strip()
+    if not value:
+        return None
+    lowered = value.lower()
+    if lowered in {"none", "null", "unlimited", "不限", "无限", "持续"}:
         return None
     return int(value)
 
@@ -843,15 +929,38 @@ def configure_tk_dpi_scaling(root: Tk) -> None:
         pass
 
 
+def available_screen_geometry(root: Tk) -> tuple[int, int, int, int]:
+    screen_width = max(int(root.winfo_screenwidth()), 1)
+    screen_height = max(int(root.winfo_screenheight()), 1)
+    if os.name == "nt":
+        try:
+            class RECT(ctypes.Structure):
+                _fields_ = [
+                    ("left", ctypes.c_long),
+                    ("top", ctypes.c_long),
+                    ("right", ctypes.c_long),
+                    ("bottom", ctypes.c_long),
+                ]
+
+            rect = RECT()
+            spi_getworkarea = 0x0030
+            if ctypes.windll.user32.SystemParametersInfoW(spi_getworkarea, 0, ctypes.byref(rect), 0):
+                width = max(int(rect.right - rect.left), 1)
+                height = max(int(rect.bottom - rect.top), 1)
+                return int(rect.left), int(rect.top), width, height
+        except Exception:
+            pass
+    return 0, 0, screen_width, max(screen_height - TASKBAR_RESERVED_HEIGHT, 1)
+
+
 def apply_responsive_window_geometry(root: Tk) -> None:
     try:
-        screen_width = max(int(root.winfo_screenwidth()), 1)
-        screen_height = max(int(root.winfo_screenheight()), 1)
+        work_x, work_y, screen_width, screen_height = available_screen_geometry(root)
         use_high_res = screen_width >= 2400 and screen_height >= 1500
         desired_width = HIGH_RES_WINDOW_WIDTH if use_high_res else TARGET_WINDOW_WIDTH
         desired_height = HIGH_RES_WINDOW_HEIGHT if use_high_res else TARGET_WINDOW_HEIGHT
         side_margin = 80 if use_high_res else 32
-        bottom_margin = 80 if use_high_res else 56
+        bottom_margin = 24 if use_high_res else 16
         available_width = max(1280, screen_width - side_margin)
         available_height = max(820, screen_height - bottom_margin)
         window_width = min(desired_width, available_width)
@@ -860,26 +969,31 @@ def apply_responsive_window_geometry(root: Tk) -> None:
             window_width = max(1280, int(window_height * WINDOW_ASPECT_RATIO))
         else:
             window_height = max(800, int(window_width / WINDOW_ASPECT_RATIO))
-        x = max((screen_width - window_width) // 2, 0)
-        y = max((screen_height - window_height) // 2, 0)
+        if window_height > available_height:
+            window_height = available_height
+            window_width = min(window_width, max(1280, int(window_height * WINDOW_ASPECT_RATIO)))
+        if window_width > available_width:
+            window_width = available_width
+            window_height = min(window_height, max(760, int(window_width / WINDOW_ASPECT_RATIO)))
+        x = work_x + max((screen_width - window_width) // 2, 0)
+        y = work_y + max((screen_height - bottom_margin - window_height) // 2, 0)
         min_width = min(MIN_WINDOW_WIDTH, max(1280, screen_width - side_margin))
-        min_height = min(MIN_WINDOW_HEIGHT, max(820, screen_height - bottom_margin))
+        min_height = min(MIN_WINDOW_HEIGHT - TASKBAR_RESERVED_HEIGHT, max(760, screen_height - bottom_margin))
         root.geometry(f"{window_width}x{window_height}+{x}+{y}")
         root.minsize(min_width, min_height)
-        root.after_idle(lambda: maximize_window(root))
     except Exception:
-        root.geometry(f"{TARGET_WINDOW_WIDTH}x{TARGET_WINDOW_HEIGHT}")
-        root.minsize(MIN_WINDOW_WIDTH, MIN_WINDOW_HEIGHT)
-        root.after_idle(lambda: maximize_window(root))
+        root.geometry(f"{TARGET_WINDOW_WIDTH}x{TARGET_WINDOW_HEIGHT - TASKBAR_RESERVED_HEIGHT}")
+        root.minsize(MIN_WINDOW_WIDTH, MIN_WINDOW_HEIGHT - TASKBAR_RESERVED_HEIGHT)
 
 
 def maximize_window(root: Tk) -> None:
     try:
-        root.state("zoomed")
+        work_x, work_y, screen_width, screen_height = available_screen_geometry(root)
+        root.geometry(f"{screen_width}x{screen_height}+{work_x}+{work_y}")
     except Exception:
         try:
             screen_width = max(int(root.winfo_screenwidth()), TARGET_WINDOW_WIDTH)
-            screen_height = max(int(root.winfo_screenheight()), TARGET_WINDOW_HEIGHT)
+            screen_height = max(int(root.winfo_screenheight()) - TASKBAR_RESERVED_HEIGHT, MIN_WINDOW_HEIGHT)
             root.geometry(f"{screen_width}x{screen_height}+0+0")
         except Exception:
             pass
@@ -1078,9 +1192,7 @@ class ZoomImagePane(Frame):
 
     def set_frame(self, frame: CameraFrame) -> None:
         self._last_image = frame.image if getattr(frame, "image", None) is not None else None
-        self.info_var.set(
-            f"{frame.width}x{frame.height}  Frame:{frame.frame_number}  CamTS:{frame.camera_timestamp}"
-        )
+        self.info_var.set(f"{frame.width}x{frame.height}  Frame:{frame.frame_number}")
         self._render()
 
     def set_display_image(self, image: Image.Image | None, info: str = "") -> None:
@@ -1230,16 +1342,33 @@ class ZoomImagePane(Frame):
         center_x = left + width / 2
         center_y = top + height / 2
         color = SUCCESS_COLOR
-        self.canvas.create_line(left, center_y, left + width, center_y, fill=color, width=1, tags=("guide",), stipple="gray50")
-        self.canvas.create_line(center_x, top, center_x, top + height, fill=color, width=1, tags=("guide",), stipple="gray50")
-        if self._guide_mode == "full":
+        if self._guide_mode in {"center", "full"}:
+            self.canvas.create_line(
+                left, center_y, left + width, center_y, fill=color, width=1, tags=("guide",), stipple="gray50"
+            )
+            self.canvas.create_line(
+                center_x, top, center_x, top + height, fill=color, width=1, tags=("guide",), stipple="gray50"
+            )
+        if self._guide_mode in {"grid", "full"}:
             for frac in (1 / 3, 2 / 3):
                 y = top + height * frac
+                x = left + width * frac
                 self.canvas.create_line(
                     left,
                     y,
                     left + width,
                     y,
+                    fill=color,
+                    width=1,
+                    dash=(6, 5),
+                    tags=("guide",),
+                    stipple="gray50",
+                )
+                self.canvas.create_line(
+                    x,
+                    top,
+                    x,
+                    top + height,
                     fill=color,
                     width=1,
                     dash=(6, 5),
@@ -1397,39 +1526,6 @@ class ZoomImagePane(Frame):
                     pass
         self._performance_bg_id = None
         self._performance_text_id = None
-        canvas_width = max(self.canvas.winfo_width(), 1)
-        canvas_height = max(self.canvas.winfo_height(), 1)
-        x = 10
-        y = max(canvas_height - 48, 10)
-        text_width = max(180, min(canvas_width - 20, 620))
-        text_height = 38 if "\n" in self._performance_text else 20
-        color = {"good": SUCCESS_COLOR, "warn": WARNING_COLOR, "bad": DANGER_COLOR}.get(
-            self._performance_status, SUCCESS_COLOR
-        )
-        if self._performance_bg_id is None:
-            self._performance_bg_id = self.canvas.create_rectangle(
-                x,
-                y,
-                x + text_width,
-                y + text_height,
-                fill=CANVAS_COLOR,
-                outline=BORDER_COLOR,
-                stipple="gray25",
-                tags=("performance",),
-            )
-            self._performance_text_id = self.canvas.create_text(
-                x + 7,
-                y + 5,
-                text=self._performance_text,
-                fill=color,
-                font=(MONO_FONT_FAMILY, max(8, OVERLAY_FONT_SIZE - 2), "bold"),
-                anchor="nw",
-                tags=("performance",),
-            )
-        else:
-            self.canvas.coords(self._performance_bg_id, x, y, x + text_width, y + text_height)
-            if self._performance_text_id is not None:
-                self.canvas.coords(self._performance_text_id, x + 7, y + 5)
         self._raise_overlays()
 
     def _on_mouse_press(self, event) -> None:
@@ -1602,12 +1698,17 @@ class ToolTip:
 
 class HistogramCanvas(ttk.Frame):
     def __init__(self, master: Tk | Frame, title: str):
-        super().__init__(master, style="Panel.TFrame", padding=(7, 5))
+        super().__init__(master, style="Panel.TFrame", padding=(4, 2))
         self.title = title
         self.histogram: list[float] | None = None
         ttk.Label(self, text=title, style="Panel.TLabel").pack(side=TOP, anchor="w")
         self.canvas = Canvas(
-            self, width=260, height=90, bg=CHART_COLOR, highlightthickness=1, highlightbackground=BORDER_COLOR
+            self,
+            width=260,
+            height=HISTOGRAM_CANVAS_HEIGHT,
+            bg=CHART_COLOR,
+            highlightthickness=1,
+            highlightbackground=BORDER_COLOR,
         )
         self.canvas.pack(side=TOP, fill=BOTH, expand=True)
         self.canvas.bind("<Configure>", self._on_configure)
@@ -1628,7 +1729,7 @@ class HistogramCanvas(ttk.Frame):
     def draw(self) -> None:
         self.canvas.delete("all")
         width = max(self.canvas.winfo_width(), 120)
-        height = max(self.canvas.winfo_height(), 80)
+        height = max(self.canvas.winfo_height(), 58)
         margin_left = 24
         margin_right = 8
         margin_top = 8
@@ -1716,16 +1817,21 @@ class StereoCaptureOnlyApp:
 
     def _config_snapshot(self) -> dict:
         if isinstance(self.config, ThreadSafeConfig):
-            return self.config.snapshot()
-        return dict(self.config)
+            return mono8_capture_config(safe_trigger_config(self.config.snapshot()))
+        return mono8_capture_config(safe_trigger_config(dict(self.config)))
 
     def _update_config(self, values: dict[str, object], *, save: bool = True) -> dict:
+        if any(key in values for key in TRIGGER_CONFIG_KEYS):
+            values = safe_trigger_config(values)
+        values = mono8_capture_config(values)
         if isinstance(self.config, ThreadSafeConfig):
             with self.config._lock:
                 self.config.update(values)
+                self.config.update(mono8_capture_config(self.config.snapshot()))
                 snapshot = self.config.snapshot()
         else:
             self.config.update(values)
+            self.config.update(mono8_capture_config(dict(self.config)))
             snapshot = dict(self.config)
         if save:
             save_config(snapshot)
@@ -1778,6 +1884,11 @@ class StereoCaptureOnlyApp:
         self.root.bind("<Escape>", self._on_escape_key)
 
         self.config = load_config()
+        self.config.update(
+            mono8_capture_config(
+                safe_trigger_config(self.config.snapshot() if isinstance(self.config, ThreadSafeConfig) else dict(self.config))
+            )
+        )
         setup_logging(self.config)
         self._ensure_default_full_resolution()
         self._ensure_recording_config_defaults()
@@ -1786,7 +1897,7 @@ class StereoCaptureOnlyApp:
         self._ensure_preset_config_defaults()
         self._ensure_project_config_defaults()
         self.project_manager = ProjectManager(resolve_output_root(self.config), self.config)
-        if self.project_manager.enabled and not self.project_manager.current_project_id:
+        if self.project_manager.enabled:
             self.project_manager.create_project()
             self.project_manager.sync_config(self.config)
             save_config(self.config)
@@ -1866,6 +1977,9 @@ class StereoCaptureOnlyApp:
         self.roi_editing = False
         self.focus_roi_editing = False
         self._last_device_status = "尚未刷新设备。"
+        self._available_cameras: list[object] = []
+        self._camera_assignment_choices: list[str] = [CAMERA_ASSIGNMENT_AUTO]
+        self._camera_choice_serials: dict[str, str] = {CAMERA_ASSIGNMENT_AUTO: ""}
         self._last_video_sides: list[str] = []
         self._last_quality_metrics: dict[str, object] | None = None
         self._last_left_frame_obj: CameraFrame | None = None
@@ -1932,6 +2046,8 @@ class StereoCaptureOnlyApp:
                 key = f"{side}_roi_{field}"
                 if self.config.get(key) in (None, ""):
                     self.config[key] = fallback
+        self.config["right_roi_width"] = self.config.get("left_roi_width", self.config["roi_width"])
+        self.config["right_roi_height"] = self.config.get("left_roi_height", self.config["roi_height"])
 
     def _ensure_config_section(self, key: str) -> dict[str, object]:
         section = self.config.get(key)
@@ -1945,6 +2061,8 @@ class StereoCaptureOnlyApp:
         default_preset = "室内低光" if "室内低光" in presets else next(iter(presets), "室内低光")
         self.preset_var = StringVar(value=default_preset)
         self.trigger_source_var = StringVar(value=display_trigger_source(self.config.get("trigger_source", "Software")))
+        self.left_camera_var = StringVar(value=CAMERA_ASSIGNMENT_AUTO)
+        self.right_camera_var = StringVar(value=CAMERA_ASSIGNMENT_AUTO)
         self.exposure_auto_var = StringVar(value=str(self.config.get("exposure_auto", "Off")))
         self.exposure_time_var = StringVar(value=str(self.config.get("exposure_time_us", 10000.0)))
         self.auto_exposure_lower_var = StringVar(value=optional_config_text(self.config, "auto_exposure_lower_limit", "100.0"))
@@ -1966,8 +2084,8 @@ class StereoCaptureOnlyApp:
         self.left_roi_height_var = StringVar(value=str(self.config.get("left_roi_height", self.config.get("roi_height", CAPTURE_HEIGHT))))
         self.left_roi_offset_x_var = StringVar(value=str(self.config.get("left_roi_offset_x", self.config.get("roi_offset_x", 0))))
         self.left_roi_offset_y_var = StringVar(value=str(self.config.get("left_roi_offset_y", self.config.get("roi_offset_y", 0))))
-        self.right_roi_width_var = StringVar(value=str(self.config.get("right_roi_width", self.config.get("roi_width", CAPTURE_WIDTH))))
-        self.right_roi_height_var = StringVar(value=str(self.config.get("right_roi_height", self.config.get("roi_height", CAPTURE_HEIGHT))))
+        self.right_roi_width_var = StringVar(value=str(self.config.get("left_roi_width", self.config.get("roi_width", CAPTURE_WIDTH))))
+        self.right_roi_height_var = StringVar(value=str(self.config.get("left_roi_height", self.config.get("roi_height", CAPTURE_HEIGHT))))
         self.right_roi_offset_x_var = StringVar(value=str(self.config.get("right_roi_offset_x", self.config.get("roi_offset_x", 0))))
         self.right_roi_offset_y_var = StringVar(value=str(self.config.get("right_roi_offset_y", self.config.get("roi_offset_y", 0))))
         self.interval_seconds_var = StringVar(value=optional_config_text(self.config, "interval_capture_seconds", "5.0"))
@@ -1981,16 +2099,13 @@ class StereoCaptureOnlyApp:
             else DIC_CAPTURE_CONFIG["record_fps"]
         )
         self.dic_record_fps_var = StringVar(value=str(dic_record_fps))
-        dic_pixel_format = (
-            str(dic_section.get("pixel_format", DIC_CAPTURE_CONFIG["pixel_format"]))
-            if isinstance(dic_section, dict)
-            else str(DIC_CAPTURE_CONFIG["pixel_format"])
-        )
-        self.dic_pixel_format_var = StringVar(value=dic_pixel_format if dic_pixel_format in DIC_PIXEL_FORMATS else "Mono16")
         self.record_max_seconds_var = StringVar(value=optional_config_text(self.config, "record_max_seconds", "0"))
         exposure_monitor = self._ensure_config_section("exposure_monitor")
         self.preview_quality_analysis_var = BooleanVar(
             value=config_bool(self.config, "preview_quality_analysis_enabled", True, True)
+        )
+        self.focus_realtime_analysis_var = BooleanVar(
+            value=config_bool(self.config, "focus_realtime_analysis_enabled", True, True)
         )
         self.focus_peaking_var = BooleanVar(value=False)
         self.zebra_var = BooleanVar(value=bool(exposure_monitor.get("zebra_enabled", False)))
@@ -2025,6 +2140,9 @@ class StereoCaptureOnlyApp:
         )
         self.focus_score_var = StringVar(value="对焦 --")
         self.focus_detail_var = StringVar(value="L: -- | R: -- | Δ: --")
+        self.focus_left_score_var = StringVar(value="--")
+        self.focus_right_score_var = StringVar(value="--")
+        self.focus_delta_var = StringVar(value="--")
         self.focus_status_var = StringVar(value="未标定")
         self.focus_roi_var = StringVar(value=self._format_focus_roi())
         self.exposure_status_var = StringVar(value="过曝: -- | 欠曝: -- | SNR: --")
@@ -2036,7 +2154,10 @@ class StereoCaptureOnlyApp:
         self.guide_mode_var = StringVar(value="关闭")
         self.mp4_progress_var = StringVar(value="MP4 --")
         self._focus_peaking_enabled_setting = bool(self.focus_peaking_var.get())
+        self._focus_realtime_analysis_enabled_setting = bool(self.focus_realtime_analysis_var.get())
         self._histogram_enabled_setting = bool(self.histogram_enabled_var.get())
+        if self.project_manager.enabled:
+            self.save_dir_var.set(str(self.project_manager.active_project_dir))
 
     def _build_ui(self) -> None:
         toolbar = ttk.Frame(self.root, style="Toolbar.TFrame", padding=(12, 6, 12, 5))
@@ -2103,7 +2224,7 @@ class StereoCaptureOnlyApp:
         settings.pack(side=TOP, fill=X, pady=(5, 0))
 
         trigger_panel = ttk.Frame(settings, style="Panel.TFrame", padding=(6, 4))
-        trigger_panel.pack(side=LEFT, fill="y", padx=(0, 8))
+        trigger_panel.pack(side=LEFT, padx=(0, 8))
         ttk.Label(trigger_panel, text="触发", style="Panel.TLabel").grid(row=0, column=0, padx=(0, 4), pady=2)
         ttk.OptionMenu(
             trigger_panel,
@@ -2153,37 +2274,35 @@ class StereoCaptureOnlyApp:
         )
         self.dic_capture_button.grid(row=0, column=12, padx=(0, 4), pady=2)
         self.dic_record_fps_entry = self._labeled_entry(interval_panel, "DIC fps", self.dic_record_fps_var, 6, 0, 13)
-        ttk.Label(interval_panel, text="输出", style="Panel.TLabel", anchor="e").grid(
-            row=0, column=15, padx=(4, 1), pady=1, sticky="e"
-        )
-        self.dic_pixel_format_menu = ttk.OptionMenu(
-            interval_panel,
-            self.dic_pixel_format_var,
-            self.dic_pixel_format_var.get(),
-            *DIC_PIXEL_FORMATS,
-        )
-        self.dic_pixel_format_menu.grid(row=0, column=16, padx=(0, 2), pady=1, sticky="ew")
 
-        info = ttk.Frame(toolbar, style="InfoBar.TFrame", padding=(8, 4))
-        info.pack(side=TOP, fill=X, pady=(5, 0))
-        ttk.Label(info, text="Project", style="InfoLabel.TLabel").pack(side=LEFT, padx=(0, 4))
-        ttk.Label(info, textvariable=self.project_id_var, style="InfoValue.TLabel").pack(side=LEFT, padx=(0, 18))
-        ttk.Label(info, textvariable=self.calibration_summary_var, style="InfoValue.TLabel").pack(
-            side=LEFT, padx=(0, 18)
+        assignment_panel = ttk.Frame(settings, style="Panel.TFrame", padding=(6, 4))
+        assignment_panel.pack(side=LEFT, fill="y", padx=(8, 0))
+        ttk.Label(assignment_panel, text="画面分配", style="Panel.TLabel").grid(
+            row=0, column=0, columnspan=4, padx=(0, 4), pady=2, sticky="w"
         )
-        ttk.Label(info, textvariable=self.temperature_status_var, style="InfoValue.TLabel").pack(
-            side=LEFT, padx=(0, 18)
+        ttk.Label(assignment_panel, text="左", style="Panel.TLabel").grid(row=1, column=0, padx=(0, 2), pady=1)
+        self.left_camera_menu = ttk.OptionMenu(
+            assignment_panel,
+            self.left_camera_var,
+            self.left_camera_var.get(),
+            CAMERA_ASSIGNMENT_AUTO,
+            command=lambda _value: self._on_camera_assignment_changed(),
         )
-        ttk.Label(info, text="保存路径", style="InfoLabel.TLabel").pack(side=LEFT, padx=(0, 4))
-        ttk.Label(info, textvariable=self.save_dir_var, style="InfoValue.TLabel").pack(side=LEFT, fill=X, expand=True)
-        self.mp4_progress_label = ttk.Label(info, textvariable=self.mp4_progress_var, style="InfoValue.TLabel")
-        self.mp4_progress = ttk.Progressbar(
-            info,
-            mode="determinate",
-            maximum=100,
-            length=180,
-            style="Green.Horizontal.TProgressbar",
+        self.left_camera_menu.grid(row=1, column=1, padx=(0, 6), pady=1, sticky="ew")
+        ttk.Label(assignment_panel, text="右", style="Panel.TLabel").grid(row=1, column=2, padx=(0, 2), pady=1)
+        self.right_camera_menu = ttk.OptionMenu(
+            assignment_panel,
+            self.right_camera_var,
+            self.right_camera_var.get(),
+            CAMERA_ASSIGNMENT_AUTO,
+            command=lambda _value: self._on_camera_assignment_changed(),
         )
+        self.right_camera_menu.grid(row=1, column=3, pady=1, sticky="ew")
+        assignment_panel.grid_columnconfigure(1, minsize=126, weight=1)
+        assignment_panel.grid_columnconfigure(3, minsize=126, weight=1)
+        self._sync_camera_assignment_controls()
+
+        self._build_status_bar()
 
         content = DualCameraStrip(
             self.root,
@@ -2207,7 +2326,7 @@ class StereoCaptureOnlyApp:
         param_header = ttk.Frame(self.param_panel, style="Toolbar.TFrame")
         param_header.pack(side=TOP, fill=X)
         ttk.Label(param_header, text="参数设置", style="ParamTitle.TLabel").pack(side=LEFT, padx=(0, 8))
-        ttk.Label(param_header, text="曝光/增益/白平衡/ROI", style="HeaderMeta.TLabel").pack(side=LEFT)
+        ttk.Label(param_header, text="采集参数 / 图像校正 / ROI", style="HeaderMeta.TLabel").pack(side=LEFT)
 
         self.param_panel_body = ttk.Frame(self.param_panel, style="Toolbar.TFrame")
         param_panel = self.param_panel_body
@@ -2216,23 +2335,31 @@ class StereoCaptureOnlyApp:
         gain_panel = ttk.Frame(param_panel, style="Panel.TFrame", padding=(4, 2))
         gain_panel.grid(row=0, column=0, sticky="ew", padx=0, pady=(0, 4))
         self._configure_parameter_grid(gain_panel)
-        ttk.Label(gain_panel, text="增 益", style="Panel.TLabel").grid(row=0, column=0, padx=(0, 5), pady=1, sticky="w")
+        ttk.Label(gain_panel, text="增益", style="PanelSection.TLabel").grid(
+            row=0, column=0, columnspan=2, padx=(0, 5), pady=1, sticky="w"
+        )
+        ttk.Label(gain_panel, text="模式", style="Panel.TLabel", anchor="e").grid(
+            row=0, column=2, padx=(2, 1), pady=1, sticky="e"
+        )
         ttk.OptionMenu(gain_panel, self.gain_auto_var, self.gain_auto_var.get(), "Off", "Once", "Continuous").grid(
-            row=0, column=1, columnspan=2, padx=2, pady=1, sticky="w"
+            row=0, column=3, columnspan=2, padx=2, pady=1, sticky="w"
         )
         gain_panel.grid_columnconfigure(4, weight=1)
         gain_panel.grid_columnconfigure(5, minsize=70, weight=0)
         self.apply_gain_button = ttk.Button(gain_panel, text="应用", command=self.apply_gain_settings, state=DISABLED, width=6)
         self.apply_gain_button.grid(row=0, column=5, padx=(6, 0), pady=1, sticky="e")
-        self._labeled_entry(gain_panel, "值", self.gain_var, 4, 1, 0)
-        self._labeled_entry(gain_panel, "下限", self.auto_gain_lower_var, 4, 1, 2)
-        self._labeled_entry(gain_panel, "上限", self.auto_gain_upper_var, 4, 1, 4)
+        self._labeled_entry(gain_panel, "手动", self.gain_var, 5, 1, 0, stretch=False, label_width=4)
+        self._labeled_entry(gain_panel, "下限", self.auto_gain_lower_var, 5, 1, 2, stretch=False, label_width=4)
+        self._labeled_entry(gain_panel, "上限", self.auto_gain_upper_var, 5, 1, 4, stretch=False, label_width=4)
 
         exposure_panel = ttk.Frame(param_panel, style="Panel.TFrame", padding=(4, 2))
         exposure_panel.grid(row=1, column=0, sticky="ew", padx=0, pady=(0, 4))
         self._configure_parameter_grid(exposure_panel)
-        ttk.Label(exposure_panel, text="曝 光", style="Panel.TLabel").grid(
-            row=0, column=0, padx=(0, 5), pady=1, sticky="w"
+        ttk.Label(exposure_panel, text="曝光", style="PanelSection.TLabel").grid(
+            row=0, column=0, columnspan=2, padx=(0, 5), pady=1, sticky="w"
+        )
+        ttk.Label(exposure_panel, text="模式", style="Panel.TLabel", anchor="e").grid(
+            row=0, column=2, padx=(2, 1), pady=1, sticky="e"
         )
         ttk.OptionMenu(
             exposure_panel,
@@ -2241,22 +2368,29 @@ class StereoCaptureOnlyApp:
             "Off",
             "Once",
             "Continuous",
-        ).grid(row=0, column=1, columnspan=2, padx=2, pady=1, sticky="w")
+        ).grid(row=0, column=3, columnspan=2, padx=2, pady=1, sticky="w")
         exposure_panel.grid_columnconfigure(4, weight=1)
         exposure_panel.grid_columnconfigure(5, minsize=70, weight=0)
         self.apply_exposure_button = ttk.Button(
             exposure_panel, text="应用", command=self.apply_exposure_settings, state=DISABLED, width=6
         )
         self.apply_exposure_button.grid(row=0, column=5, padx=(6, 0), pady=1, sticky="e")
-        self._labeled_entry(exposure_panel, "us", self.exposure_time_var, 9, 1, 0)
-        self._labeled_entry(exposure_panel, "下限", self.auto_exposure_lower_var, 9, 1, 2)
-        self._labeled_entry(exposure_panel, "上限", self.auto_exposure_upper_var, 9, 1, 4)
+        self._labeled_entry(exposure_panel, "时间", self.exposure_time_var, 7, 1, 0, stretch=False, label_width=4)
+        self._labeled_entry(
+            exposure_panel, "下限", self.auto_exposure_lower_var, 7, 1, 2, stretch=False, label_width=4
+        )
+        self._labeled_entry(
+            exposure_panel, "上限", self.auto_exposure_upper_var, 7, 1, 4, stretch=False, label_width=4
+        )
 
         wb_panel = ttk.Frame(param_panel, style="Panel.TFrame", padding=(4, 2))
         wb_panel.grid(row=2, column=0, sticky="ew", padx=0, pady=(0, 4))
         self._configure_parameter_grid(wb_panel)
-        ttk.Label(wb_panel, text="白平衡", style="Panel.TLabel").grid(
-            row=0, column=0, padx=(0, 5), pady=1, sticky="w"
+        ttk.Label(wb_panel, text="白平衡", style="PanelSection.TLabel").grid(
+            row=0, column=0, columnspan=2, padx=(0, 5), pady=1, sticky="w"
+        )
+        ttk.Label(wb_panel, text="模式", style="Panel.TLabel", anchor="e").grid(
+            row=0, column=2, padx=(2, 1), pady=1, sticky="e"
         )
         ttk.OptionMenu(
             wb_panel,
@@ -2265,7 +2399,7 @@ class StereoCaptureOnlyApp:
             "Off",
             "Once",
             "Continuous",
-        ).grid(row=0, column=1, columnspan=2, padx=2, pady=1, sticky="w")
+        ).grid(row=0, column=3, columnspan=2, padx=2, pady=1, sticky="w")
         wb_panel.grid_columnconfigure(4, weight=1)
         wb_panel.grid_columnconfigure(5, minsize=70, weight=0)
         self.apply_wb_button = ttk.Button(
@@ -2273,27 +2407,37 @@ class StereoCaptureOnlyApp:
         )
         self.apply_wb_button.grid(row=0, column=5, padx=(6, 0), pady=1, sticky="e")
 
+        wb_values = ttk.Frame(wb_panel, style="Panel.TFrame")
+        wb_values.grid(row=1, column=0, columnspan=6, sticky="ew", pady=(1, 0))
+        for column in range(3):
+            wb_values.grid_columnconfigure(column, weight=1, uniform="white_balance")
         for index, (label, variable) in enumerate(
             (("R", self.balance_red_var), ("G", self.balance_green_var), ("B", self.balance_blue_var))
         ):
-            col = index * 2
-            ttk.Label(wb_panel, text=label, style="Panel.TLabel", anchor="e").grid(
-                row=1, column=col, padx=(2, 2), pady=1, sticky="e"
+            group = ttk.Frame(wb_values, style="Panel.TFrame")
+            group.grid(row=0, column=index, padx=(0, 6 if index < 2 else 0), sticky="ew")
+            group.grid_columnconfigure(1, weight=1)
+            ttk.Label(group, text=label, style="Panel.TLabel", anchor="e", width=2).grid(
+                row=0, column=0, padx=(0, 2), pady=1, sticky="e"
             )
-            ttk.Entry(wb_panel, textvariable=variable, width=7).grid(
-                row=1, column=col + 1, padx=(0, 6), pady=1, sticky="w"
+            ttk.Entry(group, textvariable=variable, width=7).grid(
+                row=0, column=1, pady=1, sticky="ew"
             )
 
         correction_panel = ttk.Frame(param_panel, style="Panel.TFrame", padding=(4, 2))
         correction_panel.grid(row=3, column=0, sticky="ew", padx=0, pady=(0, 4))
-        self._configure_parameter_grid(correction_panel)
-        for column in (1, 3, 5):
-            correction_panel.grid_columnconfigure(column, minsize=46, weight=0)
-        ttk.Label(correction_panel, text="图像校正", style="Panel.TLabel").grid(
-            row=0, column=0, padx=(0, 5), pady=1, sticky="w"
+        for column, width in {0: 74, 1: 44, 2: 40, 3: 44, 4: 52, 5: 44}.items():
+            correction_panel.grid_columnconfigure(column, minsize=width, weight=0)
+        correction_panel.grid_columnconfigure(6, weight=1)
+        ttk.Label(correction_panel, text="图像校正", style="PanelSection.TLabel").grid(
+            row=0, column=0, columnspan=3, padx=(0, 5), pady=1, sticky="w"
         )
+        self.apply_correction_button = ttk.Button(
+            correction_panel, text="应用", command=self.apply_image_correction_settings, state=DISABLED, width=6
+        )
+        self.apply_correction_button.grid(row=0, column=4, columnspan=3, padx=(6, 0), pady=1, sticky="e")
         for index, (label, variable) in enumerate(
-            (("Black", self.black_level_var), ("Shift", self.digital_shift_var), ("Gamma", self.gamma_var))
+            (("Black Level", self.black_level_var), ("Shift", self.digital_shift_var), ("Gamma", self.gamma_var))
         ):
             col = index * 2
             ttk.Label(correction_panel, text=label, style="Panel.TLabel", anchor="e").grid(
@@ -2302,65 +2446,102 @@ class StereoCaptureOnlyApp:
             ttk.Entry(correction_panel, textvariable=variable, width=4).grid(
                 row=1, column=col + 1, padx=(0, 2), pady=1, sticky="w"
             )
-        self.apply_correction_button = ttk.Button(
-            correction_panel, text="应用", command=self.apply_image_correction_settings, state=DISABLED, width=6
-        )
-        self.apply_correction_button.grid(row=1, column=6, padx=(6, 0), pady=1, sticky="e")
 
         roi_panel = ttk.Frame(param_panel, style="Panel.TFrame", padding=(4, 2))
         roi_panel.grid(row=4, column=0, sticky="ew", padx=0)
-        self._configure_parameter_grid(roi_panel)
-        ttk.Label(roi_panel, text="ROI", style="Panel.TLabel").grid(
-            row=0, column=0, columnspan=4, padx=(0, 5), pady=1, sticky="w"
+        for column, width in {0: 20, 1: 18, 2: 40, 3: 18, 4: 40, 5: 18, 6: 40, 7: 18, 8: 40}.items():
+            roi_panel.grid_columnconfigure(column, minsize=width, weight=0)
+        roi_panel.grid_columnconfigure(9, weight=1)
+        ttk.Label(roi_panel, text="ROI裁剪", style="PanelSection.TLabel").grid(
+            row=0, column=0, columnspan=2, padx=(0, 5), pady=1, sticky="w"
         )
-        def grid_roi_entry(label: str, variable: StringVar, row: int, column: int) -> None:
-            ttk.Label(roi_panel, text=label, style="Panel.TLabel", anchor="e").grid(
-                row=row, column=column, padx=(4, 1), pady=1, sticky="e"
-            )
-            ttk.Entry(roi_panel, textvariable=variable, width=6).grid(
-                row=row, column=column + 1, padx=(0, 2), pady=1, sticky="w"
-            )
+        self.edit_roi_button = ttk.Button(roi_panel, text="框选", command=self.toggle_roi_edit_mode, width=8)
+        self.edit_roi_button.grid(row=0, column=2, columnspan=2, padx=(0, 4), pady=1, sticky="ew")
+        self.reset_roi_button = ttk.Button(roi_panel, text="满幅", command=self.reset_roi_settings, width=5)
+        self.reset_roi_button.grid(row=0, column=4, columnspan=2, padx=(0, 4), pady=1, sticky="ew")
+        self.apply_roi_button = ttk.Button(roi_panel, text="应用", command=self.apply_roi_settings, state=DISABLED, width=5)
+        self.apply_roi_button.grid(row=0, column=6, columnspan=2, padx=(0, 0), pady=1, sticky="ew")
 
-        ttk.Label(roi_panel, text="左", style="Panel.TLabel").grid(row=1, column=0, padx=(0, 3), pady=1, sticky="w")
-        grid_roi_entry("W", self.left_roi_width_var, 1, 1)
-        grid_roi_entry("H", self.left_roi_height_var, 1, 3)
-        grid_roi_entry("X", self.left_roi_offset_x_var, 2, 1)
-        grid_roi_entry("Y", self.left_roi_offset_y_var, 2, 3)
-        ttk.Label(roi_panel, text="右", style="Panel.TLabel").grid(row=3, column=0, padx=(0, 3), pady=1, sticky="w")
-        grid_roi_entry("W", self.right_roi_width_var, 3, 1)
-        grid_roi_entry("H", self.right_roi_height_var, 3, 3)
-        grid_roi_entry("X", self.right_roi_offset_x_var, 4, 1)
-        grid_roi_entry("Y", self.right_roi_offset_y_var, 4, 3)
-        self.edit_roi_button = ttk.Button(roi_panel, text="框选ROI", command=self.toggle_roi_edit_mode)
-        self.edit_roi_button.grid(row=5, column=0, columnspan=2, padx=(0, 6), pady=(4, 1), sticky="ew")
-        self.reset_roi_button = ttk.Button(roi_panel, text="重置", command=self.reset_roi_settings)
-        self.reset_roi_button.grid(row=5, column=2, padx=(0, 6), pady=(4, 1), sticky="ew")
-        self.apply_roi_button = ttk.Button(roi_panel, text="应用", command=self.apply_roi_settings, state=DISABLED)
-        self.apply_roi_button.grid(row=5, column=3, padx=(0, 6), pady=(4, 1), sticky="ew")
+        roi_values = ttk.Frame(roi_panel, style="Panel.TFrame")
+        roi_values.grid(row=1, column=0, columnspan=10, sticky="ew", pady=(1, 0))
+        roi_values.grid_columnconfigure(0, minsize=20, weight=0)
+        for column in range(1, 5):
+            roi_values.grid_columnconfigure(column, weight=1, uniform="roi_field")
+
+        def grid_roi_entry(label: str, variable: StringVar, row: int, column: int, *, readonly: bool = False) -> None:
+            group = ttk.Frame(roi_values, style="Panel.TFrame")
+            group.grid(row=row, column=column, padx=(0, 3 if column < 4 else 0), sticky="ew")
+            group.grid_columnconfigure(0, minsize=16, weight=0)
+            group.grid_columnconfigure(1, weight=1)
+            ttk.Label(group, text=label, style="Panel.TLabel", anchor="e", width=2).grid(
+                row=0, column=0, padx=(0, 2), pady=1, sticky="e"
+            )
+            ttk.Entry(
+                group,
+                textvariable=variable,
+                width=4,
+                font=(MONO_FONT_FAMILY, max(BASE_FONT_SIZE - 1, 8)),
+                state="readonly" if readonly else NORMAL,
+            ).grid(row=0, column=1, pady=1, sticky="ew")
+
+        ttk.Label(roi_values, text="左", style="Panel.TLabel").grid(row=0, column=0, padx=(0, 3), pady=1, sticky="w")
+        grid_roi_entry("W", self.left_roi_width_var, 0, 1)
+        grid_roi_entry("H", self.left_roi_height_var, 0, 2)
+        grid_roi_entry("X", self.left_roi_offset_x_var, 0, 3)
+        grid_roi_entry("Y", self.left_roi_offset_y_var, 0, 4)
+        ttk.Label(roi_values, text="右", style="Panel.TLabel").grid(row=1, column=0, padx=(0, 3), pady=1, sticky="w")
+        grid_roi_entry("W", self.right_roi_width_var, 1, 1, readonly=True)
+        grid_roi_entry("H", self.right_roi_height_var, 1, 2, readonly=True)
+        grid_roi_entry("X", self.right_roi_offset_x_var, 1, 3)
+        grid_roi_entry("Y", self.right_roi_offset_y_var, 1, 4)
         self.param_panel_body.pack(side=TOP, fill=X, pady=(5, 0))
 
         self.quality_panel = ttk.Frame(self.root, style="Toolbar.TFrame", padding=(12, 0, 12, 0))
         self.quality_panel.pack(side=TOP, fill=BOTH, expand=True)
         self._build_quality_panels(self.quality_panel)
 
-        ttk.Separator(self.root, orient="horizontal").pack(side=TOP, fill=X)
-        status_bar = ttk.Frame(self.root, style="StatusBar.TFrame")
-        status_bar.pack(side=BOTTOM, fill=X)
+    def _build_status_bar(self) -> None:
+        self.status_bar = ttk.Frame(self.root, style="StatusBar.TFrame", height=STATUS_BAR_HEIGHT)
+        self.status_bar.pack(side=BOTTOM, fill=X)
+        self.status_bar.grid_propagate(False)
+        self.status_separator = ttk.Separator(self.root, orient="horizontal")
+        self.status_separator.pack(side=BOTTOM, fill=X)
+        self.status_bar.grid_columnconfigure(0, weight=1)
+        self.status_bar.grid_columnconfigure(1, weight=0, minsize=96)
+        self.status_bar.grid_columnconfigure(2, weight=0, minsize=180)
+        self.status_bar.grid_columnconfigure(3, weight=0, minsize=STATUS_VERSION_WIDTH * 9)
+        self.status_bar.grid_rowconfigure(0, weight=1)
         self.status_label = ttk.Label(
-            status_bar,
+            self.status_bar,
             textvariable=self.status_var,
             style="Status.TLabel",
             anchor="w",
             padding=(8, 4),
         )
-        self.status_label.pack(side=LEFT, fill=X, expand=True)
-        ttk.Label(
-            status_bar,
+        self.status_label.grid(row=0, column=0, sticky="ew")
+        self.mp4_progress_label = ttk.Label(
+            self.status_bar,
+            textvariable=self.mp4_progress_var,
+            style="Status.TLabel",
+            anchor="e",
+            padding=(0, 4),
+        )
+        self.mp4_progress = ttk.Progressbar(
+            self.status_bar,
+            mode="determinate",
+            maximum=100,
+            length=170,
+            style="Green.Horizontal.TProgressbar",
+        )
+        self.status_version_label = ttk.Label(
+            self.status_bar,
             text=APP_VERSION,
             style="StatusVersion.TLabel",
             anchor="e",
             padding=(8, 4),
-        ).pack(side=RIGHT)
+            width=STATUS_VERSION_WIDTH,
+        )
+        self.status_version_label.grid(row=0, column=3, sticky="e")
 
     def _configure_style(self) -> None:
         self.style = ttk.Style()
@@ -2395,7 +2576,25 @@ class StereoCaptureOnlyApp:
             "CompactPanel.TLabel",
             background=PANEL_COLOR,
             foreground=TEXT_COLOR,
-            font=(FONT_FAMILY, max(BASE_FONT_SIZE - 1, 8)),
+            font=(FONT_FAMILY, COMPACT_UI_FONT_SIZE),
+        )
+        self.style.configure(
+            "PanelSection.TLabel",
+            background=PANEL_COLOR,
+            foreground=SUBTLE_TEXT_COLOR,
+            font=(FONT_FAMILY, COMPACT_UI_FONT_SIZE, "bold"),
+        )
+        self.style.configure(
+            "PanelMetricValue.TLabel",
+            background=PANEL_COLOR,
+            foreground=ACCENT_ACTIVE_COLOR,
+            font=(MONO_FONT_FAMILY, BASE_FONT_SIZE, "bold"),
+        )
+        self.style.configure(
+            "PanelMetricMuted.TLabel",
+            background=PANEL_COLOR,
+            foreground=MUTED_TEXT_COLOR,
+            font=(MONO_FONT_FAMILY, max(BASE_FONT_SIZE - 1, 8)),
         )
         self.style.configure(
             "AppTitle.TLabel",
@@ -2539,6 +2738,11 @@ class StereoCaptureOnlyApp:
         )
         self.style.configure("Utility.TButton", padding=(9, 4))
         self.style.configure(
+            "Compact.TButton",
+            font=(FONT_FAMILY, COMPACT_UI_FONT_SIZE),
+            padding=(6, 2),
+        )
+        self.style.configure(
             "Danger.TButton",
             background="#2a1d21",
             foreground="#ffb4b4",
@@ -2574,6 +2778,11 @@ class StereoCaptureOnlyApp:
             foreground=[("disabled", SUBTLE_TEXT_COLOR)],
         )
         self.style.configure(
+            "Compact.TMenubutton",
+            font=(FONT_FAMILY, COMPACT_UI_FONT_SIZE),
+            padding=(5, 2),
+        )
+        self.style.configure(
             "TCheckbutton",
             background=PANEL_COLOR,
             foreground=TEXT_COLOR,
@@ -2586,6 +2795,11 @@ class StereoCaptureOnlyApp:
             background=[("active", PANEL_COLOR)],
             foreground=[("disabled", SUBTLE_TEXT_COLOR)],
             indicatorcolor=[("selected", ACCENT_COLOR), ("disabled", "#252c34")],
+        )
+        self.style.configure(
+            "Compact.TCheckbutton",
+            font=(FONT_FAMILY, COMPACT_UI_FONT_SIZE),
+            padding=(1, 0),
         )
         self.style.configure(
             "Toolbar.TLabelframe",
@@ -2655,20 +2869,20 @@ class StereoCaptureOnlyApp:
     def _build_quality_panels(self, parent: ttk.Frame) -> None:
         parent.grid_columnconfigure(0, weight=7, uniform="quality_panels")
         parent.grid_columnconfigure(1, weight=4, uniform="quality_panels")
-        monitor_height = QUALITY_MONITOR_MIN_HEIGHT
+        monitor_height = QUALITY_MONITOR_COMPACT_HEIGHT
         try:
             if int(self.root.winfo_screenheight()) >= 1200:
-                monitor_height = QUALITY_MONITOR_HIGH_RES_MIN_HEIGHT
+                monitor_height = QUALITY_MONITOR_HIGH_RES_COMPACT_HEIGHT
         except Exception:
             pass
         parent.grid_rowconfigure(0, minsize=monitor_height, weight=1)
         parent.grid_rowconfigure(1, weight=0)
 
-        self.focus_panel = ttk.LabelFrame(parent, text="对焦辅助", padding=(6, 4))
+        self.focus_panel = ttk.LabelFrame(parent, text="对焦辅助", padding=(5, 3))
         self.focus_panel.grid(row=0, column=0, sticky="nsew", padx=(0, 5), pady=(0, 5))
         self._build_focus_panel(self.focus_panel)
 
-        self.exposure_panel = ttk.LabelFrame(parent, text="曝光监控", padding=(6, 4))
+        self.exposure_panel = ttk.LabelFrame(parent, text="曝光监控", padding=(5, 3))
         self.exposure_panel.grid(row=0, column=1, sticky="nsew", padx=(5, 0), pady=(0, 5))
         self._build_exposure_panel(self.exposure_panel)
 
@@ -2677,11 +2891,11 @@ class StereoCaptureOnlyApp:
         self._build_validation_panel(self.validation_panel)
 
     def _build_camera_side_panels(self, parent: ttk.Frame) -> None:
-        self.focus_panel = ttk.LabelFrame(parent, text="对焦辅助", padding=(6, 4))
+        self.focus_panel = ttk.LabelFrame(parent, text="对焦辅助", padding=(5, 3))
         self.focus_panel.pack(side=TOP, fill=X, pady=(0, 8))
         self._build_focus_panel(self.focus_panel)
 
-        self.exposure_panel = ttk.LabelFrame(parent, text="曝光监控", padding=(6, 4))
+        self.exposure_panel = ttk.LabelFrame(parent, text="曝光监控", padding=(5, 3))
         self.exposure_panel.pack(side=TOP, fill=X)
         self._build_exposure_panel(self.exposure_panel)
 
@@ -2696,6 +2910,9 @@ class StereoCaptureOnlyApp:
     def _build_focus_panel(self, panel: ttk.LabelFrame) -> None:
         top = ttk.Frame(panel, style="Panel.TFrame")
         top.pack(side=TOP, fill=X)
+        ttk.Checkbutton(top, text="实时分析", variable=self.focus_realtime_analysis_var, command=self._sync_quality_toggles).pack(
+            side=LEFT, padx=(0, 6)
+        )
         ttk.Checkbutton(top, text="峰值对焦", variable=self.focus_peaking_var, command=self._sync_quality_toggles).pack(
             side=LEFT, padx=(0, 6)
         )
@@ -2705,49 +2922,111 @@ class StereoCaptureOnlyApp:
 
         self.focus_panel_body = ttk.Frame(panel, style="Panel.TFrame")
         self.focus_panel_body.pack(side=TOP, fill=BOTH, expand=True)
-        self.focus_panel_body.grid_columnconfigure(0, weight=3)
-        self.focus_panel_body.grid_columnconfigure(1, weight=2, minsize=260)
+        self.focus_panel_body.grid_columnconfigure(0, weight=1, uniform="focus_assist")
+        self.focus_panel_body.grid_columnconfigure(1, weight=1, uniform="focus_assist")
         self.focus_panel_body.grid_rowconfigure(0, weight=1)
 
         focus_controls = ttk.Frame(self.focus_panel_body, style="Panel.TFrame")
         focus_controls.grid(row=0, column=0, sticky="nsew", padx=(0, 6))
 
+        ttk.Label(focus_controls, text="操作", style="PanelSection.TLabel").pack(side=TOP, fill=X, pady=(1, 0))
         command_row = ttk.Frame(focus_controls, style="Panel.TFrame")
-        command_row.pack(side=TOP, fill=X, pady=(3, 0))
+        command_row.pack(side=TOP, fill=X, pady=(1, 2))
         self.focus_roi_button = ttk.Button(command_row, text="框选对焦ROI", command=self.toggle_focus_roi_edit_mode)
-        self.focus_roi_button.pack(side=LEFT, padx=(0, 4))
-        ttk.Button(command_row, text="设为目标", command=self.set_focus_reference).pack(side=LEFT, padx=(0, 4))
-        ttk.Button(command_row, text="保存基准", command=self.save_focus_reference_snapshot).pack(side=LEFT)
-        score_row = ttk.Frame(focus_controls, style="Panel.TFrame")
-        score_row.pack(side=TOP, fill=X, pady=(3, 0))
-        ttk.Label(score_row, textvariable=self.focus_score_var).pack(side=LEFT, padx=(0, 8))
-        self.focus_progress = ttk.Progressbar(score_row, mode="determinate", maximum=100, style="Yellow.Horizontal.TProgressbar")
-        self.focus_progress.pack(side=LEFT, fill=X, expand=True, padx=(0, 8))
-        self.focus_status_label = ttk.Label(score_row, textvariable=self.focus_status_var, style="Warn.TLabel", width=18)
-        self.focus_status_label.pack(side=LEFT)
+        self.focus_roi_button.grid(row=0, column=0, padx=(0, 4), pady=(0, 2), sticky="ew")
+        ttk.Button(command_row, text="设为目标", command=self.set_focus_reference).grid(
+            row=0, column=1, padx=(0, 4), pady=(0, 2), sticky="ew"
+        )
+        ttk.Button(command_row, text="保存基准", command=self.save_focus_reference_snapshot).grid(
+            row=0, column=2, pady=(0, 2), sticky="ew"
+        )
+        for column in range(3):
+            command_row.grid_columnconfigure(column, weight=1, uniform="focus_actions")
 
-        detail_row = ttk.Frame(focus_controls, style="Panel.TFrame")
-        detail_row.pack(side=TOP, fill=X, pady=(2, 0))
-        self.focus_detail_label = ttk.Label(detail_row, textvariable=self.focus_detail_var, style="Panel.TLabel")
-        self.focus_detail_label.pack(side=LEFT, fill=X, expand=True)
-        ttk.Label(detail_row, textvariable=self.focus_roi_var, style="Panel.TLabel").pack(side=RIGHT)
+        ttk.Separator(focus_controls, orient="horizontal").pack(side=TOP, fill=X, pady=(1, 1))
+        ttk.Label(focus_controls, text="当前对焦", style="PanelSection.TLabel").pack(side=TOP, fill=X)
+        score_grid = ttk.Frame(focus_controls, style="Panel.TFrame")
+        score_grid.pack(side=TOP, fill=X, pady=(1, 0))
+        score_grid.grid_columnconfigure(1, weight=1)
+        score_grid.grid_columnconfigure(2, minsize=110, weight=0)
+        ttk.Label(score_grid, text="综合", style="Panel.TLabel", anchor="e").grid(
+            row=0, column=0, padx=(0, 4), pady=1, sticky="e"
+        )
+        ttk.Label(score_grid, textvariable=self.focus_score_var, style="PanelMetricValue.TLabel", anchor="w").grid(
+            row=0, column=1, padx=(0, 6), pady=1, sticky="ew"
+        )
+        self.focus_status_label = ttk.Label(score_grid, textvariable=self.focus_status_var, style="PanelWarn.TLabel", width=12)
+        self.focus_status_label.grid(row=0, column=2, pady=1, sticky="e")
+        self.focus_progress = ttk.Progressbar(
+            score_grid, mode="determinate", maximum=100, style="Yellow.Horizontal.TProgressbar"
+        )
+        self.focus_progress.grid(row=1, column=0, columnspan=3, pady=(2, 1), sticky="ew")
 
+        ttk.Label(focus_controls, text="左右相机一致性", style="PanelSection.TLabel").pack(side=TOP, fill=X, pady=(2, 0))
+        detail_grid = ttk.Frame(focus_controls, style="Panel.TFrame")
+        detail_grid.pack(side=TOP, fill=X, pady=(1, 0))
+        for column in range(3):
+            detail_grid.grid_columnconfigure(column, weight=1, uniform="focus_detail")
+        ttk.Label(detail_grid, text="左 L", style="PanelMetricMuted.TLabel", anchor="center").grid(
+            row=0, column=0, padx=(0, 4), pady=(0, 1), sticky="ew"
+        )
+        ttk.Label(detail_grid, text="右 R", style="PanelMetricMuted.TLabel", anchor="center").grid(
+            row=0, column=1, padx=(0, 4), pady=(0, 1), sticky="ew"
+        )
+        ttk.Label(detail_grid, text="差值 Δ", style="PanelMetricMuted.TLabel", anchor="center").grid(
+            row=0, column=2, pady=(0, 1), sticky="ew"
+        )
+        self.focus_left_score_label = ttk.Label(
+            detail_grid, textvariable=self.focus_left_score_var, style="PanelMetricValue.TLabel", anchor="center"
+        )
+        self.focus_left_score_label.grid(row=1, column=0, padx=(0, 4), sticky="ew")
+        self.focus_right_score_label = ttk.Label(
+            detail_grid, textvariable=self.focus_right_score_var, style="PanelMetricValue.TLabel", anchor="center"
+        )
+        self.focus_right_score_label.grid(row=1, column=1, padx=(0, 4), sticky="ew")
+        self.focus_delta_label = ttk.Label(
+            detail_grid, textvariable=self.focus_delta_var, style="PanelMetricValue.TLabel", anchor="center"
+        )
+        self.focus_delta_label.grid(row=1, column=2, sticky="ew")
+
+        roi_row = ttk.Frame(focus_controls, style="Panel.TFrame")
+        roi_row.pack(side=TOP, fill=X, pady=(2, 0))
+        roi_row.grid_columnconfigure(1, weight=1)
+        ttk.Label(roi_row, text="对焦 ROI", style="PanelSection.TLabel", anchor="w").grid(
+            row=0, column=0, padx=(0, 6), sticky="w"
+        )
+        ttk.Label(roi_row, textvariable=self.focus_roi_var, style="PanelMetricMuted.TLabel", anchor="w").grid(
+            row=0, column=1, sticky="ew"
+        )
+
+        ttk.Label(focus_controls, text="峰值趋势", style="PanelSection.TLabel").pack(side=TOP, fill=X, pady=(2, 0))
         peak_row = ttk.Frame(focus_controls, style="Panel.TFrame")
-        peak_row.pack(side=TOP, fill=X, pady=(2, 0))
-        ttk.Label(peak_row, textvariable=self.focus_peak_var, style="Panel.TLabel").pack(side=LEFT, padx=(0, 8))
+        peak_row.pack(side=TOP, fill=X, pady=(1, 0))
+        ttk.Label(peak_row, textvariable=self.focus_peak_var, style="PanelMetricMuted.TLabel").pack(side=LEFT, padx=(0, 8))
         self.focus_chart_canvas = Canvas(
-            peak_row, width=240, height=36, bg=CHART_COLOR, highlightthickness=1, highlightbackground=BORDER_COLOR
+            peak_row, width=240, height=28, bg=CHART_COLOR, highlightthickness=1, highlightbackground=BORDER_COLOR
         )
         self.focus_chart_canvas.pack(side=LEFT, fill=X, expand=True)
 
-        self.magnifier_frame = ttk.LabelFrame(self.focus_panel_body, text="对焦放大镜", padding=(5, 3))
+        self.magnifier_frame = ttk.LabelFrame(self.focus_panel_body, text="对焦放大镜", padding=(4, 2))
         self.magnifier_frame.grid(row=0, column=1, sticky="nsew")
         mag_top = ttk.Frame(self.magnifier_frame, style="Panel.TFrame")
         mag_top.pack(side=TOP, fill=X)
         self.magnifier_info_var = StringVar(value="倍率 100% | 点击预览锁定/解锁，滚轮调倍率")
-        ttk.Label(mag_top, textvariable=self.magnifier_info_var, style="Panel.TLabel").pack(side=LEFT, fill=X, expand=True)
+        ttk.Label(
+            mag_top,
+            textvariable=self.magnifier_info_var,
+            style="Panel.TLabel",
+            width=44,
+            anchor="w",
+        ).pack(side=LEFT, fill=X, expand=True)
         self.magnifier_canvas = Canvas(
-            self.magnifier_frame, width=260, height=150, bg=CHART_COLOR, highlightthickness=1, highlightbackground=BORDER_COLOR
+            self.magnifier_frame,
+            width=MAGNIFIER_CANVAS_WIDTH,
+            height=MAGNIFIER_CANVAS_HEIGHT,
+            bg=CHART_COLOR,
+            highlightthickness=1,
+            highlightbackground=BORDER_COLOR,
         )
         self.magnifier_canvas.pack(side=TOP, fill=BOTH, expand=True, pady=(2, 0))
         self._magnifier_image_ref: ImageTk.PhotoImage | None = None
@@ -2773,15 +3052,20 @@ class StereoCaptureOnlyApp:
 
         self.exposure_panel_body = ttk.Frame(panel, style="Panel.TFrame")
         self.exposure_panel_body.pack(side=TOP, fill=BOTH, expand=True)
+        exposure_status_row = ttk.Frame(self.exposure_panel_body, style="Panel.TFrame")
+        exposure_status_row.pack(side=TOP, fill=X, pady=(2, 0))
+        exposure_status_row.grid_columnconfigure(0, weight=7)
+        exposure_status_row.grid_columnconfigure(1, weight=9)
         self.exposure_status_label = ttk.Label(
-            self.exposure_panel_body, textvariable=self.exposure_status_var, style="Panel.TLabel"
+            exposure_status_row, textvariable=self.exposure_status_var, style="Panel.TLabel", anchor="w"
         )
-        self.exposure_status_label.pack(side=TOP, fill=X, pady=(3, 0))
-        ttk.Label(self.exposure_panel_body, textvariable=self.exposure_advice_var, style="Panel.TLabel").pack(
-            side=TOP, fill=X, pady=(2, 0)
+        self.exposure_status_label.grid(row=0, column=0, sticky="ew", padx=(0, 8))
+        self.exposure_advice_label = ttk.Label(
+            exposure_status_row, textvariable=self.exposure_advice_var, style="Panel.TLabel", anchor="w"
         )
+        self.exposure_advice_label.grid(row=0, column=1, sticky="ew")
         hist_row = ttk.Frame(self.exposure_panel_body, style="Panel.TFrame")
-        hist_row.pack(side=TOP, fill=BOTH, expand=True, pady=(3, 0))
+        hist_row.pack(side=TOP, fill=BOTH, expand=True, pady=(2, 0))
         hist_row.grid_columnconfigure(0, weight=1)
         hist_row.grid_columnconfigure(1, weight=1)
         hist_row.grid_rowconfigure(0, weight=1)
@@ -2858,10 +3142,11 @@ class StereoCaptureOnlyApp:
             text="质量分析",
             variable=self.preview_quality_analysis_var,
             command=self._sync_quality_toggles,
+            style="Compact.TCheckbutton",
         ).pack(side=LEFT, padx=(0, 6))
-        self.validation_collapse_button = ttk.Button(top, text="校验", width=5, state=DISABLED)
+        self.validation_collapse_button = ttk.Button(top, text="校验", width=5, state=DISABLED, style="Compact.TButton")
         ttk.Label(top, text="预览模式", style="CompactPanel.TLabel").pack(side=LEFT, padx=(0, 4))
-        ttk.OptionMenu(
+        preview_menu = ttk.OptionMenu(
             top,
             self.stereo_preview_mode_var,
             self.stereo_preview_mode_var.get(),
@@ -2871,18 +3156,30 @@ class StereoCaptureOnlyApp:
             "校正叠加",
             "位移叠加",
             command=self._on_quality_menu_changed,
-        ).pack(side=LEFT, padx=(0, 6))
+        )
+        preview_menu.configure(style="Compact.TMenubutton")
+        self._configure_option_menu_font(preview_menu, COMPACT_UI_FONT_SIZE)
+        preview_menu.pack(side=LEFT, padx=(0, 6))
         ttk.Label(top, text="辅助线", style="CompactPanel.TLabel").pack(side=LEFT, padx=(0, 4))
-        ttk.OptionMenu(
+        guide_menu = ttk.OptionMenu(
             top,
             self.guide_mode_var,
             self.guide_mode_var.get(),
             "关闭",
-            "中心十字",
-            "全部网格线",
+            "仅十字线",
+            "仅网格线",
+            "十字+网格",
             command=self._on_quality_menu_changed,
-        ).pack(side=LEFT, padx=(0, 6))
-        self.epipolar_button = ttk.Button(top, text="极线对准检查", command=self.run_epipolar_check)
+        )
+        guide_menu.configure(style="Compact.TMenubutton")
+        self._configure_option_menu_font(guide_menu, COMPACT_UI_FONT_SIZE)
+        guide_menu.pack(side=LEFT, padx=(0, 6))
+        self.epipolar_button = ttk.Button(
+            top,
+            text="极线对准检查",
+            command=self.run_epipolar_check,
+            style="Compact.TButton",
+        )
         self.epipolar_button.pack(side=LEFT, padx=(0, 10))
         ttk.Label(
             top, textvariable=self.capture_gate_var, style="CompactPanel.TLabel"
@@ -2894,6 +3191,13 @@ class StereoCaptureOnlyApp:
         ttk.Label(
             top, textvariable=self.calibration_status_var, style="CompactPanel.TLabel"
         ).pack(side=LEFT, fill=X, expand=True)
+
+    def _configure_option_menu_font(self, menu_button: ttk.OptionMenu, font_size: int) -> None:
+        try:
+            menu = self.root.nametowidget(str(menu_button["menu"]))
+            menu.configure(font=(FONT_FAMILY, font_size))
+        except Exception:
+            pass
 
     def _build_project_panel(self, panel: ttk.LabelFrame) -> None:
         top = ttk.Frame(panel, style="Panel.TFrame")
@@ -2935,13 +3239,25 @@ class StereoCaptureOnlyApp:
             panel.grid_columnconfigure(col, weight=1)
 
     def _labeled_entry(
-        self, parent: ttk.Frame, label: str, variable: StringVar, width: int = 7, row: int = 0, column: int = 0
+        self,
+        parent: ttk.Frame,
+        label: str,
+        variable: StringVar,
+        width: int = 7,
+        row: int = 0,
+        column: int = 0,
+        *,
+        stretch: bool = True,
+        label_width: int | None = None,
     ) -> ttk.Entry:
-        ttk.Label(parent, text=label, style="Panel.TLabel", anchor="e").grid(
+        label_options = {"text": label, "style": "Panel.TLabel", "anchor": "e"}
+        if label_width is not None:
+            label_options["width"] = label_width
+        ttk.Label(parent, **label_options).grid(
             row=row, column=column, padx=(4, 1), pady=1, sticky="e"
         )
         entry = ttk.Entry(parent, textvariable=variable, width=width)
-        entry.grid(row=row, column=column + 1, padx=(0, 2), pady=1, sticky="ew")
+        entry.grid(row=row, column=column + 1, padx=(0, 2), pady=1, sticky="ew" if stretch else "w")
         return entry
 
     def _toggle_param_panel(self) -> None:
@@ -3110,8 +3426,22 @@ class StereoCaptureOnlyApp:
         project_dir = self.project_manager.create_project()
         self.project_manager.sync_config(self.config)
         save_config(self.config)
-        self.project_id_var.set(self.project_manager.current_project_id)
+        self._set_project_status_vars()
         self.status_var.set(f"新建项目：{project_dir}")
+
+    def _project_capture_paths(self, capture_id: str) -> tuple[Path, Path, Path]:
+        project_dir = self.project_manager.active_project_dir
+        left_dir = project_dir / "left"
+        right_dir = project_dir / "right"
+        meta_dir = project_dir / "exports" / "captures" / capture_id
+        left_dir.mkdir(parents=True, exist_ok=True)
+        right_dir.mkdir(parents=True, exist_ok=True)
+        meta_dir.mkdir(parents=True, exist_ok=True)
+        return left_dir, right_dir, meta_dir
+
+    def _set_project_status_vars(self) -> None:
+        self.project_id_var.set(self.project_manager.current_project_id or "--")
+        self.save_dir_var.set(str(self.project_manager.active_project_dir))
 
     def _calibration_wizard_settings(self) -> dict[str, object]:
         wizard = self._ensure_config_section("calibration_wizard")
@@ -3425,6 +3755,146 @@ class StereoCaptureOnlyApp:
         connected_text = "\n".join(connected) if connected else "当前未连接相机。"
         return f"{self._last_device_status}\n{connected_text}"
 
+    def _camera_choice_label(self, camera: object) -> str:
+        serial = str(getattr(camera, "serial", "") or "").strip()
+        label = str(getattr(camera, "label", "") or "").strip()
+        transport = str(getattr(camera, "transport", "") or "").strip()
+        prefix = label or serial or f"Camera {getattr(camera, 'index', '')}".strip()
+        suffix = f" [{transport}]" if transport else ""
+        return f"{prefix}{suffix}"
+
+    def _camera_serial_from_choice(self, value: object) -> str:
+        text = str(value or "").strip()
+        if not text or text == CAMERA_ASSIGNMENT_AUTO:
+            return ""
+        return self._camera_choice_serials.get(text, "")
+
+    def _set_camera_assignment_menus(self, choices: list[str]) -> None:
+        for menu_widget, variable in (
+            (getattr(self, "left_camera_menu", None), self.left_camera_var),
+            (getattr(self, "right_camera_menu", None), self.right_camera_var),
+        ):
+            if menu_widget is None:
+                continue
+            menu = menu_widget["menu"]
+            menu.delete(0, "end")
+            for choice in choices:
+                menu.add_command(
+                    label=choice,
+                    command=lambda selected=choice, var=variable: self._select_camera_assignment(var, selected),
+                )
+
+    def _select_camera_assignment(self, variable: StringVar, value: str) -> None:
+        variable.set(value)
+        self._on_camera_assignment_changed()
+
+    def _sync_camera_assignment_controls(self, cameras: list[object] | None = None) -> None:
+        if cameras is not None:
+            self._available_cameras = list(cameras)
+        choices = [CAMERA_ASSIGNMENT_AUTO]
+        self._camera_choice_serials = {CAMERA_ASSIGNMENT_AUTO: ""}
+        for camera in self._available_cameras:
+            label = self._camera_choice_label(camera)
+            serial = str(getattr(camera, "serial", "") or "").strip()
+            if label in self._camera_choice_serials:
+                label = f"{label} #{getattr(camera, 'index', len(choices))}"
+            choices.append(label)
+            self._camera_choice_serials[label] = serial
+
+        left_serial = str(self.config.get("left_serial", "") or "").strip()
+        right_serial = str(self.config.get("right_serial", "") or "").strip()
+        known_serials = {serial for serial in self._camera_choice_serials.values() if serial}
+        for serial in (left_serial, right_serial):
+            if serial and serial not in known_serials:
+                label = f"已保存: {serial}"
+                choices.append(label)
+                self._camera_choice_serials[label] = serial
+                known_serials.add(serial)
+        selected_by_serial = {serial: label for label, serial in self._camera_choice_serials.items() if serial}
+        left_choice = selected_by_serial.get(left_serial, CAMERA_ASSIGNMENT_AUTO)
+        right_choice = selected_by_serial.get(right_serial, CAMERA_ASSIGNMENT_AUTO)
+        if self._camera_serial_from_choice(self.left_camera_var.get()) in selected_by_serial:
+            left_choice = self.left_camera_var.get()
+        if self._camera_serial_from_choice(self.right_camera_var.get()) in selected_by_serial:
+            right_choice = self.right_camera_var.get()
+        self.left_camera_var.set(left_choice)
+        self.right_camera_var.set(right_choice)
+        self._camera_assignment_choices = choices
+        self._set_camera_assignment_menus(choices)
+
+    def _selected_camera_assignment_config(self) -> dict[str, object]:
+        left_serial = self._camera_serial_from_choice(self.left_camera_var.get())
+        right_serial = self._camera_serial_from_choice(self.right_camera_var.get())
+        if left_serial and right_serial and left_serial == right_serial:
+            raise ValueError("左右画面不能选择同一台相机。")
+        return {
+            "left_serial": left_serial,
+            "right_serial": right_serial,
+            "bind_camera_serials": bool(left_serial or right_serial),
+        }
+
+    def _on_camera_assignment_changed(self) -> None:
+        try:
+            values = self._selected_camera_assignment_config()
+        except ValueError as exc:
+            self.status_var.set(str(exc))
+            return
+        self._update_config(values, save=False)
+
+    def show_camera_assignment_popup(self, cameras: list[object] | None = None) -> None:
+        if cameras is not None:
+            self._sync_camera_assignment_controls(cameras)
+        if not getattr(self, "_available_cameras", []):
+            messagebox.showwarning("画面分配", "未检测到相机，请先确认设备连接。", parent=self.root)
+            return
+        popup = Toplevel(self.root)
+        popup.title("画面分配")
+        popup.configure(bg=BG_COLOR)
+        popup.transient(self.root)
+        popup.geometry("+%d+%d" % (self.root.winfo_rootx() + 140, self.root.winfo_rooty() + 120))
+
+        body = ttk.LabelFrame(popup, text="选择左右相机", padding=(12, 10))
+        body.pack(side=TOP, fill=BOTH, expand=True, padx=12, pady=12)
+        body.grid_columnconfigure(1, weight=1)
+
+        left_choice = StringVar(value=self.left_camera_var.get())
+        right_choice = StringVar(value=self.right_camera_var.get())
+        choices = list(getattr(self, "_camera_assignment_choices", [CAMERA_ASSIGNMENT_AUTO]))
+
+        ttk.Label(body, text="左画面", style="Panel.TLabel").grid(row=0, column=0, padx=(0, 8), pady=5, sticky="e")
+        ttk.OptionMenu(body, left_choice, left_choice.get(), *choices).grid(row=0, column=1, pady=5, sticky="ew")
+        ttk.Label(body, text="右画面", style="Panel.TLabel").grid(row=1, column=0, padx=(0, 8), pady=5, sticky="e")
+        ttk.OptionMenu(body, right_choice, right_choice.get(), *choices).grid(row=1, column=1, pady=5, sticky="ew")
+
+        button_row = ttk.Frame(body, style="Panel.TFrame")
+        button_row.grid(row=2, column=0, columnspan=2, sticky="e", pady=(10, 0))
+
+        def save_assignment() -> None:
+            previous_left = self.left_camera_var.get()
+            previous_right = self.right_camera_var.get()
+            self.left_camera_var.set(left_choice.get())
+            self.right_camera_var.set(right_choice.get())
+            try:
+                values = self._selected_camera_assignment_config()
+            except ValueError as exc:
+                self.left_camera_var.set(previous_left)
+                self.right_camera_var.set(previous_right)
+                messagebox.showerror("画面分配错误", str(exc), parent=popup)
+                return
+            self._update_config(values, save=True)
+            self.status_var.set("画面分配已保存，连接相机时将按所选左右画面绑定。")
+            popup.destroy()
+
+        ttk.Button(button_row, text="取消", command=popup.destroy).pack(side=LEFT, padx=(0, 6))
+        ttk.Button(button_row, text="保存分配", command=save_assignment, style="Accent.TButton").pack(side=LEFT)
+        popup.protocol("WM_DELETE_WINDOW", popup.destroy)
+        popup.update_idletasks()
+        width = max(body.winfo_reqwidth() + 36, 440)
+        height = max(body.winfo_reqheight() + 40, 180)
+        popup.geometry(f"{width}x{height}+{self.root.winfo_rootx() + 140}+{self.root.winfo_rooty() + 120}")
+        popup.grab_set()
+        popup.focus_force()
+
     def _update_connected_titles(self, left_info, right_info) -> None:
         if left_info is not None:
             self.left_pane.set_title(f"左相机：{left_info.label}")
@@ -3605,6 +4075,18 @@ class StereoCaptureOnlyApp:
         self._reset_stats()
         self._start_preview_thread()
 
+    def _ensure_preview_thread_after_interval(self) -> None:
+        if self.camera_system is None or self.recording or self.interval_capturing or not self.previewing:
+            return
+        if not self.camera_system.has_ready_camera():
+            self.previewing = False
+            self.preview_button.configure(text="开始采集")
+            self.status_var.set("定时拍照结束后未重启预览：相机连接不可用，请重新连接相机。")
+            return
+        self.preview_button.configure(text="停止采集")
+        self._reset_stats()
+        self._start_preview_thread()
+
     def _start_preview_thread(self) -> None:
         with self._state_lock:
             if self.preview_thread and self.preview_thread.is_alive():
@@ -3640,6 +4122,12 @@ class StereoCaptureOnlyApp:
         except ValueError:
             self.status_var.set("连接前请先检查参数：曝光、增益、ROI、定时拍照和录像 FPS 必须为数字。")
             return
+        try:
+            assignment_config = self._selected_camera_assignment_config()
+        except ValueError as exc:
+            self.status_var.set(str(exc))
+            return
+        self._update_config(assignment_config, save=True)
         self.connect_button.configure(state=DISABLED)
         self.status_var.set("正在连接相机并应用采集参数...")
 
@@ -3761,10 +4249,11 @@ class StereoCaptureOnlyApp:
     def _should_analyze_preview_frame(self, frame_index: int, config_snapshot: dict | None = None) -> bool:
         config_snapshot = config_snapshot or self._config_snapshot()
         zebra_enabled = bool(self.zebra_var.get()) if hasattr(self, "zebra_var") else False
+        focus_analysis_enabled = bool(getattr(self, "_focus_realtime_analysis_enabled_setting", True))
         analysis_required = (
             config_bool(config_snapshot, "preview_quality_analysis_enabled", True, True)
             or bool(getattr(self, "_histogram_enabled_setting", False))
-            or bool(getattr(self, "_focus_peaking_enabled_setting", False))
+            or (focus_analysis_enabled and bool(getattr(self, "_focus_peaking_enabled_setting", False)))
             or zebra_enabled
         )
         if not analysis_required:
@@ -3965,20 +4454,17 @@ class StereoCaptureOnlyApp:
 
     def _save_hdr_bracket(self, captures: list[dict[str, object]], base_exposure_us: float) -> Path:
         capture_id = timestamp_ms()
-        group_dir = self.project_manager.output_root_for_mode("photos") / f"{capture_id}_hdr"
-        group_dir.mkdir(parents=True, exist_ok=True)
-        left_dir = group_dir / "left"
-        right_dir = group_dir / "right"
-        left_dir.mkdir(parents=True, exist_ok=True)
-        right_dir.mkdir(parents=True, exist_ok=True)
+        left_dir, right_dir, meta_dir = self._project_capture_paths(f"{capture_id}_hdr")
+        project_dir = self.project_manager.active_project_dir
         ext = image_extension(self.config)
         bracket_meta: list[dict[str, object]] = []
         for index, item in enumerate(captures, start=1):
             ev = float(item["ev_offset"])
             left = item.get("left")
             right = item.get("right")
-            left_path = left_dir / f"ev_{ev:+.1f}_left.{ext}"
-            right_path = right_dir / f"ev_{ev:+.1f}_right.{ext}"
+            ev_token = f"{ev:+.1f}".replace("+", "p").replace("-", "m").replace(".", "p")
+            left_path = left_dir / f"{capture_id}_hdr_ev_{ev_token}_left.{ext}"
+            right_path = right_dir / f"{capture_id}_hdr_ev_{ev_token}_right.{ext}"
             if isinstance(left, CameraFrame):
                 left_path = self._save_frame(left, left_path)
             if isinstance(right, CameraFrame):
@@ -3998,7 +4484,7 @@ class StereoCaptureOnlyApp:
         first_left = next((item.get("left") for item in captures if isinstance(item.get("left"), CameraFrame)), None)
         first_right = next((item.get("right") for item in captures if isinstance(item.get("right"), CameraFrame)), None)
         self._write_meta(
-            group_dir / "meta.json",
+            meta_dir / "meta.json",
             mode="hdr_bracket",
             capture_id=capture_id,
             trigger_time=captures[0].get("trigger_time") if captures else time.time(),
@@ -4007,15 +4493,20 @@ class StereoCaptureOnlyApp:
             base_exposure_time_us=base_exposure_us,
             brackets=bracket_meta,
             data_manifest={
-                "manifest_csv": str(group_dir / "exports" / "file_manifest.csv"),
-                "summary_json": str(group_dir / "exports" / "capture_summary.json"),
+                "manifest_csv": str(meta_dir / "exports" / "file_manifest.csv"),
+                "summary_json": str(meta_dir / "exports" / "capture_summary.json"),
             },
         )
         manifest = self._write_manifest_for_session(
-            group_dir, {"mode": "hdr_bracket", "capture_id": capture_id, "brackets": bracket_meta}
+            meta_dir, {"mode": "hdr_bracket", "capture_id": capture_id, "brackets": bracket_meta}
         )
-        self.project_manager.register_session("hdr_bracket", group_dir, group_dir / "meta.json", {"manifest": manifest})
-        return group_dir
+        self.project_manager.register_session(
+            "hdr_bracket",
+            meta_dir,
+            meta_dir / "meta.json",
+            {"capture_id": capture_id, "image_root": str(project_dir), "manifest": manifest},
+        )
+        return meta_dir
 
     def toggle_interval_capture(self) -> None:
         if self.interval_capturing:
@@ -4031,7 +4522,7 @@ class StereoCaptureOnlyApp:
             return
         try:
             interval_s = float(self.interval_seconds_var.get())
-            limit = optional_int_text(self.interval_limit_var.get())
+            limit = optional_interval_limit_text(self.interval_limit_var.get())
         except ValueError:
             self.status_var.set("定时拍照参数必须是数字。")
             return
@@ -4097,8 +4588,9 @@ class StereoCaptureOnlyApp:
                 self.ui_queue.put(("interval_lamp_green", None))
                 if self.previewing:
                     self._preview_frame_counter += 1
-                    analysis = self._analyze_preview_frames(left, right, self._preview_frame_counter)
-                    self.ui_queue.put(("quality_metrics", analysis))
+                    if self._should_analyze_preview_frame(self._preview_frame_counter):
+                        analysis = self._analyze_preview_frames(left, right, self._preview_frame_counter)
+                        self.ui_queue.put(("quality_metrics", analysis))
                     self.ui_queue.put(("frames", (left, right)))
                 self.ui_queue.put(
                     (
@@ -4190,9 +4682,13 @@ class StereoCaptureOnlyApp:
             self.start_dic_capture()
 
     def _dic_capture_config(self) -> dict[str, object]:
-        dic_section = self._config_snapshot().get("dic_capture", {})
+        current = self._config_snapshot()
+        dic_section = current.get("dic_capture", {})
         dic_overrides = dic_section if isinstance(dic_section, dict) else {}
-        snapshot = {**self._config_snapshot(), **dic_capture_defaults(), **dic_overrides}
+        snapshot = {**current, **dic_capture_defaults(), **dic_overrides}
+        for key in DIC_CAMERA_SETTING_KEYS:
+            if key in current:
+                snapshot[key] = current[key]
         gate = dict(snapshot.get("capture_quality_gate", DIC_CAPTURE_CONFIG["capture_quality_gate"]))
         snapshot["capture_quality_gate"] = gate
         snapshot["image_format"] = image_extension(snapshot)
@@ -4204,45 +4700,37 @@ class StereoCaptureOnlyApp:
             raise ValueError("DIC FPS must be greater than 0")
         return fps
 
-    def _dic_pixel_format_from_entry(self) -> str:
-        if not hasattr(self, "dic_pixel_format_var"):
-            section = self.config.get("dic_capture", {}) if hasattr(self, "config") else {}
-            value = str(section.get("pixel_format", DIC_CAPTURE_CONFIG["pixel_format"]) if isinstance(section, dict) else DIC_CAPTURE_CONFIG["pixel_format"])
-            return value if value in DIC_PIXEL_FORMATS else "Mono16"
-        value = str(self.dic_pixel_format_var.get() or "Mono16").strip()
-        if value not in DIC_PIXEL_FORMATS:
-            raise ValueError("unsupported DIC pixel format")
-        return value
-
     def _apply_dic_ui_settings_to_config(self, config_snapshot: dict[str, object]) -> dict[str, object]:
-        snapshot = dict(config_snapshot)
+        snapshot = mono8_capture_config(config_snapshot)
         fps = self._dic_record_fps_from_entry()
-        pixel_format = self._dic_pixel_format_from_entry()
         snapshot["record_fps"] = fps
-        snapshot["pixel_format"] = pixel_format
-        high_bit_depth = pixel_format != "Mono8"
-        snapshot["save_raw_frames"] = high_bit_depth
-        snapshot["record_force_image_format"] = not high_bit_depth
+        snapshot["pixel_format"] = CAPTURE_PIXEL_FORMAT
+        snapshot["save_raw_frames"] = False
+        snapshot["record_force_image_format"] = True
         snapshot["image_format"] = "png"
         snapshot["viewable_sidecar_enabled"] = True
         snapshot["viewable_sidecar_format"] = "png"
-        if high_bit_depth:
-            snapshot["raw_frame_format"] = str(snapshot.get("raw_frame_format") or "tiff16")
         dic_section = dict(snapshot.get("dic_capture", {}) if isinstance(snapshot.get("dic_capture"), dict) else {})
         dic_section["record_fps"] = fps
-        dic_section["pixel_format"] = pixel_format
-        dic_section["save_raw_frames"] = high_bit_depth
-        dic_section["record_force_image_format"] = not high_bit_depth
+        dic_section["pixel_format"] = CAPTURE_PIXEL_FORMAT
+        dic_section["save_raw_frames"] = False
+        dic_section["record_force_image_format"] = True
         dic_section["image_format"] = "png"
         dic_section["viewable_sidecar_enabled"] = True
         dic_section["viewable_sidecar_format"] = "png"
-        if high_bit_depth:
-            dic_section["raw_frame_format"] = str(snapshot.get("raw_frame_format") or "tiff16")
-        snapshot["dic_capture"] = dic_section
+        snapshot["dic_capture"] = mono8_capture_config(dic_section)
         return snapshot
 
     def _apply_dic_record_fps_to_config(self, config_snapshot: dict[str, object]) -> dict[str, object]:
         return self._apply_dic_ui_settings_to_config(config_snapshot)
+
+    def _apply_current_camera_settings_to_dic_config(self, config_snapshot: dict[str, object]) -> dict[str, object]:
+        snapshot = dict(config_snapshot)
+        current_settings = self._current_parameter_config()
+        for key in DIC_CAMERA_SETTING_KEYS:
+            if key in current_settings:
+                snapshot[key] = current_settings[key]
+        return snapshot
 
     def start_dic_capture(self) -> None:
         if self.camera_system is None:
@@ -4254,9 +4742,10 @@ class StereoCaptureOnlyApp:
             self.status_var.set("定时拍照中不能启动 DIC 图像采集。")
             return
         try:
-            config_snapshot = self._apply_dic_ui_settings_to_config(self._dic_capture_config())
+            config_snapshot = self._apply_current_camera_settings_to_dic_config(self._dic_capture_config())
+            config_snapshot = self._apply_dic_ui_settings_to_config(config_snapshot)
         except ValueError:
-            self.status_var.set("DIC FPS 必须是大于 0 的数字，输出格式需为 Mono16/Mono12/Mono10/Mono8。")
+            self.status_var.set("DIC FPS 必须是大于 0 的数字。")
             return
         self._load_vars_from_snapshot(config_snapshot, include_record_fps=False)
         self.status_var.set("正在应用 DIC 图像采集参数...")
@@ -4674,7 +5163,7 @@ class StereoCaptureOnlyApp:
                 "skip_keep_frames": skip_keep_frames,
                 "left_videos": [str(path) for path in video_outputs["left"]],
                 "right_videos": [str(path) for path in video_outputs["right"]],
-                "pixel_format": config_snapshot.get("pixel_format", "Mono8"),
+                "pixel_format": CAPTURE_PIXEL_FORMAT,
                 "left_camera": asdict(camera_system.left_info) if camera_system and camera_system.left_info else None,
                 "right_camera": asdict(camera_system.right_info) if camera_system and camera_system.right_info else None,
                 "device_versions": dict(self._device_versions),
@@ -5284,9 +5773,7 @@ class StereoCaptureOnlyApp:
                     segment_index = int(item["segment_index"])
                     saved_index = int(item["saved_index"])
                     paths: dict[str, str | None] = {"left": None, "right": None}
-                    raw_paths: dict[str, str | None] = {"left": None, "right": None}
                     frame_meta: dict[str, dict | None] = {"left": None, "right": None}
-                    raw_sidecar_bytes = 0
                     for side in ("left", "right"):
                         frame = item.get(side)
                         if frame is None:
@@ -5302,20 +5789,6 @@ class StereoCaptureOnlyApp:
                                 self._set_record_write_warning(f"Video codec fallback: {codec_name}")
                         writers[key].write(self._frame_to_video_frame(frame))
                         paths[side] = str(self._record_segment_video_path(side, segment_index))
-                        if self._should_save_raw_frame(frame, config_snapshot) and not config_bool(
-                            config_snapshot, "record_force_image_format", False, False
-                        ):
-                            raw_path = (
-                                self._require_record_dir()
-                                / "raw"
-                                / side
-                                / f"part_{segment_index:03d}"
-                                / f"{side}_{saved_index:06d}.{raw_frame_extension(config_snapshot)}"
-                            )
-                            raw_path.parent.mkdir(parents=True, exist_ok=True)
-                            raw_path = self._save_raw_frame(frame, raw_path, config_snapshot)
-                            raw_paths[side] = str(raw_path)
-                            raw_sidecar_bytes += raw_path.stat().st_size if raw_path.exists() else frame_raw_estimated_bytes(frame)
                         if write_frame_meta and hasattr(frame, "release_raw_data"):
                             frame.release_raw_data()
                     elapsed = time.perf_counter() - started
@@ -5324,7 +5797,7 @@ class StereoCaptureOnlyApp:
                         bytes_written = max(
                             self._record_video_segment_bytes(segment_index, video_outputs),
                             self._estimate_video_segment_bytes(saved_index, segment_index, config_snapshot),
-                        ) + raw_sidecar_bytes
+                        )
                         self._observe_record_write_lag(lag)
                         self._mark_record_video_saved(
                             saved_index,
@@ -5346,8 +5819,6 @@ class StereoCaptureOnlyApp:
                                 "right_path": None,
                                 "left_video_path": paths["left"],
                                 "right_video_path": paths["right"],
-                                "left_raw_path": raw_paths["left"],
-                                "right_raw_path": raw_paths["right"],
                                 "left_checksum": None,
                                 "right_checksum": None,
                                 "checksum_algorithm": None,
@@ -5429,10 +5900,16 @@ class StereoCaptureOnlyApp:
                 value = str(path)
         except ValueError:
             value = str(path)
-        self.save_dir_var.set(value)
         self.config["save_dir"] = value
+        self.project_manager = ProjectManager(resolve_output_root(self.config), self.config)
+        if self.project_manager.enabled:
+            self.project_manager.create_project()
+            self.project_manager.sync_config(self.config)
+            self._set_project_status_vars()
+        else:
+            self.save_dir_var.set(value)
         save_config(self.config)
-        self.status_var.set(f"保存路径已设置：{value}")
+        self.status_var.set(f"保存路径已设置：{self.save_dir_var.get()}")
 
     def reset_view(self) -> None:
         self.left_pane.reset_zoom()
@@ -5538,7 +6015,15 @@ class StereoCaptureOnlyApp:
             self.left_roi_height_var.set(str(height))
             self.left_roi_offset_x_var.set(str(offset_x))
             self.left_roi_offset_y_var.set(str(offset_y))
+            self.right_roi_width_var.set(str(width))
+            self.right_roi_height_var.set(str(height))
         else:
+            try:
+                width = optional_int_text(self.left_roi_width_var.get()) or width
+                height = optional_int_text(self.left_roi_height_var.get()) or height
+            except ValueError:
+                self.status_var.set("ROI 参数必须是整数。")
+                return
             self.right_roi_width_var.set(str(width))
             self.right_roi_height_var.set(str(height))
             self.right_roi_offset_x_var.set(str(offset_x))
@@ -5548,6 +6033,32 @@ class StereoCaptureOnlyApp:
         self._set_roi_edit_mode(False)
         if self.camera_system is not None:
             self.apply_roi_settings()
+
+    def _side_roi_requests_from_controls(self) -> dict[str, tuple[int, int, int, int]]:
+        left_width = optional_int_text(self.left_roi_width_var.get()) or CAPTURE_WIDTH
+        left_height = optional_int_text(self.left_roi_height_var.get()) or CAPTURE_HEIGHT
+        left_offset_x = int(self.left_roi_offset_x_var.get() or 0)
+        left_offset_y = int(self.left_roi_offset_y_var.get() or 0)
+        right_offset_x = int(self.right_roi_offset_x_var.get() or 0)
+        right_offset_y = int(self.right_roi_offset_y_var.get() or 0)
+        self.right_roi_width_var.set(str(left_width))
+        self.right_roi_height_var.set(str(left_height))
+        return {
+            "left": (left_width, left_height, left_offset_x, left_offset_y),
+            "right": (left_width, left_height, right_offset_x, right_offset_y),
+        }
+
+    def _side_roi_requests_from_config(self, config_snapshot: dict) -> dict[str, tuple[int, int, int, int]]:
+        left_width = int(config_snapshot.get("left_roi_width", config_snapshot.get("roi_width", CAPTURE_WIDTH)) or CAPTURE_WIDTH)
+        left_height = int(config_snapshot.get("left_roi_height", config_snapshot.get("roi_height", CAPTURE_HEIGHT)) or CAPTURE_HEIGHT)
+        left_offset_x = int(config_snapshot.get("left_roi_offset_x", config_snapshot.get("roi_offset_x", 0)) or 0)
+        left_offset_y = int(config_snapshot.get("left_roi_offset_y", config_snapshot.get("roi_offset_y", 0)) or 0)
+        right_offset_x = int(config_snapshot.get("right_roi_offset_x", config_snapshot.get("roi_offset_x", 0)) or 0)
+        right_offset_y = int(config_snapshot.get("right_roi_offset_y", config_snapshot.get("roi_offset_y", 0)) or 0)
+        return {
+            "left": (left_width, left_height, left_offset_x, left_offset_y),
+            "right": (left_width, left_height, right_offset_x, right_offset_y),
+        }
 
     def reset_roi_settings(self) -> None:
         self.left_roi_width_var.set(str(CAPTURE_WIDTH))
@@ -5571,7 +6082,7 @@ class StereoCaptureOnlyApp:
         if not preset:
             self.status_var.set(f"未找到预设：{self.preset_var.get()}")
             return
-        self.config.update(preset)
+        self.config.update(mono8_capture_config(safe_trigger_config(preset)))
         self._ensure_default_full_resolution()
         self._load_vars_from_config()
         save_config(self.config)
@@ -5584,7 +6095,7 @@ class StereoCaptureOnlyApp:
             self.status_var.set("预设保存失败：参数必须是数字。")
             return
         presets = self.config.setdefault("presets", {})
-        presets[self.preset_var.get()] = preset
+        presets[self.preset_var.get()] = mono8_capture_config(preset)
         save_config(self.config)
         self.status_var.set(f"已保存预设：{self.preset_var.get()}")
 
@@ -5864,20 +6375,7 @@ class StereoCaptureOnlyApp:
         if self.camera_system is None:
             return
         try:
-            rois = {
-                "left": (
-                    optional_int_text(self.left_roi_width_var.get()) or CAPTURE_WIDTH,
-                    optional_int_text(self.left_roi_height_var.get()) or CAPTURE_HEIGHT,
-                    int(self.left_roi_offset_x_var.get() or 0),
-                    int(self.left_roi_offset_y_var.get() or 0),
-                ),
-                "right": (
-                    optional_int_text(self.right_roi_width_var.get()) or CAPTURE_WIDTH,
-                    optional_int_text(self.right_roi_height_var.get()) or CAPTURE_HEIGHT,
-                    int(self.right_roi_offset_x_var.get() or 0),
-                    int(self.right_roi_offset_y_var.get() or 0),
-                ),
-            }
+            rois = self._side_roi_requests_from_controls()
         except ValueError:
             self.status_var.set("ROI 参数必须是整数。")
             return
@@ -5920,14 +6418,17 @@ class StereoCaptureOnlyApp:
     def apply_trigger_settings(self) -> None:
         if self.camera_system is None:
             return
-        trigger_source = canonical_trigger_source(self.trigger_source_var.get())
+        requested_source = canonical_trigger_source(self.trigger_source_var.get())
+        trigger_source = safe_capture_trigger_source(requested_source)
+        if requested_source != trigger_source:
+            self.trigger_source_var.set(display_trigger_source(trigger_source))
+            self.status_var.set("硬触发级联和外部硬触发已禁用，当前仅支持软触发和连续采集；已切换为软触发。")
+            self._update_config({"trigger_source": trigger_source})
+            self._set_cached_trigger_source(trigger_source)
+            return
         self._set_cached_trigger_source(trigger_source)
         self.apply_trigger_button.configure(state=DISABLED)
-        if trigger_source == "Cascade":
-            self.status_var.set("正在应用硬触发级联：左相机 Line2 输出，右相机 Line0 接收。")
-        elif trigger_source == "Line0":
-            self.status_var.set("正在应用外部硬触发；请确认两台相机 Line0 已接入同一个上升沿触发脉冲。")
-        elif trigger_source == "Continuous":
+        if trigger_source == "Continuous":
             self.status_var.set("正在应用连续采集；相机会按曝光和带宽能力自由运行。")
         else:
             self.status_var.set("正在应用软触发模式...")
@@ -5938,11 +6439,7 @@ class StereoCaptureOnlyApp:
                 self._update_config({"trigger_source": trigger_source})
                 self._set_cached_trigger_source(trigger_source)
                 message = self._format_apply_result("触发模式已应用", warnings)
-                if trigger_source == "Cascade":
-                    message += "；硬触发级联只软件触发主相机，从相机由 Line0 硬件脉冲同步曝光。"
-                elif trigger_source == "Line0":
-                    message += "；外部硬触发不会发送软件触发，若没有外部脉冲会持续超时。"
-                elif trigger_source == "Continuous":
+                if trigger_source == "Continuous":
                     message += "；连续采集关闭帧触发，预览/录像读取相机连续输出的最新帧。"
                 self.ui_queue.put(("status", message))
             except Exception as exc:
@@ -5984,10 +6481,17 @@ class StereoCaptureOnlyApp:
                     self.status_var.set(str(payload))
                 elif kind == "devices_refreshed":
                     _cameras, message = payload
+                    if isinstance(_cameras, list):
+                        self._sync_camera_assignment_controls(_cameras)
                     self._last_device_status = str(message)
                     self.status_var.set(str(message))
+                    if isinstance(_cameras, list) and _cameras:
+                        self.show_camera_assignment_popup(_cameras)
                 elif kind == "connected":
                     left_info, right_info = payload
+                    connected_cameras = [camera for camera in (left_info, right_info) if camera is not None]
+                    if connected_cameras:
+                        self._sync_camera_assignment_controls(connected_cameras)
                     self._update_connected_titles(left_info, right_info)
                     self._set_capture_buttons(NORMAL)
                     self._set_parameter_buttons(NORMAL)
@@ -6176,6 +6680,7 @@ class StereoCaptureOnlyApp:
                         self._set_interval_lamp(SUBTLE_TEXT_COLOR)
                     if self.camera_system is not None and not self.recording:
                         self._set_capture_buttons(NORMAL)
+                    self._ensure_preview_thread_after_interval()
                     if not payload:
                         self.status_var.set(f"定时拍照已停止，共保存 {self.interval_count} 组。")
                 elif kind == "interval_lamp_green":
@@ -6256,8 +6761,6 @@ class StereoCaptureOnlyApp:
         def set_dic_options_enabled(enabled: bool) -> None:
             if hasattr(self, "dic_record_fps_entry"):
                 self.dic_record_fps_entry.configure(state=NORMAL if enabled else DISABLED)
-            if hasattr(self, "dic_pixel_format_menu"):
-                self.dic_pixel_format_menu.configure(state=NORMAL if enabled else DISABLED)
 
         if self.camera_system is None:
             self.connect_button.configure(state=NORMAL)
@@ -6334,8 +6837,8 @@ class StereoCaptureOnlyApp:
         if not hasattr(self, "mp4_progress"):
             return
         if visible and not self.mp4_progress.winfo_ismapped():
-            self.mp4_progress_label.pack(side=LEFT, padx=(12, 4))
-            self.mp4_progress.pack(side=LEFT, padx=(0, 4))
+            self.mp4_progress_label.grid(row=0, column=1, sticky="e", padx=(8, 4))
+            self.mp4_progress.grid(row=0, column=2, sticky="e", padx=(0, 8))
         value = min(max(float(percent), 0.0), 100.0)
         self.mp4_progress.configure(value=value)
         self.mp4_progress_var.set(message)
@@ -6343,8 +6846,8 @@ class StereoCaptureOnlyApp:
     def _hide_mp4_progress(self) -> None:
         if not hasattr(self, "mp4_progress"):
             return
-        self.mp4_progress.pack_forget()
-        self.mp4_progress_label.pack_forget()
+        self.mp4_progress.grid_forget()
+        self.mp4_progress_label.grid_forget()
         self.mp4_progress.configure(value=0)
         self.mp4_progress_var.set("MP4 --")
 
@@ -6355,6 +6858,7 @@ class StereoCaptureOnlyApp:
         self.config.setdefault("focus_reference_score", None)
         self.config.setdefault("focus_drift_check_interval_minutes", 30)
         self.config.setdefault("focus_drift_warning_threshold", 0.15)
+        self.config.setdefault("focus_realtime_analysis_enabled", True)
         exposure_monitor = self._ensure_config_section("exposure_monitor")
         exposure_monitor.setdefault("zebra_enabled", False)
         exposure_monitor.setdefault("histogram_enabled", True)
@@ -6421,7 +6925,7 @@ class StereoCaptureOnlyApp:
             "record_clone_frames_for_writer": False,
             "record_drop_frames_on_write_lag": False,
             "record_checksum_during_capture": False,
-            "record_force_image_format": False,
+            "record_force_image_format": True,
             "focus_peaking_overlay_interval_seconds": 0.20,
             "raw_frame_format": "npy",
             "record_disk_benchmark_enabled": True,
@@ -6455,7 +6959,7 @@ class StereoCaptureOnlyApp:
             "black_level": None,
             "digital_shift": None,
             "gamma": None,
-            "save_raw_frames": True,
+            "save_raw_frames": False,
             "image_format": "png",
             "field_correction": {
                 "enabled": False,
@@ -6472,10 +6976,7 @@ class StereoCaptureOnlyApp:
         }
         for key, value in defaults.items():
             self.config.setdefault(key, value)
-        if str(self.config.get("pixel_format", "")).lower() == "mono16":
-            if str(self.config.get("image_format", "")).lower() in {"jpg", "jpeg"}:
-                self.config["image_format"] = "png"
-            self.config["save_raw_frames"] = True
+        self.config.update(mono8_capture_config(self.config.snapshot() if isinstance(self.config, ThreadSafeConfig) else dict(self.config)))
         field_correction = self._ensure_config_section("field_correction")
         field_correction.setdefault("enabled", False)
         field_correction.setdefault("dark_frame_path", "")
@@ -6571,22 +7072,17 @@ class StereoCaptureOnlyApp:
 
     def _guide_mode_key(self) -> str:
         value = self.guide_mode_var.get()
-        if value == "中心十字":
+        if value in {"中心十字", "仅十字线"}:
             return "center"
-        if value == "全部网格线":
+        if value in {"仅网格线", "网格线"}:
+            return "grid"
+        if value in {"全部网格线", "十字+网格"}:
             return "full"
         return "off"
 
     def _record_roi_sizes_from_config(self, config_snapshot: dict) -> tuple[tuple[int, int], tuple[int, int]]:
-        left_size = (
-            int(config_snapshot.get("left_roi_width", config_snapshot.get("roi_width", CAPTURE_WIDTH)) or CAPTURE_WIDTH),
-            int(config_snapshot.get("left_roi_height", config_snapshot.get("roi_height", CAPTURE_HEIGHT)) or CAPTURE_HEIGHT),
-        )
-        right_size = (
-            int(config_snapshot.get("right_roi_width", config_snapshot.get("roi_width", CAPTURE_WIDTH)) or CAPTURE_WIDTH),
-            int(config_snapshot.get("right_roi_height", config_snapshot.get("roi_height", CAPTURE_HEIGHT)) or CAPTURE_HEIGHT),
-        )
-        return left_size, right_size
+        rois = self._side_roi_requests_from_config(config_snapshot)
+        return rois["left"][:2], rois["right"][:2]
 
     def _record_pair_bytes_from_config(self, config_snapshot: dict) -> int:
         if not config_bool(config_snapshot, "record_save_image_sequence", False, False):
@@ -6599,7 +7095,7 @@ class StereoCaptureOnlyApp:
         )
 
     def _capture_priority_record_config(self, config_snapshot: dict) -> dict:
-        snapshot = dict(config_snapshot)
+        snapshot = mono8_capture_config(config_snapshot)
         if not config_bool(snapshot, "record_capture_priority_mode", True, True):
             return snapshot
 
@@ -6781,12 +7277,14 @@ class StereoCaptureOnlyApp:
 
     def _sync_quality_toggles(self) -> None:
         self.config["preview_quality_analysis_enabled"] = bool(self.preview_quality_analysis_var.get())
+        self.config["focus_realtime_analysis_enabled"] = bool(self.focus_realtime_analysis_var.get())
         exposure_monitor = self._ensure_config_section("exposure_monitor")
         exposure_monitor["zebra_enabled"] = bool(self.zebra_var.get())
         exposure_monitor["histogram_enabled"] = bool(self.histogram_enabled_var.get())
+        self._focus_realtime_analysis_enabled_setting = bool(self.focus_realtime_analysis_var.get())
         self._focus_peaking_enabled_setting = bool(self.focus_peaking_var.get())
         self._histogram_enabled_setting = bool(self.histogram_enabled_var.get())
-        if not self.preview_quality_analysis_var.get():
+        if not self.preview_quality_analysis_var.get() or not self.focus_realtime_analysis_var.get():
             self._set_last_quality_metrics(None)
             self._last_focus_overlay_left = None
             self._last_focus_overlay_right = None
@@ -6795,7 +7293,10 @@ class StereoCaptureOnlyApp:
         self._update_quality_optional_sections()
         save_config(self.config)
         if hasattr(self, "left_pane"):
-            if self._histogram_enabled_setting and (
+            needs_analysis = self._histogram_enabled_setting or (
+                self._focus_realtime_analysis_enabled_setting and self.preview_quality_analysis_var.get()
+            )
+            if needs_analysis and (
                 self._last_left_frame_obj is not None or self._last_right_frame_obj is not None
             ):
                 metrics = self._analyze_preview_frames(
@@ -6809,8 +7310,10 @@ class StereoCaptureOnlyApp:
     def _update_quality_optional_sections(self) -> None:
         if not hasattr(self, "magnifier_frame"):
             return
-        if not self.magnifier_frame.winfo_manager():
+        if self.magnifier_enabled_var.get() and not self.magnifier_frame.winfo_manager():
             self.magnifier_frame.grid(row=0, column=1, sticky="nsew")
+        elif not self.magnifier_enabled_var.get() and self.magnifier_frame.winfo_manager():
+            self.magnifier_frame.grid_remove()
         self._update_magnifier()
 
     def _set_last_quality_metrics(self, metrics: dict[str, object] | None) -> None:
@@ -6828,26 +7331,38 @@ class StereoCaptureOnlyApp:
             self._cached_focus_roi_source = source
         return self._cached_focus_roi
 
-    def _analyze_preview_frames(self, left: CameraFrame | None, right: CameraFrame | None, frame_index: int) -> dict[str, object]:
+    def _analyze_preview_frames(
+        self,
+        left: CameraFrame | None,
+        right: CameraFrame | None,
+        frame_index: int,
+        *,
+        force_focus_analysis: bool = False,
+    ) -> dict[str, object]:
         roi = self._focus_roi()
         method = str(self.config.get("focus_method", "laplacian"))
         left_image = left.image if left is not None and getattr(left, "image", None) is not None else None
         right_image = right.image if right is not None and getattr(right, "image", None) is not None else None
         metrics: dict[str, object] = {
-            "focus": focus_pair_metrics(left_image, right_image, roi, method),
             "focus_roi": roi,
             "temperatures_c": dict(self._latest_temperatures),
             "timestamp": time.time(),
         }
+        focus_analysis_enabled = force_focus_analysis or bool(
+            getattr(self, "_focus_realtime_analysis_enabled_setting", True)
+        )
+        if focus_analysis_enabled:
+            metrics["focus"] = focus_pair_metrics(left_image, right_image, roi, method)
         update_histogram = bool(self._histogram_enabled_setting)
         metrics["left_exposure"] = exposure_metrics(left_image, include_histogram=update_histogram)
         metrics["right_exposure"] = exposure_metrics(right_image, include_histogram=update_histogram)
-        metrics["dic_speckle"] = {
-            "left": speckle_quality(left_image, roi),
-            "right": speckle_quality(right_image, roi),
-        }
-        focus = metrics["focus"]
-        if self._focus_peaking_enabled_setting and isinstance(focus, dict):
+        if focus_analysis_enabled:
+            metrics["dic_speckle"] = {
+                "left": speckle_quality(left_image, roi),
+                "right": speckle_quality(right_image, roi),
+            }
+        focus = metrics.get("focus")
+        if focus_analysis_enabled and self._focus_peaking_enabled_setting and isinstance(focus, dict):
             now = time.perf_counter()
             interval_s = max(config_float(self.config, "focus_peaking_overlay_interval_seconds", 0.20), 0.05)
             overlay_key = (
@@ -6867,7 +7382,7 @@ class StereoCaptureOnlyApp:
                 self._last_focus_overlay_right = make_focus_peaking_overlay(right_image) if right_image is not None else None
                 self._last_focus_overlay_key = overlay_key
                 self._last_focus_overlay_time = now
-        elif not self._focus_peaking_enabled_setting:
+        elif not focus_analysis_enabled or not self._focus_peaking_enabled_setting:
             self._last_focus_overlay_left = None
             self._last_focus_overlay_right = None
             self._last_focus_overlay_key = None
@@ -6878,7 +7393,8 @@ class StereoCaptureOnlyApp:
         if not isinstance(metrics, dict):
             return
         now = time.perf_counter()
-        self._set_last_quality_metrics(metrics)
+        if isinstance(metrics.get("focus"), dict):
+            self._set_last_quality_metrics(metrics)
         if now - self._last_analysis_time < 0.20:
             return
         self._last_analysis_time = now
@@ -7146,22 +7662,22 @@ class StereoCaptureOnlyApp:
             pct = 0.0
             status = "未标定"
             style = "Yellow.Horizontal.TProgressbar"
-            label_style = "Warn.TLabel"
+            label_style = "PanelWarn.TLabel"
         else:
             pct = min(max(score / max(float(reference), 1e-9) * 100.0, 0.0), 150.0)
             if pct >= 80:
                 status = "对焦良好"
                 style = "Green.Horizontal.TProgressbar"
-                label_style = "Good.TLabel"
+                label_style = "PanelGood.TLabel"
             elif pct >= 40:
                 status = "对焦一般，建议微调"
                 style = "Yellow.Horizontal.TProgressbar"
-                label_style = "Warn.TLabel"
+                label_style = "PanelWarn.TLabel"
             else:
                 status = "对焦不足，需重新对焦"
                 style = "Red.Horizontal.TProgressbar"
-                label_style = "Bad.TLabel"
-        self.focus_score_var.set(f"Focus {score:.1f}")
+                label_style = "PanelBad.TLabel"
+        self.focus_score_var.set(f"{score:.1f}")
         self._update_focus_chart(score)
         self.focus_progress.configure(value=min(pct, 100.0), style=style)
         self.focus_status_var.set(status)
@@ -7170,16 +7686,23 @@ class StereoCaptureOnlyApp:
         r_text = "--" if right_score is None else f"{float(right_score):.1f}"
         d_text = "--" if delta is None else f"{float(delta):.1f}"
         self.focus_detail_var.set(f"L: {l_text} | R: {r_text} | Δ: {d_text}")
+        self.focus_left_score_var.set(l_text)
+        self.focus_right_score_var.set(r_text)
+        self.focus_delta_var.set(d_text)
         consistency_warning = bool(focus.get("consistency_warning"))
-        self.focus_detail_label.configure(style="PanelBad.TLabel" if consistency_warning else "Panel.TLabel")
+        detail_style = "PanelBad.TLabel" if consistency_warning else "PanelMetricValue.TLabel"
+        for label_name in ("focus_left_score_label", "focus_right_score_label", "focus_delta_label"):
+            if hasattr(self, label_name):
+                getattr(self, label_name).configure(style=detail_style)
         if consistency_warning:
             self.focus_status_var.set("左右对焦不一致")
-            self.focus_status_label.configure(style="Bad.TLabel")
+            self.focus_status_label.configure(style="PanelBad.TLabel")
 
     def _update_exposure_display(self, left_exposure: dict[str, object] | None, right_exposure: dict[str, object] | None) -> None:
         exposures = [item for item in (left_exposure, right_exposure) if item]
         if not exposures:
             self.exposure_status_var.set("过曝: -- | 欠曝: -- | SNR: --")
+            self.exposure_advice_var.set("曝光建议: --")
             return
         over_pct = max(float(item.get("over_pct") or 0.0) for item in exposures)
         under_pct = max(float(item.get("under_pct") or 0.0) for item in exposures)
@@ -7195,8 +7718,6 @@ class StereoCaptureOnlyApp:
                 snr_style = "PanelWarn.TLabel"
             else:
                 snr_style = "PanelBad.TLabel"
-        self.exposure_status_var.set(f"过曝: {over_pct:.1f}% | 欠曝: {under_pct:.1f}% | SNR: {snr_text}")
-        self.exposure_status_label.configure(style=snr_style)
         advice = left_exposure.get("advice") if left_exposure else None
         if not advice and right_exposure:
             advice = right_exposure.get("advice")
@@ -7204,7 +7725,12 @@ class StereoCaptureOnlyApp:
         current_gain = config_float(self.config, "gain", 0.0)
         if snr_values and current_gain > min(gain_limit, 6.0) and min(snr_values) < 30.0:
             advice = "建议降低增益或增加光照"
-        self.exposure_advice_var.set(f"曝光建议: {advice or '--'}")
+        advice_text = str(advice or "--")
+        self.exposure_status_var.set(f"过曝: {over_pct:.1f}% | 欠曝: {under_pct:.1f}% | SNR: {snr_text}")
+        self.exposure_status_label.configure(style=snr_style)
+        if hasattr(self, "exposure_advice_label"):
+            self.exposure_advice_label.configure(style=snr_style)
+        self.exposure_advice_var.set(f"曝光建议: {advice_text}")
         if self.histogram_enabled_var.get():
             if left_exposure and left_exposure.get("histogram"):
                 self.left_hist_canvas.set_histogram(left_exposure.get("histogram"))
@@ -7615,7 +8141,12 @@ class StereoCaptureOnlyApp:
         return allow, report
 
     def _quality_metrics_for_pair(self, left: CameraFrame | None, right: CameraFrame | None) -> dict[str, object]:
-        metrics = self._analyze_preview_frames(left, right, self._preview_frame_counter + 1)
+        metrics = self._analyze_preview_frames(
+            left,
+            right,
+            self._preview_frame_counter + 1,
+            force_focus_analysis=True,
+        )
         self._set_last_quality_metrics(metrics)
         calibration_cfg = self.config.get("calibration_check", {})
         if config_bool(calibration_cfg, "board_coverage_enabled", False, False):
@@ -7636,16 +8167,11 @@ class StereoCaptureOnlyApp:
         return metrics
 
     def _current_parameter_config(self) -> dict:
-        left_width = optional_int_text(self.left_roi_width_var.get()) or CAPTURE_WIDTH
-        left_height = optional_int_text(self.left_roi_height_var.get()) or CAPTURE_HEIGHT
-        left_offset_x = int(self.left_roi_offset_x_var.get() or 0)
-        left_offset_y = int(self.left_roi_offset_y_var.get() or 0)
-        right_width = optional_int_text(self.right_roi_width_var.get()) or CAPTURE_WIDTH
-        right_height = optional_int_text(self.right_roi_height_var.get()) or CAPTURE_HEIGHT
-        right_offset_x = int(self.right_roi_offset_x_var.get() or 0)
-        right_offset_y = int(self.right_roi_offset_y_var.get() or 0)
+        rois = self._side_roi_requests_from_controls()
+        left_width, left_height, left_offset_x, left_offset_y = rois["left"]
+        right_width, right_height, right_offset_x, right_offset_y = rois["right"]
         return {
-            "trigger_source": self.trigger_source_var.get(),
+            "trigger_source": safe_capture_trigger_source(self.trigger_source_var.get()),
             "exposure_auto": self.exposure_auto_var.get(),
             "exposure_time_us": float(self.exposure_time_var.get() or 0),
             "auto_exposure_lower_limit": optional_float_text(self.auto_exposure_lower_var.get()),
@@ -7661,10 +8187,10 @@ class StereoCaptureOnlyApp:
             "black_level": optional_float_text(self.black_level_var.get()),
             "digital_shift": optional_float_text(self.digital_shift_var.get()),
             "gamma": optional_float_text(self.gamma_var.get()),
-            "pixel_format": self.config.get("pixel_format", "Mono8"),
+            "pixel_format": CAPTURE_PIXEL_FORMAT,
             "image_format": image_extension(self.config),
-            "record_force_image_format": config_bool(self.config, "record_force_image_format", False, False),
-            "save_raw_frames": config_bool(self.config, "save_raw_frames", False, False),
+            "record_force_image_format": True,
+            "save_raw_frames": False,
             "raw_frame_format": raw_frame_format(self.config),
             "camera_timestamp_offset_fixed": self.config.get("camera_timestamp_offset_fixed"),
             "field_correction": dict(self.config.get("field_correction", {}))
@@ -7677,14 +8203,7 @@ class StereoCaptureOnlyApp:
             "chunk_selectors": list(self.config.get("chunk_selectors", []))
             if isinstance(self.config.get("chunk_selectors"), list)
             else self.config.get("chunk_selectors"),
-            "require_hardware_trigger": config_bool(self.config, "require_hardware_trigger", False, False),
-            "hardware_sync_enabled": config_bool(self.config, "hardware_sync_enabled", False, False),
-            "hardware_sync_master": self.config.get("hardware_sync_master", "left"),
-            "hardware_sync_master_line": self.config.get("hardware_sync_master_line", "Line2"),
-            "hardware_sync_master_line_source": self.config.get("hardware_sync_master_line_source", "ExposureActive"),
-            "hardware_sync_slave_line": self.config.get("hardware_sync_slave_line", "Line0"),
-            "hardware_sync_slave_activation": self.config.get("hardware_sync_slave_activation", "RisingEdge"),
-            "hardware_sync_master_trigger_source": self.config.get("hardware_sync_master_trigger_source", "Software"),
+            **TRIGGER_CONFIG_SAFE_DEFAULTS,
             "roi_width": left_width,
             "roi_height": left_height,
             "roi_offset_x": left_offset_x,
@@ -7700,6 +8219,7 @@ class StereoCaptureOnlyApp:
         }
 
     def _load_vars_from_snapshot(self, snapshot: dict[str, object], *, include_record_fps: bool = True) -> None:
+        snapshot = safe_trigger_config(snapshot)
         self.trigger_source_var.set(display_trigger_source(snapshot.get("trigger_source", "Software")))
         self._set_cached_trigger_source(str(snapshot.get("trigger_source", "Software")))
         self.exposure_auto_var.set(str(snapshot.get("exposure_auto", "Off")))
@@ -7713,8 +8233,8 @@ class StereoCaptureOnlyApp:
         self.left_roi_height_var.set(str(snapshot.get("left_roi_height", snapshot.get("roi_height", CAPTURE_HEIGHT))))
         self.left_roi_offset_x_var.set(str(snapshot.get("left_roi_offset_x", snapshot.get("roi_offset_x", 0))))
         self.left_roi_offset_y_var.set(str(snapshot.get("left_roi_offset_y", snapshot.get("roi_offset_y", 0))))
-        self.right_roi_width_var.set(str(snapshot.get("right_roi_width", snapshot.get("roi_width", CAPTURE_WIDTH))))
-        self.right_roi_height_var.set(str(snapshot.get("right_roi_height", snapshot.get("roi_height", CAPTURE_HEIGHT))))
+        self.right_roi_width_var.set(str(snapshot.get("left_roi_width", snapshot.get("roi_width", CAPTURE_WIDTH))))
+        self.right_roi_height_var.set(str(snapshot.get("left_roi_height", snapshot.get("roi_height", CAPTURE_HEIGHT))))
         self.right_roi_offset_x_var.set(str(snapshot.get("right_roi_offset_x", snapshot.get("roi_offset_x", 0))))
         self.right_roi_offset_y_var.set(str(snapshot.get("right_roi_offset_y", snapshot.get("roi_offset_y", 0))))
         self.interval_seconds_var.set(optional_config_text(snapshot, "interval_capture_seconds", ""))
@@ -7722,11 +8242,9 @@ class StereoCaptureOnlyApp:
         if include_record_fps:
             self.record_fps_var.set(str(snapshot.get("record_fps", 5.0)))
         self.dic_record_fps_var.set(str(snapshot.get("record_fps", DIC_CAPTURE_CONFIG["record_fps"])))
-        if hasattr(self, "dic_pixel_format_var"):
-            pixel_format = str(snapshot.get("pixel_format", DIC_CAPTURE_CONFIG["pixel_format"]))
-            self.dic_pixel_format_var.set(pixel_format if pixel_format in DIC_PIXEL_FORMATS else "Mono16")
 
     def _apply_capture_config_to_camera(self, config_snapshot: dict[str, object]) -> list[str]:
+        config_snapshot = mono8_capture_config(safe_trigger_config(config_snapshot))
         camera_system = self._require_camera_system()
         warnings: list[str] = []
 
@@ -7734,7 +8252,7 @@ class StereoCaptureOnlyApp:
             value = config_snapshot.get(key)
             return optional_float_text("" if value is None else str(value))
 
-        pixel_format = str(config_snapshot.get("pixel_format", "Mono8"))
+        pixel_format = CAPTURE_PIXEL_FORMAT
         apply_pixel_format = getattr(camera_system, "apply_pixel_format_settings", None)
         if callable(apply_pixel_format):
             warnings.extend(apply_pixel_format(pixel_format))
@@ -7764,20 +8282,7 @@ class StereoCaptureOnlyApp:
                     optional_config_float("gamma"),
                 )
             )
-        rois = {
-            "left": (
-                int(config_snapshot.get("left_roi_width", config_snapshot.get("roi_width", CAPTURE_WIDTH)) or CAPTURE_WIDTH),
-                int(config_snapshot.get("left_roi_height", config_snapshot.get("roi_height", CAPTURE_HEIGHT)) or CAPTURE_HEIGHT),
-                int(config_snapshot.get("left_roi_offset_x", config_snapshot.get("roi_offset_x", 0)) or 0),
-                int(config_snapshot.get("left_roi_offset_y", config_snapshot.get("roi_offset_y", 0)) or 0),
-            ),
-            "right": (
-                int(config_snapshot.get("right_roi_width", config_snapshot.get("roi_width", CAPTURE_WIDTH)) or CAPTURE_WIDTH),
-                int(config_snapshot.get("right_roi_height", config_snapshot.get("roi_height", CAPTURE_HEIGHT)) or CAPTURE_HEIGHT),
-                int(config_snapshot.get("right_roi_offset_x", config_snapshot.get("roi_offset_x", 0)) or 0),
-                int(config_snapshot.get("right_roi_offset_y", config_snapshot.get("roi_offset_y", 0)) or 0),
-            ),
-        }
+        rois = self._side_roi_requests_from_config(config_snapshot)
         _results, roi_warnings = camera_system.apply_side_roi_settings(rois, restart_stream=True)
         warnings.extend(roi_warnings)
         apply_chunk = getattr(camera_system, "apply_chunk_settings", None)
@@ -7791,6 +8296,8 @@ class StereoCaptureOnlyApp:
         if hasattr(camera_system, "config"):
             camera_system.config.update(config_snapshot)
         camera_system.trigger_source = str(config_snapshot.get("trigger_source", camera_system.trigger_source))
+        camera_system.require_hardware_trigger = False
+        camera_system.hardware_sync_enabled = False
         camera_system.timestamp_reject_enabled = config_bool(config_snapshot, "timestamp_reject_enabled", True, False)
         camera_system.max_camera_timestamp_delta = int(config_snapshot.get("max_camera_timestamp_delta", 0) or 0)
         camera_system.max_host_timestamp_delta = int(
@@ -7803,29 +8310,22 @@ class StereoCaptureOnlyApp:
     def _save_current_capture_settings(self) -> None:
         values = self._current_parameter_config()
         values["interval_capture_seconds"] = float(self.interval_seconds_var.get() or 0)
-        values["interval_capture_count"] = optional_int_text(self.interval_limit_var.get())
+        values["interval_capture_count"] = optional_interval_limit_text(self.interval_limit_var.get())
         values["record_fps"] = optional_positive_fps(self.record_fps_var.get()) or 0.0
         values["record_max_seconds"] = max(float(self.record_max_seconds_var.get() or 0), 0.0)
         try:
             dic_record_fps = self._dic_record_fps_from_entry()
         except ValueError:
             dic_record_fps = config_float(self.config.get("dic_capture", {}), "record_fps", DIC_CAPTURE_CONFIG["record_fps"])
-        try:
-            dic_pixel_format = self._dic_pixel_format_from_entry()
-        except ValueError:
-            dic_pixel_format = str(self.config.get("dic_capture", {}).get("pixel_format", DIC_CAPTURE_CONFIG["pixel_format"]))
         dic_capture = dict(self.config.get("dic_capture", {}) if isinstance(self.config.get("dic_capture"), dict) else {})
         dic_capture["record_fps"] = dic_record_fps
-        dic_capture["pixel_format"] = dic_pixel_format
-        high_bit_depth = dic_pixel_format != "Mono8"
-        dic_capture["save_raw_frames"] = high_bit_depth
-        dic_capture["record_force_image_format"] = not high_bit_depth
+        dic_capture["pixel_format"] = CAPTURE_PIXEL_FORMAT
+        dic_capture["save_raw_frames"] = False
+        dic_capture["record_force_image_format"] = True
         dic_capture["image_format"] = "png"
         dic_capture["viewable_sidecar_enabled"] = True
         dic_capture["viewable_sidecar_format"] = "png"
-        if high_bit_depth:
-            dic_capture["raw_frame_format"] = str(dic_capture.get("raw_frame_format") or "tiff16")
-        values["dic_capture"] = dic_capture
+        values["dic_capture"] = mono8_capture_config(dic_capture)
         self._update_config(values, save=False)
         self._set_cached_trigger_source(str(values.get("trigger_source", "Software")))
         self._ensure_recording_config_defaults()
@@ -7849,6 +8349,7 @@ class StereoCaptureOnlyApp:
         self._ensure_reliability_config_defaults()
 
     def _load_vars_from_config(self) -> None:
+        self.config.update(safe_trigger_config(self._config_snapshot()))
         self._ensure_default_full_resolution()
         self.trigger_source_var.set(display_trigger_source(self.config.get("trigger_source", "Software")))
         self._set_cached_trigger_source(str(self.config.get("trigger_source", "Software")))
@@ -7871,8 +8372,8 @@ class StereoCaptureOnlyApp:
         self.left_roi_height_var.set(str(self.config.get("left_roi_height", self.config.get("roi_height", CAPTURE_HEIGHT))))
         self.left_roi_offset_x_var.set(str(self.config.get("left_roi_offset_x", self.config.get("roi_offset_x", 0))))
         self.left_roi_offset_y_var.set(str(self.config.get("left_roi_offset_y", self.config.get("roi_offset_y", 0))))
-        self.right_roi_width_var.set(str(self.config.get("right_roi_width", self.config.get("roi_width", CAPTURE_WIDTH))))
-        self.right_roi_height_var.set(str(self.config.get("right_roi_height", self.config.get("roi_height", CAPTURE_HEIGHT))))
+        self.right_roi_width_var.set(str(self.config.get("left_roi_width", self.config.get("roi_width", CAPTURE_WIDTH))))
+        self.right_roi_height_var.set(str(self.config.get("left_roi_height", self.config.get("roi_height", CAPTURE_HEIGHT))))
         self.right_roi_offset_x_var.set(str(self.config.get("right_roi_offset_x", self.config.get("roi_offset_x", 0))))
         self.right_roi_offset_y_var.set(str(self.config.get("right_roi_offset_y", self.config.get("roi_offset_y", 0))))
         self.record_max_seconds_var.set(optional_config_text(self.config, "record_max_seconds", "0"))
@@ -7884,15 +8385,8 @@ class StereoCaptureOnlyApp:
 
     def _side_roi_dimensions_from_config(self, config_snapshot: dict | None = None) -> tuple[tuple[int, int], tuple[int, int]]:
         config_snapshot = config_snapshot or self._config_snapshot()
-        left = (
-            int(config_snapshot.get("left_roi_width") or config_snapshot.get("roi_width") or CAPTURE_WIDTH),
-            int(config_snapshot.get("left_roi_height") or config_snapshot.get("roi_height") or CAPTURE_HEIGHT),
-        )
-        right = (
-            int(config_snapshot.get("right_roi_width") or config_snapshot.get("roi_width") or CAPTURE_WIDTH),
-            int(config_snapshot.get("right_roi_height") or config_snapshot.get("roi_height") or CAPTURE_HEIGHT),
-        )
-        return left, right
+        rois = self._side_roi_requests_from_config(config_snapshot)
+        return rois["left"][:2], rois["right"][:2]
 
     def _reset_stats(self) -> None:
         self._stat_last_time = time.perf_counter()
@@ -9049,15 +9543,10 @@ Output {esc('MP4 + image sequence' if config_bool(config_snapshot, 'record_save_
         quality_report: dict[str, object] | None = None,
     ) -> Path:
         capture_id = timestamp_ms()
-        photo_root = self.project_manager.output_root_for_mode("photos")
-        group_dir = photo_root / capture_id
-        group_dir.mkdir(parents=True, exist_ok=True)
+        left_dir, right_dir, meta_dir = self._project_capture_paths(capture_id)
+        project_dir = self.project_manager.active_project_dir
         ext = image_extension(self.config)
 
-        left_dir = group_dir / "left"
-        right_dir = group_dir / "right"
-        left_dir.mkdir(parents=True, exist_ok=True)
-        right_dir.mkdir(parents=True, exist_ok=True)
         group_left = left_dir / f"{capture_id}_left.{ext}"
         group_right = right_dir / f"{capture_id}_right.{ext}"
 
@@ -9072,7 +9561,7 @@ Output {esc('MP4 + image sequence' if config_bool(config_snapshot, 'record_save_
         calibration_board = quality_metrics.get("calibration_board")
         dic_speckle = quality_metrics.get("dic_speckle")
         self._write_meta(
-            group_dir / "meta.json",
+            meta_dir / "meta.json",
             mode=mode,
             capture_id=capture_id,
             trigger_time=trigger_time,
@@ -9092,27 +9581,30 @@ Output {esc('MP4 + image sequence' if config_bool(config_snapshot, 'record_save_
             calibration_board=calibration_board,
             capture_quality_report=quality_report or self._quality_report_from_metrics(quality_metrics),
             data_manifest={
-                "manifest_csv": str(group_dir / "exports" / "file_manifest.csv"),
-                "summary_json": str(group_dir / "exports" / "capture_summary.json"),
+                "manifest_csv": str(meta_dir / "exports" / "file_manifest.csv"),
+                "summary_json": str(meta_dir / "exports" / "capture_summary.json"),
             },
         )
         manifest = self._write_manifest_for_session(
-            group_dir,
+            meta_dir,
             {
                 "mode": mode,
                 "capture_id": capture_id,
                 "dic_speckle": dic_speckle,
                 "quality_report": quality_report or self._quality_report_from_metrics(quality_metrics),
             },
+            scan_roots=[meta_dir, left_dir, right_dir],
         )
-        self.project_manager.register_session(mode, group_dir, group_dir / "meta.json", {"manifest": manifest})
-        return group_dir
+        self.project_manager.register_session(
+            mode,
+            meta_dir,
+            meta_dir / "meta.json",
+            {"capture_id": capture_id, "image_root": str(project_dir), "manifest": manifest},
+        )
+        return meta_dir
 
     def _save_frame(self, frame: CameraFrame, path: Path, config_snapshot: dict | None = None) -> Path:
-        config_snapshot = config_snapshot or self._config_snapshot()
-        force_image = config_bool(config_snapshot, "record_force_image_format", False, False)
-        if self._should_save_raw_frame(frame, config_snapshot) and not force_image:
-            return self._save_raw_frame(frame, path, config_snapshot)
+        config_snapshot = mono8_capture_config(config_snapshot or self._config_snapshot())
         if getattr(frame, "image", None) is None:
             return self._save_raw_frame(frame, path, config_snapshot)
         return self._save_image(frame.image, path, config_snapshot)
@@ -9340,6 +9832,7 @@ Output {esc('MP4 + image sequence' if config_bool(config_snapshot, 'record_save_
         session_dir: Path,
         capture_summary: dict[str, object],
         config_snapshot: dict | None = None,
+        scan_roots: list[Path] | None = None,
     ) -> dict[str, object]:
         config_snapshot = config_snapshot or self._config_snapshot()
         camera_settings = self._capture_settings_snapshot(config_snapshot)
@@ -9356,6 +9849,7 @@ Output {esc('MP4 + image sequence' if config_bool(config_snapshot, 'record_save_
             camera_settings=camera_settings,
             environment=environment,
             algorithm=self._checksum_algorithm(config_snapshot),
+            scan_roots=scan_roots,
         )
 
     def _capture_settings_snapshot(self, config_snapshot: dict | None = None) -> dict[str, object]:
@@ -9432,7 +9926,7 @@ Output {esc('MP4 + image sequence' if config_bool(config_snapshot, 'record_save_
         payload["left"] = self._frame_meta(left_frame) if left_frame is not None else None
         payload["right"] = self._frame_meta(right_frame) if right_frame is not None else None
         payload["image_format"] = image_extension(self.config)
-        payload["pixel_format"] = self.config.get("pixel_format", "Mono8")
+        payload["pixel_format"] = CAPTURE_PIXEL_FORMAT
         payload["left_camera"] = asdict(self.camera_system.left_info) if self.camera_system and self.camera_system.left_info else None
         payload["right_camera"] = (
             asdict(self.camera_system.right_info) if self.camera_system and self.camera_system.right_info else None
