@@ -1,6 +1,6 @@
 {
-  "left_serial": "DB0371852",
-  "right_serial": "DB0371907",
+  "left_serial": "DB0371907",
+  "right_serial": "DB0371852",
   "bind_camera_serials": true,
   "save_dir": "captures",
   "trigger_source": "Software",
@@ -12,14 +12,14 @@
   "gain_auto": "Once",
   "auto_gain_lower_limit": 0.0,
   "auto_gain_upper_limit": 15.0,
-  "balance_white_auto": "Off",
+  "balance_white_auto": "Once",
   "balance_ratio_red": null,
   "balance_ratio_green": null,
   "balance_ratio_blue": null,
-  "roi_width": 2444,
-  "roi_height": 1298,
-  "roi_offset_x": 744,
-  "roi_offset_y": 1354,
+  "roi_width": 3980,
+  "roi_height": 2316,
+  "roi_offset_x": 1220,
+  "roi_offset_y": 466,
   "pixel_format": "Mono8",
   "image_format": "png",
   "frame_timeout_ms": 800,
@@ -49,7 +49,7 @@
     "Gain"
   ],
   "preview_fps": 5.0,
-  "record_fps": 5.0,
+  "record_fps": 1.0,
   "interval_capture_seconds": 0.5,
   "interval_capture_count": null,
   "record_jpeg_quality": 100,
@@ -61,7 +61,7 @@
   "use_nvenc": false,
   "record_split_interval_seconds": 0,
   "record_split_size_gb": 0.0,
-  "record_max_seconds": 0.0,
+  "record_max_seconds": 80.0,
   "logging_enabled": true,
   "sound_alert_enabled": true,
   "auto_reconnect_enabled": true,
@@ -318,10 +318,10 @@
     }
   },
   "focus_roi": {
-    "x_frac": 0.15625,
-    "y_frac": 0.3969298245614035,
-    "w_frac": 0.40789473684210525,
-    "h_frac": 0.3092105263157895
+    "x_frac": 0.0,
+    "y_frac": 0.015112262521588947,
+    "w_frac": 0.05025125628140704,
+    "h_frac": 0.08635578583765112
   },
   "focus_method": "laplacian",
   "focus_reference_score": 941.6252859372322,
@@ -377,8 +377,8 @@
   "project": {
     "enabled": true,
     "projects_subdir": "projects",
-    "current_project_id": "20260614_122501_944",
-    "current_project_name": "Project 20260614_122501_944"
+    "current_project_id": "20260616_100727_254",
+    "current_project_name": "Project 20260616_100727_254"
   },
   "hdr_bracketing": {
     "enabled": true,
@@ -399,14 +399,14 @@
   "record_checksum_during_capture": false,
   "save_raw_frames": false,
   "preview_quality_analysis_enabled": false,
-  "left_roi_width": 2444,
-  "left_roi_height": 1298,
-  "left_roi_offset_x": 744,
-  "left_roi_offset_y": 1354,
-  "right_roi_width": 2444,
-  "right_roi_height": 1298,
-  "right_roi_offset_x": 0,
-  "right_roi_offset_y": 0,
+  "left_roi_width": 3980,
+  "left_roi_height": 2316,
+  "left_roi_offset_x": 1220,
+  "left_roi_offset_y": 466,
+  "right_roi_width": 3980,
+  "right_roi_height": 2316,
+  "right_roi_offset_x": 200,
+  "right_roi_offset_y": 466,
   "close_total_thread_join_timeout_seconds": 10.0,
   "software_trigger_barrier_timeout_seconds": 1.0,
   "record_queue_max_items": 32,
@@ -461,7 +461,7 @@
     "right_roi_height": 3648,
     "right_roi_offset_x": 0,
     "right_roi_offset_y": 0,
-    "record_fps": 5.0,
+    "record_fps": 1.0,
     "interval_capture_seconds": 0.5,
     "interval_capture_count": null,
     "record_save_image_sequence": true,
@@ -530,5 +530,6 @@
   "digital_shift": null,
   "gamma": null,
   "viewable_sidecar_enabled": true,
-  "viewable_sidecar_format": "png"
+  "viewable_sidecar_format": "png",
+  "focus_realtime_analysis_enabled": false
 }

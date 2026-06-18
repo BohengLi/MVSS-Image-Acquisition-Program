@@ -209,6 +209,28 @@ RAW_FRAME_FORMATS = {"npy", "png16", "tiff16", "exr"}
 DIC_CAPTURE_MODE = "dic_capture"
 CAPTURE_PIXEL_FORMAT = "Mono8"
 CAMERA_ASSIGNMENT_AUTO = "自动"
+DIC_CAMERA_SETTING_KEYS = (
+    "exposure_auto",
+    "exposure_time_us",
+    "auto_exposure_lower_limit",
+    "auto_exposure_upper_limit",
+    "gain_auto",
+    "gain",
+    "auto_gain_lower_limit",
+    "auto_gain_upper_limit",
+    "roi_width",
+    "roi_height",
+    "roi_offset_x",
+    "roi_offset_y",
+    "left_roi_width",
+    "left_roi_height",
+    "left_roi_offset_x",
+    "left_roi_offset_y",
+    "right_roi_width",
+    "right_roi_height",
+    "right_roi_offset_x",
+    "right_roi_offset_y",
+)
 DIC_CAPTURE_CONFIG = {
     "trigger_source": "Continuous",
     "trigger_activation": "RisingEdge",
@@ -657,6 +679,16 @@ def optional_float_text(text: str) -> float | None:
 def optional_int_text(text: str) -> int | None:
     value = text.strip()
     if not value:
+        return None
+    return int(value)
+
+
+def optional_interval_limit_text(text: str) -> int | None:
+    value = str(text).strip()
+    if not value:
+        return None
+    lowered = value.lower()
+    if lowered in {"none", "null", "unlimited", "不限", "无限", "持续"}:
         return None
     return int(value)
 
@@ -2072,6 +2104,9 @@ class StereoCaptureOnlyApp:
         self.preview_quality_analysis_var = BooleanVar(
             value=config_bool(self.config, "preview_quality_analysis_enabled", True, True)
         )
+        self.focus_realtime_analysis_var = BooleanVar(
+            value=config_bool(self.config, "focus_realtime_analysis_enabled", True, True)
+        )
         self.focus_peaking_var = BooleanVar(value=False)
         self.zebra_var = BooleanVar(value=bool(exposure_monitor.get("zebra_enabled", False)))
         self.histogram_enabled_var = BooleanVar(value=bool(exposure_monitor.get("histogram_enabled", True)))
@@ -2119,6 +2154,7 @@ class StereoCaptureOnlyApp:
         self.guide_mode_var = StringVar(value="关闭")
         self.mp4_progress_var = StringVar(value="MP4 --")
         self._focus_peaking_enabled_setting = bool(self.focus_peaking_var.get())
+        self._focus_realtime_analysis_enabled_setting = bool(self.focus_realtime_analysis_var.get())
         self._histogram_enabled_setting = bool(self.histogram_enabled_var.get())
         if self.project_manager.enabled:
             self.save_dir_var.set(str(self.project_manager.active_project_dir))
@@ -2874,6 +2910,9 @@ class StereoCaptureOnlyApp:
     def _build_focus_panel(self, panel: ttk.LabelFrame) -> None:
         top = ttk.Frame(panel, style="Panel.TFrame")
         top.pack(side=TOP, fill=X)
+        ttk.Checkbutton(top, text="实时分析", variable=self.focus_realtime_analysis_var, command=self._sync_quality_toggles).pack(
+            side=LEFT, padx=(0, 6)
+        )
         ttk.Checkbutton(top, text="峰值对焦", variable=self.focus_peaking_var, command=self._sync_quality_toggles).pack(
             side=LEFT, padx=(0, 6)
         )
@@ -4036,6 +4075,18 @@ class StereoCaptureOnlyApp:
         self._reset_stats()
         self._start_preview_thread()
 
+    def _ensure_preview_thread_after_interval(self) -> None:
+        if self.camera_system is None or self.recording or self.interval_capturing or not self.previewing:
+            return
+        if not self.camera_system.has_ready_camera():
+            self.previewing = False
+            self.preview_button.configure(text="开始采集")
+            self.status_var.set("定时拍照结束后未重启预览：相机连接不可用，请重新连接相机。")
+            return
+        self.preview_button.configure(text="停止采集")
+        self._reset_stats()
+        self._start_preview_thread()
+
     def _start_preview_thread(self) -> None:
         with self._state_lock:
             if self.preview_thread and self.preview_thread.is_alive():
@@ -4198,10 +4249,11 @@ class StereoCaptureOnlyApp:
     def _should_analyze_preview_frame(self, frame_index: int, config_snapshot: dict | None = None) -> bool:
         config_snapshot = config_snapshot or self._config_snapshot()
         zebra_enabled = bool(self.zebra_var.get()) if hasattr(self, "zebra_var") else False
+        focus_analysis_enabled = bool(getattr(self, "_focus_realtime_analysis_enabled_setting", True))
         analysis_required = (
             config_bool(config_snapshot, "preview_quality_analysis_enabled", True, True)
             or bool(getattr(self, "_histogram_enabled_setting", False))
-            or bool(getattr(self, "_focus_peaking_enabled_setting", False))
+            or (focus_analysis_enabled and bool(getattr(self, "_focus_peaking_enabled_setting", False)))
             or zebra_enabled
         )
         if not analysis_required:
@@ -4470,7 +4522,7 @@ class StereoCaptureOnlyApp:
             return
         try:
             interval_s = float(self.interval_seconds_var.get())
-            limit = optional_int_text(self.interval_limit_var.get())
+            limit = optional_interval_limit_text(self.interval_limit_var.get())
         except ValueError:
             self.status_var.set("定时拍照参数必须是数字。")
             return
@@ -4536,8 +4588,9 @@ class StereoCaptureOnlyApp:
                 self.ui_queue.put(("interval_lamp_green", None))
                 if self.previewing:
                     self._preview_frame_counter += 1
-                    analysis = self._analyze_preview_frames(left, right, self._preview_frame_counter)
-                    self.ui_queue.put(("quality_metrics", analysis))
+                    if self._should_analyze_preview_frame(self._preview_frame_counter):
+                        analysis = self._analyze_preview_frames(left, right, self._preview_frame_counter)
+                        self.ui_queue.put(("quality_metrics", analysis))
                     self.ui_queue.put(("frames", (left, right)))
                 self.ui_queue.put(
                     (
@@ -4629,9 +4682,13 @@ class StereoCaptureOnlyApp:
             self.start_dic_capture()
 
     def _dic_capture_config(self) -> dict[str, object]:
-        dic_section = self._config_snapshot().get("dic_capture", {})
+        current = self._config_snapshot()
+        dic_section = current.get("dic_capture", {})
         dic_overrides = dic_section if isinstance(dic_section, dict) else {}
-        snapshot = {**self._config_snapshot(), **dic_capture_defaults(), **dic_overrides}
+        snapshot = {**current, **dic_capture_defaults(), **dic_overrides}
+        for key in DIC_CAMERA_SETTING_KEYS:
+            if key in current:
+                snapshot[key] = current[key]
         gate = dict(snapshot.get("capture_quality_gate", DIC_CAPTURE_CONFIG["capture_quality_gate"]))
         snapshot["capture_quality_gate"] = gate
         snapshot["image_format"] = image_extension(snapshot)
@@ -4667,6 +4724,14 @@ class StereoCaptureOnlyApp:
     def _apply_dic_record_fps_to_config(self, config_snapshot: dict[str, object]) -> dict[str, object]:
         return self._apply_dic_ui_settings_to_config(config_snapshot)
 
+    def _apply_current_camera_settings_to_dic_config(self, config_snapshot: dict[str, object]) -> dict[str, object]:
+        snapshot = dict(config_snapshot)
+        current_settings = self._current_parameter_config()
+        for key in DIC_CAMERA_SETTING_KEYS:
+            if key in current_settings:
+                snapshot[key] = current_settings[key]
+        return snapshot
+
     def start_dic_capture(self) -> None:
         if self.camera_system is None:
             return
@@ -4677,7 +4742,8 @@ class StereoCaptureOnlyApp:
             self.status_var.set("定时拍照中不能启动 DIC 图像采集。")
             return
         try:
-            config_snapshot = self._apply_dic_ui_settings_to_config(self._dic_capture_config())
+            config_snapshot = self._apply_current_camera_settings_to_dic_config(self._dic_capture_config())
+            config_snapshot = self._apply_dic_ui_settings_to_config(config_snapshot)
         except ValueError:
             self.status_var.set("DIC FPS 必须是大于 0 的数字。")
             return
@@ -6614,6 +6680,7 @@ class StereoCaptureOnlyApp:
                         self._set_interval_lamp(SUBTLE_TEXT_COLOR)
                     if self.camera_system is not None and not self.recording:
                         self._set_capture_buttons(NORMAL)
+                    self._ensure_preview_thread_after_interval()
                     if not payload:
                         self.status_var.set(f"定时拍照已停止，共保存 {self.interval_count} 组。")
                 elif kind == "interval_lamp_green":
@@ -6791,6 +6858,7 @@ class StereoCaptureOnlyApp:
         self.config.setdefault("focus_reference_score", None)
         self.config.setdefault("focus_drift_check_interval_minutes", 30)
         self.config.setdefault("focus_drift_warning_threshold", 0.15)
+        self.config.setdefault("focus_realtime_analysis_enabled", True)
         exposure_monitor = self._ensure_config_section("exposure_monitor")
         exposure_monitor.setdefault("zebra_enabled", False)
         exposure_monitor.setdefault("histogram_enabled", True)
@@ -7209,12 +7277,14 @@ class StereoCaptureOnlyApp:
 
     def _sync_quality_toggles(self) -> None:
         self.config["preview_quality_analysis_enabled"] = bool(self.preview_quality_analysis_var.get())
+        self.config["focus_realtime_analysis_enabled"] = bool(self.focus_realtime_analysis_var.get())
         exposure_monitor = self._ensure_config_section("exposure_monitor")
         exposure_monitor["zebra_enabled"] = bool(self.zebra_var.get())
         exposure_monitor["histogram_enabled"] = bool(self.histogram_enabled_var.get())
+        self._focus_realtime_analysis_enabled_setting = bool(self.focus_realtime_analysis_var.get())
         self._focus_peaking_enabled_setting = bool(self.focus_peaking_var.get())
         self._histogram_enabled_setting = bool(self.histogram_enabled_var.get())
-        if not self.preview_quality_analysis_var.get():
+        if not self.preview_quality_analysis_var.get() or not self.focus_realtime_analysis_var.get():
             self._set_last_quality_metrics(None)
             self._last_focus_overlay_left = None
             self._last_focus_overlay_right = None
@@ -7223,7 +7293,10 @@ class StereoCaptureOnlyApp:
         self._update_quality_optional_sections()
         save_config(self.config)
         if hasattr(self, "left_pane"):
-            if self._histogram_enabled_setting and (
+            needs_analysis = self._histogram_enabled_setting or (
+                self._focus_realtime_analysis_enabled_setting and self.preview_quality_analysis_var.get()
+            )
+            if needs_analysis and (
                 self._last_left_frame_obj is not None or self._last_right_frame_obj is not None
             ):
                 metrics = self._analyze_preview_frames(
@@ -7258,26 +7331,38 @@ class StereoCaptureOnlyApp:
             self._cached_focus_roi_source = source
         return self._cached_focus_roi
 
-    def _analyze_preview_frames(self, left: CameraFrame | None, right: CameraFrame | None, frame_index: int) -> dict[str, object]:
+    def _analyze_preview_frames(
+        self,
+        left: CameraFrame | None,
+        right: CameraFrame | None,
+        frame_index: int,
+        *,
+        force_focus_analysis: bool = False,
+    ) -> dict[str, object]:
         roi = self._focus_roi()
         method = str(self.config.get("focus_method", "laplacian"))
         left_image = left.image if left is not None and getattr(left, "image", None) is not None else None
         right_image = right.image if right is not None and getattr(right, "image", None) is not None else None
         metrics: dict[str, object] = {
-            "focus": focus_pair_metrics(left_image, right_image, roi, method),
             "focus_roi": roi,
             "temperatures_c": dict(self._latest_temperatures),
             "timestamp": time.time(),
         }
+        focus_analysis_enabled = force_focus_analysis or bool(
+            getattr(self, "_focus_realtime_analysis_enabled_setting", True)
+        )
+        if focus_analysis_enabled:
+            metrics["focus"] = focus_pair_metrics(left_image, right_image, roi, method)
         update_histogram = bool(self._histogram_enabled_setting)
         metrics["left_exposure"] = exposure_metrics(left_image, include_histogram=update_histogram)
         metrics["right_exposure"] = exposure_metrics(right_image, include_histogram=update_histogram)
-        metrics["dic_speckle"] = {
-            "left": speckle_quality(left_image, roi),
-            "right": speckle_quality(right_image, roi),
-        }
-        focus = metrics["focus"]
-        if self._focus_peaking_enabled_setting and isinstance(focus, dict):
+        if focus_analysis_enabled:
+            metrics["dic_speckle"] = {
+                "left": speckle_quality(left_image, roi),
+                "right": speckle_quality(right_image, roi),
+            }
+        focus = metrics.get("focus")
+        if focus_analysis_enabled and self._focus_peaking_enabled_setting and isinstance(focus, dict):
             now = time.perf_counter()
             interval_s = max(config_float(self.config, "focus_peaking_overlay_interval_seconds", 0.20), 0.05)
             overlay_key = (
@@ -7297,7 +7382,7 @@ class StereoCaptureOnlyApp:
                 self._last_focus_overlay_right = make_focus_peaking_overlay(right_image) if right_image is not None else None
                 self._last_focus_overlay_key = overlay_key
                 self._last_focus_overlay_time = now
-        elif not self._focus_peaking_enabled_setting:
+        elif not focus_analysis_enabled or not self._focus_peaking_enabled_setting:
             self._last_focus_overlay_left = None
             self._last_focus_overlay_right = None
             self._last_focus_overlay_key = None
@@ -7308,7 +7393,8 @@ class StereoCaptureOnlyApp:
         if not isinstance(metrics, dict):
             return
         now = time.perf_counter()
-        self._set_last_quality_metrics(metrics)
+        if isinstance(metrics.get("focus"), dict):
+            self._set_last_quality_metrics(metrics)
         if now - self._last_analysis_time < 0.20:
             return
         self._last_analysis_time = now
@@ -8055,7 +8141,12 @@ class StereoCaptureOnlyApp:
         return allow, report
 
     def _quality_metrics_for_pair(self, left: CameraFrame | None, right: CameraFrame | None) -> dict[str, object]:
-        metrics = self._analyze_preview_frames(left, right, self._preview_frame_counter + 1)
+        metrics = self._analyze_preview_frames(
+            left,
+            right,
+            self._preview_frame_counter + 1,
+            force_focus_analysis=True,
+        )
         self._set_last_quality_metrics(metrics)
         calibration_cfg = self.config.get("calibration_check", {})
         if config_bool(calibration_cfg, "board_coverage_enabled", False, False):
@@ -8219,7 +8310,7 @@ class StereoCaptureOnlyApp:
     def _save_current_capture_settings(self) -> None:
         values = self._current_parameter_config()
         values["interval_capture_seconds"] = float(self.interval_seconds_var.get() or 0)
-        values["interval_capture_count"] = optional_int_text(self.interval_limit_var.get())
+        values["interval_capture_count"] = optional_interval_limit_text(self.interval_limit_var.get())
         values["record_fps"] = optional_positive_fps(self.record_fps_var.get()) or 0.0
         values["record_max_seconds"] = max(float(self.record_max_seconds_var.get() or 0), 0.0)
         try:
