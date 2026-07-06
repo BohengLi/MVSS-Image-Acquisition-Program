@@ -594,9 +594,38 @@ class ReliabilityFixTests(unittest.TestCase):
             ("仅网格线", "grid"),
             ("十字+网格", "full"),
             ("全部网格线", "full"),
+            ("95%安全线", "safe95"),
+            ("90%安全线", "safe90"),
+            ("85%安全线", "safe85"),
+            ("80%安全线", "safe80"),
         ):
             app.guide_mode_var.set(text)
             self.assertEqual(app._guide_mode_key(), expected)
+
+    def test_safe_guide_draws_centered_rectangle(self) -> None:
+        pane = stereo_capture_only.ZoomImagePane.__new__(stereo_capture_only.ZoomImagePane)
+        calls: list[tuple[str, tuple, dict]] = []
+
+        class FakeCanvas:
+            def delete(self, *args, **kwargs):
+                calls.append(("delete", args, kwargs))
+
+            def create_rectangle(self, *args, **kwargs):
+                calls.append(("rectangle", args, kwargs))
+                return 1
+
+        pane.canvas = FakeCanvas()
+        pane._last_image = object()
+        pane._render_bounds = (10.0, 20.0, 200.0, 100.0)
+        pane._guide_mode = "safe90"
+        pane._raise_overlays = lambda: None
+
+        pane._draw_guides()
+
+        rectangles = [item for item in calls if item[0] == "rectangle"]
+        self.assertEqual(len(rectangles), 1)
+        self.assertEqual(rectangles[0][1][:4], (20.0, 25.0, 200.0, 115.0))
+        self.assertEqual(rectangles[0][2]["tags"], ("guide",))
 
     def test_record_queue_full_drops_frame_without_blocking(self) -> None:
         app = StereoCaptureOnlyApp.__new__(StereoCaptureOnlyApp)
@@ -985,6 +1014,66 @@ class ReliabilityFixTests(unittest.TestCase):
         self.assertEqual(presets["标定采集"]["pixel_format"], "Mono8")
         self.assertFalse(presets["标定采集"]["save_raw_frames"])
 
+    def test_startup_camera_settings_reset_to_defaults_without_clearing_persistent_options(self) -> None:
+        config = {
+            "save_dir": "captures/custom",
+            "record_fps": 12.5,
+            "project": {"current_project_id": "kept"},
+            "trigger_source": "Continuous",
+            "exposure_auto": "Once",
+            "exposure_time_us": 4321.0,
+            "gain_auto": "Once",
+            "gain": 6.5,
+            "balance_white_auto": "Once",
+            "roi_width": 3200,
+            "roi_height": 1800,
+            "roi_offset_x": 128,
+            "roi_offset_y": 96,
+            "left_roi_width": 3000,
+            "left_roi_height": 1700,
+            "left_roi_offset_x": 64,
+            "left_roi_offset_y": 48,
+            "right_roi_width": 2800,
+            "right_roi_height": 1600,
+            "right_roi_offset_x": 256,
+            "right_roi_offset_y": 144,
+            "dic_capture": {
+                "record_fps": 7.0,
+                "exposure_time_us": 1111.0,
+                "gain": 2.0,
+                "left_roi_width": 1234,
+            },
+            "presets": {
+                "Custom": {
+                    "exposure_time_us": 1111.0,
+                    "gain": 2.0,
+                    "roi_width": 1234,
+                }
+            },
+        }
+
+        reset = stereo_capture_only.reset_startup_camera_settings(config)
+
+        self.assertEqual(reset["save_dir"], "captures/custom")
+        self.assertEqual(reset["record_fps"], 12.5)
+        self.assertEqual(reset["project"], {"current_project_id": "kept"})
+        self.assertEqual(reset["trigger_source"], "Software")
+        self.assertEqual(reset["exposure_auto"], "Off")
+        self.assertEqual(reset["exposure_time_us"], 20000.0)
+        self.assertEqual(reset["gain_auto"], "Off")
+        self.assertEqual(reset["gain"], 0.0)
+        self.assertEqual(reset["balance_white_auto"], "Off")
+        self.assertEqual(reset["roi_width"], stereo_capture_only.CAPTURE_WIDTH)
+        self.assertEqual(reset["roi_height"], stereo_capture_only.CAPTURE_HEIGHT)
+        self.assertEqual(reset["roi_offset_x"], 0)
+        self.assertEqual(reset["left_roi_width"], stereo_capture_only.CAPTURE_WIDTH)
+        self.assertEqual(reset["right_roi_offset_y"], 0)
+        self.assertEqual(reset["dic_capture"]["record_fps"], 7.0)
+        self.assertEqual(reset["dic_capture"]["exposure_time_us"], stereo_capture_only.DIC_CAPTURE_CONFIG["exposure_time_us"])
+        self.assertEqual(reset["dic_capture"]["gain"], stereo_capture_only.DIC_CAPTURE_CONFIG["gain"])
+        self.assertEqual(reset["dic_capture"]["left_roi_width"], stereo_capture_only.DIC_CAPTURE_CONFIG["left_roi_width"])
+        self.assertEqual(reset["presets"]["Custom"]["exposure_time_us"], 1111.0)
+
     def test_raw_frame_storage_estimate_uses_uncompressed_size(self) -> None:
         estimated = stereo_capture_only.estimate_frame_bytes(
             {"pixel_format": "Mono16", "save_raw_frames": True, "raw_frame_format": "tiff16", "image_format": "jpg"},
@@ -1203,7 +1292,7 @@ class ReliabilityFixTests(unittest.TestCase):
 
         self.assertTrue(should_analyze)
 
-    def test_focus_assist_switch_disables_focus_peaking_analysis(self) -> None:
+    def test_focus_peaking_analysis_runs_when_realtime_focus_panel_is_off(self) -> None:
         app = StereoCaptureOnlyApp.__new__(StereoCaptureOnlyApp)
         app._histogram_enabled_setting = False
         app._focus_peaking_enabled_setting = True
@@ -1220,7 +1309,37 @@ class ReliabilityFixTests(unittest.TestCase):
             },
         )
 
-        self.assertFalse(should_analyze)
+        self.assertTrue(should_analyze)
+
+    def test_focus_peaking_generates_overlay_without_realtime_focus_panel(self) -> None:
+        app = StereoCaptureOnlyApp.__new__(StereoCaptureOnlyApp)
+        app.config = {
+            "focus_roi": {"x_frac": 0.0, "y_frac": 0.0, "w_frac": 1.0, "h_frac": 1.0},
+            "focus_method": "laplacian",
+            "preview_quality_analysis_enabled": False,
+            "focus_peaking_overlay_interval_seconds": 0.05,
+        }
+        app._cached_focus_roi = app.config["focus_roi"]
+        app._cached_focus_roi_source = app.config["focus_roi"]
+        app._latest_temperatures = {}
+        app._histogram_enabled_setting = False
+        app._focus_peaking_enabled_setting = True
+        app._focus_realtime_analysis_enabled_setting = False
+        app._last_focus_overlay_key = None
+        app._last_focus_overlay_time = 0.0
+        app._last_focus_overlay_left = None
+        app._last_focus_overlay_right = None
+        image = Image.new("L", (48, 48), 0)
+        pixels = image.load()
+        for x in range(12, 36):
+            for y in range(12, 36):
+                pixels[x, y] = 255
+        left = mvs_camera.Frame(image=image, frame_number=1, width=48, height=48, host_timestamp=1.0, camera_timestamp=1)
+
+        metrics = app._analyze_preview_frames(left, None, 1)
+
+        self.assertIsInstance(metrics.get("focus"), dict)
+        self.assertIsNotNone(app._last_focus_overlay_left)
 
     def test_histogram_still_triggers_when_focus_assist_switch_is_off(self) -> None:
         app = StereoCaptureOnlyApp.__new__(StereoCaptureOnlyApp)
@@ -1253,6 +1372,26 @@ class ReliabilityFixTests(unittest.TestCase):
         app._apply_quality_metrics({"left_exposure": {}, "right_exposure": {}})
 
         self.assertEqual(app._get_last_quality_metrics(), {"focus": {"score": 100.0}})
+
+    def test_preview_metrics_cache_updates_for_capture_gate_without_focus(self) -> None:
+        app = StereoCaptureOnlyApp.__new__(StereoCaptureOnlyApp)
+        app._quality_metrics_lock = threading.Lock()
+        app._last_quality_metrics = None
+        app._last_analysis_time = 0.0
+        app.config = {"preview_quality_analysis_enabled": True}
+        app.preview_quality_analysis_var = _Var()
+        app.preview_quality_analysis_var.set(True)
+        app._update_exposure_display = lambda *_args: None
+        app._update_dic_quality_display = lambda *_args: None
+        app._update_capture_gate_preview = lambda: None
+
+        metrics = {
+            "left_exposure": {"over_pct": 1.0, "under_pct": 2.0, "mean": 128.0},
+            "right_exposure": {"over_pct": 0.5, "under_pct": 1.0, "mean": 130.0},
+        }
+        app._apply_quality_metrics(metrics)
+
+        self.assertEqual(app._get_last_quality_metrics(), metrics)
 
     def test_preview_capture_timeout_uses_shorter_preview_value(self) -> None:
         app = StereoCaptureOnlyApp.__new__(StereoCaptureOnlyApp)
@@ -1623,6 +1762,12 @@ class ReliabilityFixTests(unittest.TestCase):
         self.assertIsNone(stereo_capture_only.optional_interval_limit_text("不限"))
         self.assertEqual(stereo_capture_only.optional_interval_limit_text("12"), 12)
 
+    def test_record_max_seconds_text_allows_blank_or_zero_as_unlimited(self) -> None:
+        self.assertEqual(stereo_capture_only.optional_record_max_seconds_text(""), 0.0)
+        self.assertEqual(stereo_capture_only.optional_record_max_seconds_text("  "), 0.0)
+        self.assertEqual(stereo_capture_only.optional_record_max_seconds_text("0"), 0.0)
+        self.assertEqual(stereo_capture_only.optional_record_max_seconds_text("12.5"), 12.5)
+
     def test_interval_done_restarts_preview_thread_when_display_was_enabled(self) -> None:
         app = StereoCaptureOnlyApp.__new__(StereoCaptureOnlyApp)
         app._state_lock = threading.RLock()
@@ -1686,6 +1831,67 @@ class ReliabilityFixTests(unittest.TestCase):
         self.assertEqual(camera_system.trigger_source, "Software")
         self.assertFalse(camera_system.require_hardware_trigger)
         self.assertFalse(camera_system.hardware_sync_enabled)
+
+    def test_dic_capture_config_to_camera_does_not_reapply_exposure_gain_or_roi(self) -> None:
+        app = StereoCaptureOnlyApp.__new__(StereoCaptureOnlyApp)
+        calls: list[str] = []
+
+        class FakeCameraSystem:
+            trigger_source = "Software"
+            timestamp_reject_enabled = False
+            max_camera_timestamp_delta = 0
+            max_host_timestamp_delta = 0
+
+            def __init__(self):
+                self.config = {}
+
+            def apply_pixel_format_settings(self, _pixel_format):
+                calls.append("pixel")
+                return []
+
+            def apply_trigger_settings(self, _trigger_source):
+                calls.append("trigger")
+                return []
+
+            def apply_exposure_settings(self, *_args):
+                calls.append("exposure")
+                return []
+
+            def apply_gain_settings(self, *_args):
+                calls.append("gain")
+                return []
+
+            def apply_image_correction_settings(self, *_args):
+                calls.append("correction")
+                return []
+
+            def apply_side_roi_settings(self, *_args, **_kwargs):
+                calls.append("roi")
+                return {}, []
+
+            def apply_chunk_settings(self, *_args):
+                calls.append("chunk")
+                return []
+
+        camera_system = FakeCameraSystem()
+        app._require_camera_system = lambda: camera_system
+
+        app._apply_dic_capture_config_to_camera(
+            {
+                "trigger_source": "Continuous",
+                "exposure_auto": "Off",
+                "exposure_time_us": 1000.0,
+                "gain_auto": "Off",
+                "gain": 3.0,
+                "left_roi_width": 3200,
+                "left_roi_height": 1800,
+                "chunk_data_enabled": True,
+                "chunk_selectors": ["Timestamp"],
+            }
+        )
+
+        self.assertEqual(calls, ["pixel", "trigger", "chunk"])
+        self.assertEqual(camera_system.trigger_source, "Continuous")
 
     def test_field_correction_subtracts_dark_and_preserves_uint16_raw(self) -> None:
         app = StereoCaptureOnlyApp.__new__(StereoCaptureOnlyApp)
