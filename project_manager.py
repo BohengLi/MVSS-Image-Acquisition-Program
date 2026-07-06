@@ -7,7 +7,7 @@ import os
 import shutil
 import time
 from pathlib import Path
-from typing import Any
+from typing import Any, Callable
 
 
 def timestamp_id() -> str:
@@ -18,6 +18,73 @@ def _json_default(value: object) -> object:
     if isinstance(value, Path):
         return str(value)
     return str(value)
+
+
+def _atomic_temp_path(path: Path) -> Path:
+    return path.with_name(f"{path.name}.{os.getpid()}.{time.time_ns()}.tmp")
+
+
+def atomic_write_json(
+    path: Path,
+    payload: object,
+    *,
+    encoding: str = "utf-8",
+    default: Callable[[object], object] | None = _json_default,
+) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    tmp_path = _atomic_temp_path(path)
+    try:
+        with tmp_path.open("w", encoding=encoding) as fh:
+            json.dump(payload, fh, ensure_ascii=False, indent=2, default=default)
+            fh.write("\n")
+            fh.flush()
+            os.fsync(fh.fileno())
+        tmp_path.replace(path)
+    finally:
+        try:
+            tmp_path.unlink(missing_ok=True)
+        except OSError:
+            pass
+
+
+def atomic_write_text(path: Path, text: str, *, encoding: str = "utf-8") -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    tmp_path = _atomic_temp_path(path)
+    try:
+        with tmp_path.open("w", encoding=encoding) as fh:
+            fh.write(text)
+            fh.flush()
+            os.fsync(fh.fileno())
+        tmp_path.replace(path)
+    finally:
+        try:
+            tmp_path.unlink(missing_ok=True)
+        except OSError:
+            pass
+
+
+def atomic_write_csv(
+    path: Path,
+    fieldnames: list[str],
+    rows: list[dict[str, Any]],
+    *,
+    encoding: str = "utf-8-sig",
+) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    tmp_path = _atomic_temp_path(path)
+    try:
+        with tmp_path.open("w", newline="", encoding=encoding) as fh:
+            writer = csv.DictWriter(fh, fieldnames=fieldnames)
+            writer.writeheader()
+            writer.writerows(rows)
+            fh.flush()
+            os.fsync(fh.fileno())
+        tmp_path.replace(path)
+    finally:
+        try:
+            tmp_path.unlink(missing_ok=True)
+        except OSError:
+            pass
 
 
 def _file_checksum(path: Path, algorithm: str = "sha256") -> str:
@@ -164,9 +231,7 @@ class ProjectManager:
             item.update(extra)
         sessions.append(item)
         data["updated_at"] = time.strftime("%Y-%m-%dT%H:%M:%S%z")
-        with project_json.open("w", encoding="utf-8") as fh:
-            json.dump(data, fh, ensure_ascii=False, indent=2, default=_json_default)
-            fh.write("\n")
+        atomic_write_json(project_json, data)
 
     def project_meta(self) -> dict[str, Any] | None:
         if not self.enabled:
@@ -197,9 +262,7 @@ class ProjectManager:
             "updated_at": time.strftime("%Y-%m-%dT%H:%M:%S%z"),
             "sessions": sessions,
         }
-        with self._project_json_path(project_dir).open("w", encoding="utf-8") as fh:
-            json.dump(data, fh, ensure_ascii=False, indent=2)
-            fh.write("\n")
+        atomic_write_json(self._project_json_path(project_dir), data)
 
 
 def write_data_manifest(
@@ -209,6 +272,7 @@ def write_data_manifest(
     environment: dict[str, Any],
     algorithm: str = "sha256",
     scan_roots: list[Path] | None = None,
+    checksum_files: bool = True,
 ) -> dict[str, Any]:
     exports_dir = session_dir / "exports"
     exports_dir.mkdir(parents=True, exist_ok=True)
@@ -232,18 +296,16 @@ def write_data_manifest(
                 {
                     "path": _manifest_path_label(path, session_dir),
                     "size_bytes": stat.st_size,
-                    "checksum_algorithm": "md5" if algorithm == "md5" else "sha256",
-                    "checksum": _file_checksum(path, algorithm),
+                    "checksum_algorithm": ("md5" if algorithm == "md5" else "sha256") if checksum_files else "",
+                    "checksum": _file_checksum(path, algorithm) if checksum_files else "",
                     "modified_time": time.strftime("%Y-%m-%dT%H:%M:%S%z", time.localtime(stat.st_mtime)),
                 }
             )
-    with csv_path.open("w", newline="", encoding="utf-8-sig") as fh:
-        writer = csv.DictWriter(
-            fh,
-            fieldnames=["path", "size_bytes", "checksum_algorithm", "checksum", "modified_time"],
-        )
-        writer.writeheader()
-        writer.writerows(rows)
+    atomic_write_csv(
+        csv_path,
+        ["path", "size_bytes", "checksum_algorithm", "checksum", "modified_time"],
+        rows,
+    )
     summary_payload = {
         "session_dir": str(session_dir),
         "generated_at": time.strftime("%Y-%m-%dT%H:%M:%S%z"),
@@ -253,15 +315,15 @@ def write_data_manifest(
         "file_count": len(rows),
         "total_size_bytes": sum(int(row["size_bytes"]) for row in rows),
         "manifest_csv": str(csv_path),
+        "checksum_files": bool(checksum_files),
     }
-    with summary_path.open("w", encoding="utf-8") as fh:
-        json.dump(summary_payload, fh, ensure_ascii=False, indent=2, default=_json_default)
-        fh.write("\n")
+    atomic_write_json(summary_path, summary_payload)
     return {
         "manifest_csv": str(csv_path),
         "summary_json": str(summary_path),
         "file_count": len(rows),
         "total_size_bytes": summary_payload["total_size_bytes"],
+        "checksum_files": bool(checksum_files),
     }
 
 

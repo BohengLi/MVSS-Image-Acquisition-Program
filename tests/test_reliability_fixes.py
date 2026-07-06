@@ -16,6 +16,7 @@ import importlib.util
 import image_quality
 import calibration_manager
 import mvs_camera
+import project_manager
 import numpy as np
 from PIL import Image
 from mvs_camera import Frame, MvsCamera, MvsError, RawFramePacket, StereoCameraSystem
@@ -586,6 +587,32 @@ class ReliabilityFixTests(unittest.TestCase):
             self.assertTrue(all(str(path) in manifest_paths for path in saved_paths))
             self.assertFalse((project_dir / "photos").exists())
 
+    def test_data_manifest_can_skip_synchronous_checksums(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            session_dir = Path(tmp) / "session"
+            session_dir.mkdir()
+            (session_dir / "frame.bin").write_bytes(b"frame")
+
+            with patch.object(project_manager, "_file_checksum", side_effect=AssertionError("checksum should be skipped")):
+                manifest = project_manager.write_data_manifest(
+                    session_dir,
+                    capture_summary={},
+                    camera_settings={},
+                    environment={},
+                    checksum_files=False,
+                )
+
+            with (session_dir / "exports" / "file_manifest.csv").open("r", newline="", encoding="utf-8-sig") as fh:
+                rows = list(csv.DictReader(fh))
+            summary = json.loads((session_dir / "exports" / "capture_summary.json").read_text(encoding="utf-8"))
+            leftovers = list((session_dir / "exports").glob("*.tmp"))
+
+        self.assertEqual(manifest["checksum_files"], False)
+        self.assertEqual(rows[0]["checksum"], "")
+        self.assertEqual(rows[0]["checksum_algorithm"], "")
+        self.assertEqual(summary["checksum_files"], False)
+        self.assertEqual(leftovers, [])
+
     def test_guide_mode_key_supports_grid_and_cross_combinations(self) -> None:
         app = StereoCaptureOnlyApp.__new__(StereoCaptureOnlyApp)
         app.guide_mode_var = _Var()
@@ -690,6 +717,46 @@ class ReliabilityFixTests(unittest.TestCase):
             worker.join(timeout=1.0)
 
         self.assertFalse(stopped)
+
+    def test_record_meta_writer_streams_ndjson_and_tracks_summary(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "frames.meta.ndjson"
+            writer = stereo_capture_only.RecordMetaWriter(path, flush_every=1)
+            writer.append({"index": 1, "trigger_time": 10.0, "write_seconds": 0.1})
+            writer.append({"index": 2, "trigger_time": 11.0, "write_seconds": 0.3})
+            summary = writer.summary()
+            writer.close()
+
+            lines = path.read_text(encoding="utf-8").splitlines()
+            loaded = writer.load()
+
+        self.assertEqual(len(lines), 2)
+        self.assertFalse(lines[0].startswith("["))
+        self.assertEqual(summary["metadata_format"], "ndjson")
+        self.assertEqual(summary["count"], 2)
+        self.assertAlmostEqual(float(summary["average_write_seconds"]), 0.2)
+        self.assertEqual([item["index"] for item in loaded], [1, 2])
+
+    def test_record_sequence_frames_are_scanned_from_disk_for_mp4(self) -> None:
+        app = StereoCaptureOnlyApp.__new__(StereoCaptureOnlyApp)
+        with tempfile.TemporaryDirectory() as tmp:
+            record_dir = Path(tmp)
+            for rel_path in (
+                "left/left_000001.png",
+                "right/right_000001.png",
+                "left_part002/left_000003.png",
+            ):
+                path = record_dir / rel_path
+                path.parent.mkdir(parents=True, exist_ok=True)
+                path.write_bytes(b"frame")
+
+            frames = app._record_sequence_frames_from_disk(record_dir, {"image_format": "png"})
+
+        self.assertEqual([(frame["segment_index"], frame["saved_index"]) for frame in frames], [(1, 1), (2, 3)])
+        self.assertIn("left_path", frames[0])
+        self.assertIn("right_path", frames[0])
+        self.assertIn("left_path", frames[1])
+        self.assertNotIn("right_path", frames[1])
 
     def test_clone_frame_deep_copies_raw_payload(self) -> None:
         app = StereoCaptureOnlyApp.__new__(StereoCaptureOnlyApp)
@@ -937,6 +1004,36 @@ class ReliabilityFixTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmp:
             with self.assertRaises(MvsError):
                 app._save_raw_frame(frame, Path(tmp) / "left_000001.bmp", {"raw_frame_format": "png16"})
+
+    def test_packed_high_bit_depth_npy_skips_viewable_sidecar(self) -> None:
+        app = StereoCaptureOnlyApp.__new__(StereoCaptureOnlyApp)
+        raw = bytes(range(6))
+        frame = Frame(
+            image=object(),
+            frame_number=1,
+            width=2,
+            height=2,
+            host_timestamp=0,
+            camera_timestamp=0,
+            raw_data=raw,
+            raw_frame_len=len(raw),
+            pixel_type_name="PixelType_Gvsp_Mono12_Packed",
+            raw_bit_depth=12,
+        )
+
+        with tempfile.TemporaryDirectory() as tmp:
+            path = app._save_raw_frame(
+                frame,
+                Path(tmp) / "left_000001.bmp",
+                {
+                    "raw_frame_format": "npy",
+                    "viewable_sidecar_enabled": True,
+                    "viewable_sidecar_format": "png",
+                },
+            )
+
+            self.assertTrue(path.exists())
+            self.assertFalse(path.with_suffix(".view.png").exists())
 
     def test_high_bit_depth_frames_save_viewable_png_sidecar(self) -> None:
         app = StereoCaptureOnlyApp.__new__(StereoCaptureOnlyApp)
@@ -2352,6 +2449,45 @@ class ReliabilityFixTests(unittest.TestCase):
                 system.capture_pair()
         finally:
             future.cancel()
+
+    def test_reconnect_aborts_when_old_camera_close_fails(self) -> None:
+        app = StereoCaptureOnlyApp.__new__(StereoCaptureOnlyApp)
+        app.config = {
+            "auto_reconnect_enabled": True,
+            "auto_reconnect_max_attempts": 1,
+            "auto_reconnect_initial_delay_seconds": 0.1,
+            "auto_reconnect_max_delay_seconds": 0.1,
+        }
+        app._closing = False
+        app._reconnecting = False
+        app._state_lock = threading.RLock()
+        app.recording = False
+        app.previewing = True
+        app.interval_capturing = False
+        app.ui_queue = Queue()
+        app._wait_reconnect_delay = lambda _delay: False
+        created: list[dict] = []
+
+        class _CloseFails:
+            def close(self):
+                raise MvsError("sdk worker still running")
+
+        class _NewSystem:
+            def __init__(self, config):
+                created.append(config)
+
+            def connect(self):
+                return None, None
+
+        app.camera_system = _CloseFails()
+        with patch.object(stereo_capture_only, "StereoCameraSystem", _NewSystem):
+            result = app._attempt_reconnect("preview")
+
+        queued = list(app.ui_queue.queue)
+        self.assertFalse(result)
+        self.assertFalse(app.previewing)
+        self.assertEqual(created, [])
+        self.assertTrue(any(item[0] == "error" for item in queued))
 
     def test_temperature_display_shows_stream_drop_counter(self) -> None:
         app = StereoCaptureOnlyApp.__new__(StereoCaptureOnlyApp)

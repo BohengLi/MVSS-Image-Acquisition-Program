@@ -40,7 +40,7 @@ from image_quality import (
     roi_from_pixels,
     speckle_quality,
 )
-from project_manager import ProjectManager, benchmark_write_speed, write_data_manifest
+from project_manager import ProjectManager, atomic_write_csv, atomic_write_json, atomic_write_text, benchmark_write_speed, write_data_manifest
 
 _MVS_IMPORT_ERROR: BaseException | None = None
 try:
@@ -591,8 +591,11 @@ class RecordMetaWriter:
         self.flush_every = max(flush_every, 1)
         self._lock = threading.Lock()
         self._fh = path.open("w", encoding="utf-8")
-        self._fh.write("[\n")
         self._count = 0
+        self._write_seconds_total = 0.0
+        self._write_seconds_samples = 0
+        self._first_trigger_time: float | None = None
+        self._last_trigger_time: float | None = None
         self._closed = False
         self._aborted = False
 
@@ -605,10 +608,24 @@ class RecordMetaWriter:
         with self._lock:
             if self._closed:
                 raise RuntimeError("record frame metadata writer is already closed")
-            if self._count:
-                self._fh.write(",\n")
             self._fh.write(text)
+            self._fh.write("\n")
             self._count += 1
+            try:
+                write_seconds = float(frame_meta.get("write_seconds") or 0.0)
+            except (TypeError, ValueError):
+                write_seconds = 0.0
+            if write_seconds > 0:
+                self._write_seconds_total += write_seconds
+                self._write_seconds_samples += 1
+            try:
+                trigger_time = float(frame_meta.get("trigger_time"))
+            except (TypeError, ValueError):
+                trigger_time = None
+            if trigger_time is not None:
+                if self._first_trigger_time is None:
+                    self._first_trigger_time = trigger_time
+                self._last_trigger_time = trigger_time
             if self._count % self.flush_every == 0:
                 self._fh.flush()
 
@@ -629,7 +646,8 @@ class RecordMetaWriter:
             if self._closed:
                 return
             if not self._aborted:
-                self._fh.write("\n]\n")
+                self._fh.flush()
+                os.fsync(self._fh.fileno())
             self._fh.close()
             self._closed = True
 
@@ -641,13 +659,34 @@ class RecordMetaWriter:
             self._fh.close()
             self._closed = True
 
+    def summary(self) -> dict[str, object]:
+        with self._lock:
+            avg_write = (
+                self._write_seconds_total / self._write_seconds_samples if self._write_seconds_samples > 0 else 0.0
+            )
+            return {
+                "metadata_path": str(self.path),
+                "metadata_format": "ndjson",
+                "count": self._count,
+                "average_write_seconds": avg_write,
+                "write_seconds_samples": self._write_seconds_samples,
+                "first_trigger_time": self._first_trigger_time,
+                "last_trigger_time": self._last_trigger_time,
+                "aborted": self._aborted,
+            }
+
     def load(self) -> list[dict]:
         with self._lock:
             if not self._closed or self._aborted:
                 return []
         try:
             with self.path.open("r", encoding="utf-8") as fh:
-                payload = json.load(fh)
+                first = fh.read(1)
+                fh.seek(0)
+                if first == "[":
+                    payload = json.load(fh)
+                else:
+                    payload = [json.loads(line) for line in fh if line.strip()]
         except (OSError, json.JSONDecodeError) as exc:
             LOGGER.warning("Could not load record frame metadata from %s: %s", self.path, exc, exc_info=True)
             return []
@@ -5072,7 +5111,7 @@ class StereoCaptureOnlyApp:
         queue_size = configured_record_queue_size(config_snapshot, fps)
         image_queue: Queue[dict | None] | None = Queue(maxsize=queue_size) if save_image_sequence else None
         video_queue: Queue[dict | None] | None = Queue(maxsize=queue_size) if realtime_mp4_enabled else None
-        meta_writer = RecordMetaWriter(record_dir / "frames.meta.json", config_int(config_snapshot, "record_meta_flush_every", 32))
+        meta_writer = RecordMetaWriter(record_dir / "frames.meta.ndjson", config_int(config_snapshot, "record_meta_flush_every", 32))
         writer_errors: list[Exception] = []
         writer_errors_lock = threading.Lock()
         video_outputs: dict[str, list[str]] = {"left": [], "right": []}
@@ -5248,7 +5287,7 @@ class StereoCaptureOnlyApp:
                 self.ui_queue.put(("record_done", (record_dir, [], summary)))
             else:
                 meta_writer.close()
-                frames_snapshot = meta_writer.load()
+                frame_metadata = meta_writer.summary()
                 writer_errors_snapshot = self._writer_errors_snapshot(writer_errors, writer_errors_lock)
                 if writer_errors_snapshot:
                     self.ui_queue.put(("error", writer_errors_snapshot[0]))
@@ -5257,12 +5296,11 @@ class StereoCaptureOnlyApp:
                 generated_video_names = self._finalize_recording_videos(
                     record_dir,
                     output_fps,
-                    frames_snapshot,
                     video_outputs,
                     config_snapshot,
                 )
-                summary = self._build_record_summary(record_dir, capture_fps or 0.0, output_fps, frames_snapshot)
-                reports = self._write_record_reports(record_dir, summary, frames_snapshot, config_snapshot)
+                summary = self._build_record_summary(record_dir, capture_fps or 0.0, output_fps, frame_metadata)
+                reports = self._write_record_reports(record_dir, summary, config_snapshot)
                 summary["record_reports"] = reports
                 write_lag, _write_warning, skip_every_n, skip_keep_frames = self._record_write_state_snapshot()
                 stats = self._record_stats_snapshot()
@@ -5326,13 +5364,13 @@ class StereoCaptureOnlyApp:
                     "record_reports": reports,
                     "frames": {
                         "metadata_path": str(meta_writer.path),
-                        "count": len(frames_snapshot),
+                        "metadata_format": "ndjson",
+                        "count": int(frame_metadata.get("count", 0) or 0),
                         "embedded": False,
                     },
                     "summary": summary,
                 }
-                with (record_dir / "meta.json").open("w", encoding="utf-8") as fh:
-                    json.dump(meta, fh, ensure_ascii=False, indent=2)
+                atomic_write_json(record_dir / "meta.json", meta, default=json_metadata_default)
                 manifest = self._write_manifest_for_session(record_dir, summary, config_snapshot)
                 self.project_manager.register_session(record_mode, record_dir, record_dir / "meta.json", {"manifest": manifest})
                 self.ui_queue.put(("record_done", (record_dir, generated_video_names, summary)))
@@ -8802,11 +8840,16 @@ class StereoCaptureOnlyApp:
                 if self._wait_reconnect_delay(delay):
                     return False
                 try:
+                    close_failure: list[Exception] = []
                     if self.camera_system is not None:
                         try:
                             self.camera_system.close()
-                        except Exception:
+                        except Exception as close_exc:
                             LOGGER.exception("重连前关闭旧相机失败")
+                            close_failure.append(close_exc)
+                    if close_failure:
+                        self._handle_reconnect_close_failure(mode, close_failure[0])
+                        return False
                     system_config = self._config_snapshot()
                     system_config["allow_single_camera"] = True
                     system = StereoCameraSystem(system_config)
@@ -8834,6 +8877,22 @@ class StereoCaptureOnlyApp:
             return False
         finally:
             self._reconnecting = False
+
+    def _handle_reconnect_close_failure(self, mode: str, exc: Exception) -> None:
+        message = (
+            "camera reconnect aborted because the previous camera system could not be closed; "
+            "wait for the timed-out SDK call to return or restart the process"
+        )
+        LOGGER.error("%s: %s", message, exc, exc_info=(type(exc), exc, exc.__traceback__))
+        self.ui_queue.put(("error", MvsError(f"{message}: {exc}")))
+        self.ui_queue.put(("status", message))
+        if mode == "record":
+            self._set_record_stop_reason("reconnect_close_failed")
+            self.recording = False
+        elif mode == "preview":
+            self.previewing = False
+        elif mode == "interval":
+            self.interval_capturing = False
 
     def _wait_reconnect_delay(self, delay: float) -> bool:
         deadline = time.perf_counter() + max(delay, 0.0)
@@ -8997,13 +9056,13 @@ class StereoCaptureOnlyApp:
         self,
         record_dir: Path,
         fps: float,
-        frames: list[dict],
         video_outputs: dict[str, list[str]],
         config_snapshot: dict,
     ) -> list[str]:
         if config_bool(config_snapshot, "auto_make_mp4", True, True) and config_bool(
             config_snapshot, "record_save_image_sequence", False, False
         ):
+            frames = self._record_sequence_frames_from_disk(record_dir, config_snapshot)
             total_units = self._mp4_progress_total_units(frames)
             progress_done = 0
 
@@ -9058,6 +9117,47 @@ class StereoCaptureOnlyApp:
             for path in video_outputs[side]:
                 names.append(Path(path).name)
         return names
+
+    def _record_sequence_frames_from_disk(self, record_dir: Path, config_snapshot: dict) -> list[dict]:
+        ext = image_extension(config_snapshot)
+        frames_by_key: dict[tuple[int, int], dict[str, object]] = {}
+        for side in ("left", "right"):
+            for segment_index, frame_dir in self._record_image_segment_dirs(record_dir, side):
+                prefix = f"{side}_"
+                for path in sorted(frame_dir.glob(f"{prefix}*.{ext}")):
+                    stem = path.stem
+                    if not stem.startswith(prefix):
+                        continue
+                    try:
+                        saved_index = int(stem[len(prefix) :])
+                    except ValueError:
+                        continue
+                    key = (segment_index, saved_index)
+                    frame = frames_by_key.setdefault(
+                        key,
+                        {
+                            "saved_index": saved_index,
+                            "segment_index": segment_index,
+                        },
+                    )
+                    frame[f"{side}_path"] = str(path)
+        return [frames_by_key[key] for key in sorted(frames_by_key)]
+
+    def _record_image_segment_dirs(self, record_dir: Path, side: str) -> list[tuple[int, Path]]:
+        dirs: list[tuple[int, Path]] = []
+        first_dir = record_dir / self._record_segment_dir(side, 1)
+        if first_dir.is_dir():
+            dirs.append((1, first_dir))
+        prefix = f"{side}_part"
+        if record_dir.exists():
+            for child in record_dir.iterdir():
+                if not child.is_dir() or not child.name.startswith(prefix):
+                    continue
+                suffix = child.name[len(prefix) :]
+                if not suffix.isdigit():
+                    continue
+                dirs.append((int(suffix), child))
+        return sorted({index: path for index, path in dirs}.items())
 
     def _mp4_progress_total_units(self, frames: list[dict]) -> int:
         total = 0
@@ -9437,17 +9537,18 @@ class StereoCaptureOnlyApp:
         record_dir: Path,
         target_fps: float,
         output_fps: float,
-        frames: list[dict],
+        frame_metadata: dict[str, object],
     ) -> dict[str, object]:
         elapsed = self._record_elapsed_seconds()
         dir_bytes = self._directory_size_bytes(record_dir)
         disk_used_delta = max(self._disk_used_bytes(record_dir) - self._record_disk_usage_start, 0)
         stats = self._record_stats_snapshot()
         record_count = int(stats["record_count"])
+        frame_count = int(frame_metadata.get("count", 0) or 0)
         summary = {
             "total_frame_count": record_count,
             "saved_frame_count": stats["saved_frame_count"],
-            "valid_frame_count": len(frames),
+            "valid_frame_count": frame_count,
             "skipped_frame_count": stats["skipped_frame_count"],
             "skipped_frames": stats["skipped_frames"],
             "timeout_count": stats["timeout_count"],
@@ -9464,7 +9565,8 @@ class StereoCaptureOnlyApp:
             "stop_reason": stats["stop_reason"],
             "skip_reasons": stats["skip_reasons"],
             "per_second": stats.get("per_second", []),
-            "average_write_seconds": self._average_record_write_seconds(frames),
+            "average_write_seconds": float(frame_metadata.get("average_write_seconds", 0.0) or 0.0),
+            "frame_metadata": dict(frame_metadata),
             "disk_write_benchmark": self._record_disk_benchmark,
             "preflight": dict(self._record_preflight_plan),
         }
@@ -9472,18 +9574,7 @@ class StereoCaptureOnlyApp:
             self._record_summary = summary
         return summary
 
-    def _average_record_write_seconds(self, frames: list[dict]) -> float:
-        values = []
-        for frame in frames:
-            try:
-                value = float(frame.get("write_seconds") or 0.0)
-            except (TypeError, ValueError):
-                continue
-            if value > 0:
-                values.append(value)
-        return float(np.mean(values)) if values else 0.0
-
-    def _record_report_second_rows(self, summary: dict[str, object], frames: list[dict]) -> list[dict[str, object]]:
+    def _record_report_second_rows(self, summary: dict[str, object]) -> list[dict[str, object]]:
         rows_by_second: dict[int, dict[str, object]] = {}
         for raw in summary.get("per_second", []) if isinstance(summary.get("per_second"), list) else []:
             if not isinstance(raw, dict):
@@ -9508,41 +9599,15 @@ class StereoCaptureOnlyApp:
                 "avg_write_ms": (write_total / write_samples * 1000.0) if write_samples > 0 else 0.0,
                 "drop_reasons": "; ".join(f"{key}: {value}" for key, value in sorted(drop_reasons.items())),
             }
-        for frame in frames:
-            try:
-                trigger = float(frame.get("trigger_time") or 0.0)
-            except (TypeError, ValueError):
-                trigger = 0.0
-            second = int(max(trigger - float(frames[0].get("trigger_time") or trigger), 0.0)) if frames else 0
-            rows_by_second.setdefault(
-                second,
-                {
-                    "second": second,
-                    "captured_frames": 0,
-                    "saved_frames": 0,
-                    "skipped_frames": 0,
-                    "timeout_count": 0,
-                    "error_count": 0,
-                    "frame_number_gaps": 0,
-                    "first_frame_index": None,
-                    "last_frame_index": None,
-                    "first_saved_index": None,
-                    "last_saved_index": None,
-                    "saved_mb": 0.0,
-                    "avg_write_ms": 0.0,
-                    "drop_reasons": "",
-                },
-            )
         return [rows_by_second[key] for key in sorted(rows_by_second)]
 
     def _write_record_reports(
         self,
         record_dir: Path,
         summary: dict[str, object],
-        frames: list[dict],
         config_snapshot: dict,
     ) -> dict[str, str]:
-        second_rows = self._record_report_second_rows(summary, frames)
+        second_rows = self._record_report_second_rows(summary)
         skipped_frames = summary.get("skipped_frames")
         if not isinstance(skipped_frames, list):
             skipped_frames = self._record_stats_snapshot().get("skipped_frames", [])
@@ -9570,38 +9635,38 @@ class StereoCaptureOnlyApp:
             "metric",
             "value",
         ]
-        with csv_path.open("w", newline="", encoding="utf-8-sig") as fh:
-            writer = csv.DictWriter(fh, fieldnames=csv_fields)
-            writer.writeheader()
-            summary_rows = {
-                "total_frame_count": summary.get("total_frame_count", 0),
-                "saved_frame_count": summary.get("saved_frame_count", 0),
-                "skipped_frame_count": summary.get("skipped_frame_count", 0),
-                "timeout_count": summary.get("timeout_count", 0),
-                "frame_number_gap_count": summary.get("frame_number_gap_count", 0),
-                "average_capture_fps": f"{float(summary.get('average_capture_fps') or 0.0):.4f}",
-                "effective_video_fps": f"{float(summary.get('effective_video_fps') or 0.0):.4f}",
-                "average_write_ms": f"{float(summary.get('average_write_seconds') or 0.0) * 1000.0:.4f}",
-                "directory_size_bytes": summary.get("directory_size_bytes", 0),
-                "stop_reason": summary.get("stop_reason", ""),
-            }
-            for metric_name, value in summary_rows.items():
-                writer.writerow({"section": "summary", "metric": metric_name, "value": value})
-            for row in second_rows:
-                writer.writerow({"section": "per_second", **row})
-            for skipped in skipped_frames if isinstance(skipped_frames, list) else []:
-                if not isinstance(skipped, dict):
-                    continue
-                writer.writerow(
-                    {
-                        "section": "skipped_frame",
-                        "frame_index": skipped.get("index"),
-                        "reason": skipped.get("reason"),
-                        "time": self._format_wall_time(skipped.get("time")),
-                    }
-                )
+        rows: list[dict[str, object]] = []
+        summary_rows = {
+            "total_frame_count": summary.get("total_frame_count", 0),
+            "saved_frame_count": summary.get("saved_frame_count", 0),
+            "skipped_frame_count": summary.get("skipped_frame_count", 0),
+            "timeout_count": summary.get("timeout_count", 0),
+            "frame_number_gap_count": summary.get("frame_number_gap_count", 0),
+            "average_capture_fps": f"{float(summary.get('average_capture_fps') or 0.0):.4f}",
+            "effective_video_fps": f"{float(summary.get('effective_video_fps') or 0.0):.4f}",
+            "average_write_ms": f"{float(summary.get('average_write_seconds') or 0.0) * 1000.0:.4f}",
+            "directory_size_bytes": summary.get("directory_size_bytes", 0),
+            "stop_reason": summary.get("stop_reason", ""),
+        }
+        for metric_name, value in summary_rows.items():
+            rows.append({"section": "summary", "metric": metric_name, "value": value})
+        for row in second_rows:
+            rows.append({"section": "per_second", **row})
+        for skipped in skipped_frames if isinstance(skipped_frames, list) else []:
+            if not isinstance(skipped, dict):
+                continue
+            rows.append(
+                {
+                    "section": "skipped_frame",
+                    "frame_index": skipped.get("index"),
+                    "reason": skipped.get("reason"),
+                    "time": self._format_wall_time(skipped.get("time")),
+                }
+            )
+        atomic_write_csv(csv_path, csv_fields, rows)
 
-        html_path.write_text(
+        atomic_write_text(
+            html_path,
             self._record_report_html(record_dir, summary, second_rows, skipped_frames, config_snapshot),
             encoding="utf-8",
         )
@@ -9860,6 +9925,18 @@ Output {esc('MP4 + image sequence' if config_bool(config_snapshot, 'record_save_
         raw_len = int(getattr(frame, "raw_frame_len", 0) or len(raw_data))
         return bytes(contiguous_frame_buffer(raw_data, raw_len))
 
+    def _raw_viewable_sidecar_allowed(self, frame: CameraFrame) -> bool:
+        width = int(getattr(frame, "width", 0) or 0)
+        height = int(getattr(frame, "height", 0) or 0)
+        bit_depth = int(getattr(frame, "raw_bit_depth", 8) or 8)
+        pixel_name = str(getattr(frame, "pixel_type_name", "") or "").lower()
+        raw_len = int(getattr(frame, "raw_frame_len", 0) or 0)
+        if bit_depth > 8 and ("packed" in pixel_name or "bayer" in pixel_name):
+            return False
+        if bit_depth > 8 and width > 0 and height > 0 and raw_len < width * height * 2:
+            return False
+        return True
+
     def _frame_to_correction_array(self, frame: CameraFrame | None) -> np.ndarray | None:
         if frame is None:
             return None
@@ -9993,11 +10070,14 @@ Output {esc('MP4 + image sequence' if config_bool(config_snapshot, 'record_save_
         try:
             if fmt == "npy":
                 raw_path = self._save_raw_npy_frame(frame, raw_path)
-                try:
-                    array = self._raw_frame_array(frame)
-                    self._save_viewable_sidecar(array, raw_path, config_snapshot)
-                except Exception as exc:
-                    LOGGER.debug("viewable sidecar from raw npy payload failed: %s", exc, exc_info=True)
+                if self._raw_viewable_sidecar_allowed(frame):
+                    try:
+                        array = self._raw_frame_array(frame)
+                        self._save_viewable_sidecar(array, raw_path, config_snapshot)
+                    except Exception as exc:
+                        LOGGER.debug("viewable sidecar from raw npy payload failed: %s", exc, exc_info=True)
+                else:
+                    LOGGER.debug("viewable sidecar skipped for packed or Bayer high-bit-depth raw frame: %s", raw_path)
                 return raw_path
             array = self._raw_frame_array(frame)
             if fmt == "png16":
@@ -10125,6 +10205,7 @@ Output {esc('MP4 + image sequence' if config_bool(config_snapshot, 'record_save_
             environment=environment,
             algorithm=self._checksum_algorithm(config_snapshot),
             scan_roots=scan_roots,
+            checksum_files=config_bool(config_snapshot, "record_manifest_checksum_enabled", False, False),
         )
 
     def _capture_settings_snapshot(self, config_snapshot: dict | None = None) -> dict[str, object]:
