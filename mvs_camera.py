@@ -1882,7 +1882,9 @@ class StereoCameraSystem:
         self._camera_timestamp_offset_samples: deque[int] = deque(maxlen=self.camera_timestamp_offset_window)
         self._last_continuous_frame_numbers: dict[str, int] = {}
         self._capture_lock = threading.Lock()
+        self._executor_lock = threading.Lock()
         self._executor = ThreadPoolExecutor(max_workers=4, thread_name_prefix="mvss-capture")
+        self._abandoned_futures: set[Any] = set()
 
     def connect(self) -> tuple[CameraInfo | None, CameraInfo | None]:
         self._camera_timestamp_offset = None
@@ -2011,18 +2013,40 @@ class StereoCameraSystem:
 
     def close(self) -> None:
         errors: list[str] = []
-        for cam in (self.left, self.right):
-            if cam is None:
-                continue
-            try:
-                cam.close()
-            except Exception as exc:
-                errors.append(str(exc))
-        self.left = None
-        self.right = None
+        close_timeout_s = max(config_float(self.config, "camera_close_pending_capture_timeout_seconds", 1.0), 0.0)
+        acquired = self._capture_lock.acquire(timeout=close_timeout_s)
+        if not acquired:
+            self._retire_executor(getattr(self, "_executor", None))
+            raise MvsError(
+                "camera close skipped because a capture call is still blocked in the SDK; "
+                "restart the process before reconnecting cameras"
+            )
+        try:
+            pending = self._abandoned_futures_snapshot()
+            if pending:
+                done, pending = wait(pending, timeout=close_timeout_s)
+                for future in done:
+                    self._discard_abandoned_future(future)
+            if pending:
+                self._retire_executor(getattr(self, "_executor", None))
+                raise MvsError(
+                    "camera close skipped because timed-out SDK worker threads are still running; "
+                    "restart the process before reconnecting cameras"
+                )
+            for cam in (self.left, self.right):
+                if cam is None:
+                    continue
+                try:
+                    cam.close()
+                except Exception as exc:
+                    errors.append(str(exc))
+            self.left = None
+            self.right = None
+        finally:
+            self._capture_lock.release()
         executor = getattr(self, "_executor", None)
         if executor is not None:
-            executor.shutdown(wait=True, cancel_futures=True)
+            executor.shutdown(wait=False, cancel_futures=True)
             self._executor = None
         if errors:
             raise MvsError("; ".join(errors))
@@ -2313,6 +2337,7 @@ class StereoCameraSystem:
         timeout_ms: int | None = None,
         convert_image: bool = True,
     ) -> tuple[Frame | None, Frame | None, float]:
+        self._ensure_no_abandoned_sdk_calls()
         cameras = self._connected_cameras()
         if not cameras:
             raise MvsError("相机尚未连接。")
@@ -2391,7 +2416,8 @@ class StereoCameraSystem:
         frames: dict[str, Frame] = {}
         for future in pending:
             errors.append(FrameTimeoutError(f"{futures[future]} timed out"))
-            future.cancel()
+        if pending:
+            self._abandon_pending_futures(executor, pending)
         for future in done:
             name = futures[future]
             try:
@@ -2568,11 +2594,61 @@ class StereoCameraSystem:
         return "Software"
 
     def _executor_snapshot(self) -> ThreadPoolExecutor:
-        executor = getattr(self, "_executor", None)
+        self._ensure_executor_tracking()
+        with self._executor_lock:
+            executor = getattr(self, "_executor", None)
+            if executor is None:
+                executor = ThreadPoolExecutor(max_workers=4, thread_name_prefix="mvss-capture")
+                self._executor = executor
+            return executor
+
+    def _ensure_executor_tracking(self) -> None:
+        if not hasattr(self, "_executor_lock"):
+            self._executor_lock = threading.Lock()
+        if not hasattr(self, "_abandoned_futures"):
+            self._abandoned_futures = set()
+
+    def _discard_abandoned_future(self, future: Any) -> None:
+        self._ensure_executor_tracking()
+        with self._executor_lock:
+            self._abandoned_futures.discard(future)
+
+    def _abandoned_futures_snapshot(self) -> set[Any]:
+        self._ensure_executor_tracking()
+        with self._executor_lock:
+            done = {future for future in self._abandoned_futures if future.done() or future.cancelled()}
+            self._abandoned_futures.difference_update(done)
+            return set(self._abandoned_futures)
+
+    def _ensure_no_abandoned_sdk_calls(self) -> None:
+        if self._abandoned_futures_snapshot():
+            raise FrameTimeoutError(
+                "previous timed-out SDK capture is still running; wait for it to return or restart the process"
+            )
+
+    def _retire_executor(self, executor: ThreadPoolExecutor | None) -> None:
         if executor is None:
-            executor = ThreadPoolExecutor(max_workers=4, thread_name_prefix="mvss-capture")
-            self._executor = executor
-        return executor
+            return
+        self._ensure_executor_tracking()
+        with self._executor_lock:
+            if getattr(self, "_executor", None) is executor:
+                self._executor = None
+        executor.shutdown(wait=False, cancel_futures=True)
+
+    def _abandon_pending_futures(self, executor: ThreadPoolExecutor, pending: set[Any]) -> None:
+        if not pending:
+            return
+        self._ensure_executor_tracking()
+        callbacks: list[Any] = []
+        with self._executor_lock:
+            for future in pending:
+                future.cancel()
+                if not future.done() and not future.cancelled():
+                    self._abandoned_futures.add(future)
+                    callbacks.append(future)
+        for future in callbacks:
+            future.add_done_callback(self._discard_abandoned_future)
+        self._retire_executor(executor)
 
     def _run_parallel(self, tasks: list[tuple[str, Any]], timeout_s: float) -> list[tuple[str, Any]]:
         if len(tasks) == 1:
@@ -2585,7 +2661,8 @@ class StereoCameraSystem:
         results: list[tuple[str, Any]] = []
         for future in pending:
             errors.append(FrameTimeoutError(f"{futures[future]} timed out"))
-            future.cancel()
+        if pending:
+            self._abandon_pending_futures(executor, pending)
         for future in done:
             name = futures[future]
             try:

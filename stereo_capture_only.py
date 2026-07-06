@@ -163,6 +163,7 @@ LOGGER = logging.getLogger("mvss_capture")
 UI_QUEUE_EVENT = "<<MvssUiQueue>>"
 DEFAULT_HOST_TIMESTAMP_DELTA_NS = 10_000_000
 _CONFIG_MISSING = object()
+_CONFIG_WRITE_LOCK = threading.Lock()
 TRIGGER_SOURCE_CN = {
     "Software": "软触发",
     "Continuous": "连续采集",
@@ -593,12 +594,11 @@ class RecordMetaWriter:
         self._fh.write("[\n")
         self._count = 0
         self._closed = False
-        self._frames: list[dict] = []
+        self._aborted = False
 
     def append(self, frame_meta: dict) -> None:
         try:
             text = json.dumps(frame_meta, ensure_ascii=False, default=json_metadata_default)
-            normalized = json.loads(text)
         except (TypeError, ValueError) as exc:
             LOGGER.exception("record frame metadata is not JSON serializable")
             raise RuntimeError(f"record frame metadata is not JSON serializable: {exc}") from exc
@@ -608,7 +608,6 @@ class RecordMetaWriter:
             if self._count:
                 self._fh.write(",\n")
             self._fh.write(text)
-            self._frames.append(normalized)
             self._count += 1
             if self._count % self.flush_every == 0:
                 self._fh.flush()
@@ -629,13 +628,32 @@ class RecordMetaWriter:
         with self._lock:
             if self._closed:
                 return
-            self._fh.write("\n]\n")
+            if not self._aborted:
+                self._fh.write("\n]\n")
+            self._fh.close()
+            self._closed = True
+
+    def abort(self) -> None:
+        with self._lock:
+            if self._closed:
+                return
+            self._aborted = True
             self._fh.close()
             self._closed = True
 
     def load(self) -> list[dict]:
         with self._lock:
-            return [dict(frame) for frame in self._frames]
+            if not self._closed or self._aborted:
+                return []
+        try:
+            with self.path.open("r", encoding="utf-8") as fh:
+                payload = json.load(fh)
+        except (OSError, json.JSONDecodeError) as exc:
+            LOGGER.warning("Could not load record frame metadata from %s: %s", self.path, exc, exc_info=True)
+            return []
+        if not isinstance(payload, list):
+            return []
+        return [dict(frame) for frame in payload if isinstance(frame, dict)]
 
 
 def json_metadata_default(value: object) -> object:
@@ -704,9 +722,21 @@ def load_config() -> dict:
 
 def save_config(config: dict) -> None:
     payload = config.snapshot() if isinstance(config, ThreadSafeConfig) else dict(config)
-    with CONFIG_PATH.open("w", encoding="utf-8") as fh:
-        json.dump(payload, fh, ensure_ascii=False, indent=2)
-        fh.write("\n")
+    CONFIG_PATH.parent.mkdir(parents=True, exist_ok=True)
+    tmp_path = CONFIG_PATH.with_name(f"{CONFIG_PATH.name}.{os.getpid()}.{threading.get_ident()}.tmp")
+    with _CONFIG_WRITE_LOCK:
+        try:
+            with tmp_path.open("w", encoding="utf-8") as fh:
+                json.dump(payload, fh, ensure_ascii=False, indent=2)
+                fh.write("\n")
+                fh.flush()
+                os.fsync(fh.fileno())
+            tmp_path.replace(CONFIG_PATH)
+        finally:
+            try:
+                tmp_path.unlink(missing_ok=True)
+            except OSError:
+                LOGGER.debug("Could not remove temporary config file %s.", tmp_path, exc_info=True)
 
 
 def timestamp_ms() -> str:
@@ -717,6 +747,22 @@ def safe_filename(text: object) -> str:
     value = str(text).strip()
     cleaned = "".join(ch if ch.isalnum() or ch in "._-" else "_" for ch in value)
     return cleaned.strip("._") or "item"
+
+
+def mirrored_right_roi_from_left(
+    width: int,
+    height: int,
+    offset_x: int,
+    offset_y: int,
+    sensor_width: int = CAPTURE_WIDTH,
+) -> tuple[int, int, int, int]:
+    width = max(int(width), 1)
+    height = max(int(height), 1)
+    sensor_width = max(int(sensor_width), width)
+    offset_x = max(int(offset_x), 0)
+    offset_y = max(int(offset_y), 0)
+    mirrored_x = max(sensor_width - offset_x - width, 0)
+    return width, height, mirrored_x, offset_y
 
 
 def optional_float_text(text: str) -> float | None:
@@ -2121,8 +2167,6 @@ class StereoCaptureOnlyApp:
                 key = f"{side}_roi_{field}"
                 if self.config.get(key) in (None, ""):
                     self.config[key] = fallback
-        self.config["right_roi_width"] = self.config.get("left_roi_width", self.config["roi_width"])
-        self.config["right_roi_height"] = self.config.get("left_roi_height", self.config["roi_height"])
 
     def _ensure_config_section(self, key: str) -> dict[str, object]:
         section = self.config.get(key)
@@ -2159,8 +2203,8 @@ class StereoCaptureOnlyApp:
         self.left_roi_height_var = StringVar(value=str(self.config.get("left_roi_height", self.config.get("roi_height", CAPTURE_HEIGHT))))
         self.left_roi_offset_x_var = StringVar(value=str(self.config.get("left_roi_offset_x", self.config.get("roi_offset_x", 0))))
         self.left_roi_offset_y_var = StringVar(value=str(self.config.get("left_roi_offset_y", self.config.get("roi_offset_y", 0))))
-        self.right_roi_width_var = StringVar(value=str(self.config.get("left_roi_width", self.config.get("roi_width", CAPTURE_WIDTH))))
-        self.right_roi_height_var = StringVar(value=str(self.config.get("left_roi_height", self.config.get("roi_height", CAPTURE_HEIGHT))))
+        self.right_roi_width_var = StringVar(value=str(self.config.get("right_roi_width", self.config.get("roi_width", CAPTURE_WIDTH))))
+        self.right_roi_height_var = StringVar(value=str(self.config.get("right_roi_height", self.config.get("roi_height", CAPTURE_HEIGHT))))
         self.right_roi_offset_x_var = StringVar(value=str(self.config.get("right_roi_offset_x", self.config.get("roi_offset_x", 0))))
         self.right_roi_offset_y_var = StringVar(value=str(self.config.get("right_roi_offset_y", self.config.get("roi_offset_y", 0))))
         self.interval_seconds_var = StringVar(value=optional_config_text(self.config, "interval_capture_seconds", "5.0"))
@@ -5185,92 +5229,113 @@ class StereoCaptureOnlyApp:
                 queues.append(image_queue)
             if video_queue is not None:
                 queues.append(video_queue)
-            self._stop_record_workers(tuple(queues), workers, config_snapshot)
-            meta_writer.close()
-            frames_snapshot = meta_writer.load()
-            writer_errors_snapshot = self._writer_errors_snapshot(writer_errors, writer_errors_lock)
-            if writer_errors_snapshot:
-                self.ui_queue.put(("error", writer_errors_snapshot[0]))
-                self._add_record_errors(len(writer_errors_snapshot))
-            output_fps = self._record_output_fps(capture_fps or fps)
-            generated_video_names = self._finalize_recording_videos(
-                record_dir,
-                output_fps,
-                frames_snapshot,
-                video_outputs,
-                config_snapshot,
-            )
-            summary = self._build_record_summary(record_dir, capture_fps or 0.0, output_fps, frames_snapshot)
-            reports = self._write_record_reports(record_dir, summary, frames_snapshot, config_snapshot)
-            summary["record_reports"] = reports
-            write_lag, _write_warning, skip_every_n, skip_keep_frames = self._record_write_state_snapshot()
-            stats = self._record_stats_snapshot()
-            camera_system = self.camera_system
-            record_mode = str(config_snapshot.get("record_mode", "video"))
-            meta = {
-                "mode": record_mode,
-                "fps": fps,
-                "effective_video_fps": output_fps,
-                "frame_count": stats["record_count"],
-                "saved_frame_count": stats["saved_frame_count"],
-                "skipped_frame_count": stats["skipped_frame_count"],
-                "skipped_frames": stats["skipped_frames"],
-                "skip_reasons": stats["skip_reasons"],
-                "timeout_count": stats["timeout_count"],
-                "error_count": stats["error_count"],
-                "reconnect_count": stats["reconnect_count"],
-                "disk_warning_count": stats["disk_warning_count"],
-                "image_format": ext,
-                "record_save_image_sequence": save_image_sequence,
-                "video_format": "mp4" if (post_make_mp4 or realtime_mp4_enabled) else None,
-                "video_codec": config_snapshot.get("video_codec", "mp4v"),
-                "video_bitrate_kbps": config_int(config_snapshot, "video_bitrate_kbps", 8000),
-                "video_quality_crf": config_int(config_snapshot, "video_quality_crf", 23),
-                "video_preset": config_snapshot.get("video_preset", "medium"),
-                "use_nvenc": config_bool(config_snapshot, "use_nvenc", False, False),
-                "auto_make_mp4": post_make_mp4,
-                "record_realtime_mp4": realtime_mp4_enabled,
-                "mp4_generation": mp4_generation,
-                "record_mode": record_mode,
-                "record_split_interval_seconds": config_float(config_snapshot, "record_split_interval_seconds", 600.0),
-                "record_split_size_gb": config_float(config_snapshot, "record_split_size_gb", 4.0),
-                "record_max_seconds": max_seconds,
-                "stop_reason": stats["stop_reason"],
-                "write_lag": write_lag,
-                "disk_write_benchmark": self._record_disk_benchmark,
-                "skip_every_n": skip_every_n,
-                "skip_keep_frames": skip_keep_frames,
-                "left_videos": [str(path) for path in video_outputs["left"]],
-                "right_videos": [str(path) for path in video_outputs["right"]],
-                "pixel_format": CAPTURE_PIXEL_FORMAT,
-                "left_camera": asdict(camera_system.left_info) if camera_system and camera_system.left_info else None,
-                "right_camera": asdict(camera_system.right_info) if camera_system and camera_system.right_info else None,
-                "device_versions": dict(self._device_versions),
-                "temperatures_c": dict(self._latest_temperatures),
-                "stream_stats": dict(getattr(self, "_latest_stream_stats", {})),
-                "temperature_samples": list(self._temperature_samples),
-                "calibration": self.calibration.meta(),
-                "camera_timestamp_offset_fixed": config_snapshot.get("camera_timestamp_offset_fixed"),
-                "field_correction": dict(config_snapshot.get("field_correction", {}))
-                if isinstance(config_snapshot.get("field_correction"), dict)
-                else {},
-                "dic_analysis": dict(config_snapshot.get("dic_analysis", {}))
-                if isinstance(config_snapshot.get("dic_analysis"), dict)
-                else {},
-                "project": self.project_manager.project_meta(),
-                "data_manifest": {
-                    "manifest_csv": str(record_dir / "exports" / "file_manifest.csv"),
-                    "summary_json": str(record_dir / "exports" / "capture_summary.json"),
-                },
-                "record_reports": reports,
-                "frames": frames_snapshot,
-                "summary": summary,
-            }
-            with (record_dir / "meta.json").open("w", encoding="utf-8") as fh:
-                json.dump(meta, fh, ensure_ascii=False, indent=2)
-            manifest = self._write_manifest_for_session(record_dir, summary, config_snapshot)
-            self.project_manager.register_session(record_mode, record_dir, record_dir / "meta.json", {"manifest": manifest})
-            self.ui_queue.put(("record_done", (record_dir, generated_video_names, summary)))
+            workers_stopped = self._stop_record_workers(tuple(queues), workers, config_snapshot)
+            if not workers_stopped:
+                self._set_record_stop_reason("writer_timeout")
+                self._add_record_errors()
+                meta_writer.abort()
+                stats = self._record_stats_snapshot()
+                summary = {
+                    "record_dir": str(record_dir),
+                    "incomplete": True,
+                    "stop_reason": "writer_timeout",
+                    "record_count": stats["record_count"],
+                    "saved_frame_count": stats["saved_frame_count"],
+                    "frame_metadata_path": str(meta_writer.path),
+                    "warning": "record writer thread did not stop before finalization; final meta/report/manifest were skipped",
+                }
+                self.ui_queue.put(("error", MvsError(str(summary["warning"]))))
+                self.ui_queue.put(("record_done", (record_dir, [], summary)))
+            else:
+                meta_writer.close()
+                frames_snapshot = meta_writer.load()
+                writer_errors_snapshot = self._writer_errors_snapshot(writer_errors, writer_errors_lock)
+                if writer_errors_snapshot:
+                    self.ui_queue.put(("error", writer_errors_snapshot[0]))
+                    self._add_record_errors(len(writer_errors_snapshot))
+                output_fps = self._record_output_fps(capture_fps or fps)
+                generated_video_names = self._finalize_recording_videos(
+                    record_dir,
+                    output_fps,
+                    frames_snapshot,
+                    video_outputs,
+                    config_snapshot,
+                )
+                summary = self._build_record_summary(record_dir, capture_fps or 0.0, output_fps, frames_snapshot)
+                reports = self._write_record_reports(record_dir, summary, frames_snapshot, config_snapshot)
+                summary["record_reports"] = reports
+                write_lag, _write_warning, skip_every_n, skip_keep_frames = self._record_write_state_snapshot()
+                stats = self._record_stats_snapshot()
+                camera_system = self.camera_system
+                record_mode = str(config_snapshot.get("record_mode", "video"))
+                meta = {
+                    "mode": record_mode,
+                    "fps": fps,
+                    "effective_video_fps": output_fps,
+                    "frame_count": stats["record_count"],
+                    "saved_frame_count": stats["saved_frame_count"],
+                    "skipped_frame_count": stats["skipped_frame_count"],
+                    "skipped_frames": stats["skipped_frames"],
+                    "skip_reasons": stats["skip_reasons"],
+                    "timeout_count": stats["timeout_count"],
+                    "error_count": stats["error_count"],
+                    "reconnect_count": stats["reconnect_count"],
+                    "disk_warning_count": stats["disk_warning_count"],
+                    "image_format": ext,
+                    "record_save_image_sequence": save_image_sequence,
+                    "video_format": "mp4" if (post_make_mp4 or realtime_mp4_enabled) else None,
+                    "video_codec": config_snapshot.get("video_codec", "mp4v"),
+                    "video_bitrate_kbps": config_int(config_snapshot, "video_bitrate_kbps", 8000),
+                    "video_quality_crf": config_int(config_snapshot, "video_quality_crf", 23),
+                    "video_preset": config_snapshot.get("video_preset", "medium"),
+                    "use_nvenc": config_bool(config_snapshot, "use_nvenc", False, False),
+                    "auto_make_mp4": post_make_mp4,
+                    "record_realtime_mp4": realtime_mp4_enabled,
+                    "mp4_generation": mp4_generation,
+                    "record_mode": record_mode,
+                    "record_split_interval_seconds": config_float(config_snapshot, "record_split_interval_seconds", 600.0),
+                    "record_split_size_gb": config_float(config_snapshot, "record_split_size_gb", 4.0),
+                    "record_max_seconds": max_seconds,
+                    "stop_reason": stats["stop_reason"],
+                    "write_lag": write_lag,
+                    "disk_write_benchmark": self._record_disk_benchmark,
+                    "skip_every_n": skip_every_n,
+                    "skip_keep_frames": skip_keep_frames,
+                    "left_videos": [str(path) for path in video_outputs["left"]],
+                    "right_videos": [str(path) for path in video_outputs["right"]],
+                    "pixel_format": CAPTURE_PIXEL_FORMAT,
+                    "left_camera": asdict(camera_system.left_info) if camera_system and camera_system.left_info else None,
+                    "right_camera": asdict(camera_system.right_info) if camera_system and camera_system.right_info else None,
+                    "device_versions": dict(self._device_versions),
+                    "temperatures_c": dict(self._latest_temperatures),
+                    "stream_stats": dict(getattr(self, "_latest_stream_stats", {})),
+                    "temperature_samples": list(self._temperature_samples),
+                    "calibration": self.calibration.meta(),
+                    "camera_timestamp_offset_fixed": config_snapshot.get("camera_timestamp_offset_fixed"),
+                    "field_correction": dict(config_snapshot.get("field_correction", {}))
+                    if isinstance(config_snapshot.get("field_correction"), dict)
+                    else {},
+                    "dic_analysis": dict(config_snapshot.get("dic_analysis", {}))
+                    if isinstance(config_snapshot.get("dic_analysis"), dict)
+                    else {},
+                    "project": self.project_manager.project_meta(),
+                    "data_manifest": {
+                        "manifest_csv": str(record_dir / "exports" / "file_manifest.csv"),
+                        "summary_json": str(record_dir / "exports" / "capture_summary.json"),
+                    },
+                    "record_reports": reports,
+                    "frames": {
+                        "metadata_path": str(meta_writer.path),
+                        "count": len(frames_snapshot),
+                        "embedded": False,
+                    },
+                    "summary": summary,
+                }
+                with (record_dir / "meta.json").open("w", encoding="utf-8") as fh:
+                    json.dump(meta, fh, ensure_ascii=False, indent=2)
+                manifest = self._write_manifest_for_session(record_dir, summary, config_snapshot)
+                self.project_manager.register_session(record_mode, record_dir, record_dir / "meta.json", {"manifest": manifest})
+                self.ui_queue.put(("record_done", (record_dir, generated_video_names, summary)))
 
     def _reset_record_write_state(self) -> None:
         with self._state_lock:
@@ -5623,8 +5688,8 @@ class StereoCaptureOnlyApp:
         queues: tuple[Queue, ...],
         workers: list[threading.Thread],
         config_snapshot: dict,
-    ) -> None:
-        timeout_s = max(config_float(config_snapshot, "record_writer_stop_timeout_seconds", 10.0), 1.0)
+    ) -> bool:
+        timeout_s = max(config_float(config_snapshot, "record_writer_stop_timeout_seconds", 10.0), 0.1)
         for queue in queues:
             try:
                 queue.put(None, timeout=1.0)
@@ -5641,11 +5706,12 @@ class StereoCaptureOnlyApp:
             if worker.is_alive():
                 self._notify_warning(
                     "record_worker_stop_timeout",
-                    f"录像写入线程 {worker.name or worker.ident} 停止超时，已继续收尾。",
+                    f"Record writer thread {worker.name or worker.ident} did not stop in time; final reports will be skipped.",
                 )
         for queue in queues:
             if getattr(queue, "unfinished_tasks", 0) > 0:
                 self._drain_queue(queue, "queue_drain_after_stop_timeout")
+        return not any(worker.is_alive() for worker in workers)
 
     def _drain_queue(self, queue: Queue, reason: str) -> None:
         while True:
@@ -5700,6 +5766,9 @@ class StereoCaptureOnlyApp:
     def _clone_frame(self, frame: CameraFrame | None) -> CameraFrame | None:
         if frame is None:
             return None
+        raw_data = getattr(frame, "raw_data", None)
+        raw_len = int(getattr(frame, "raw_frame_len", 0) or (len(raw_data) if raw_data is not None else 0))
+        raw_copy = bytes(contiguous_frame_buffer(raw_data, raw_len)) if raw_data is not None and raw_len > 0 else None
         return CameraFrame(
             image=frame.image.copy() if getattr(frame, "image", None) is not None else None,
             frame_number=frame.frame_number,
@@ -5707,8 +5776,8 @@ class StereoCaptureOnlyApp:
             height=frame.height,
             host_timestamp=frame.host_timestamp,
             camera_timestamp=frame.camera_timestamp,
-            raw_data=getattr(frame, "raw_data", None),
-            raw_frame_len=int(getattr(frame, "raw_frame_len", 0) or 0),
+            raw_data=raw_copy,
+            raw_frame_len=raw_len if raw_copy is not None else 0,
             pixel_type=int(getattr(frame, "pixel_type", 0) or 0),
             pixel_type_name=str(getattr(frame, "pixel_type_name", "") or ""),
             raw_bit_depth=int(getattr(frame, "raw_bit_depth", 8) or 8),
@@ -6094,8 +6163,17 @@ class StereoCaptureOnlyApp:
             self.left_roi_height_var.set(str(height))
             self.left_roi_offset_x_var.set(str(offset_x))
             self.left_roi_offset_y_var.set(str(offset_y))
-            self.right_roi_width_var.set(str(width))
-            self.right_roi_height_var.set(str(height))
+            right_width, right_height, right_offset_x, right_offset_y = mirrored_right_roi_from_left(
+                width,
+                height,
+                offset_x,
+                offset_y,
+                CAPTURE_WIDTH,
+            )
+            self.right_roi_width_var.set(str(right_width))
+            self.right_roi_height_var.set(str(right_height))
+            self.right_roi_offset_x_var.set(str(right_offset_x))
+            self.right_roi_offset_y_var.set(str(right_offset_y))
         else:
             try:
                 width = optional_int_text(self.left_roi_width_var.get()) or width
@@ -6118,13 +6196,13 @@ class StereoCaptureOnlyApp:
         left_height = optional_int_text(self.left_roi_height_var.get()) or CAPTURE_HEIGHT
         left_offset_x = int(self.left_roi_offset_x_var.get() or 0)
         left_offset_y = int(self.left_roi_offset_y_var.get() or 0)
+        right_width = optional_int_text(self.right_roi_width_var.get()) or left_width
+        right_height = optional_int_text(self.right_roi_height_var.get()) or left_height
         right_offset_x = int(self.right_roi_offset_x_var.get() or 0)
         right_offset_y = int(self.right_roi_offset_y_var.get() or 0)
-        self.right_roi_width_var.set(str(left_width))
-        self.right_roi_height_var.set(str(left_height))
         return {
             "left": (left_width, left_height, left_offset_x, left_offset_y),
-            "right": (left_width, left_height, right_offset_x, right_offset_y),
+            "right": (right_width, right_height, right_offset_x, right_offset_y),
         }
 
     def _side_roi_requests_from_config(self, config_snapshot: dict) -> dict[str, tuple[int, int, int, int]]:
@@ -6132,11 +6210,13 @@ class StereoCaptureOnlyApp:
         left_height = int(config_snapshot.get("left_roi_height", config_snapshot.get("roi_height", CAPTURE_HEIGHT)) or CAPTURE_HEIGHT)
         left_offset_x = int(config_snapshot.get("left_roi_offset_x", config_snapshot.get("roi_offset_x", 0)) or 0)
         left_offset_y = int(config_snapshot.get("left_roi_offset_y", config_snapshot.get("roi_offset_y", 0)) or 0)
+        right_width = int(config_snapshot.get("right_roi_width", config_snapshot.get("roi_width", left_width)) or left_width)
+        right_height = int(config_snapshot.get("right_roi_height", config_snapshot.get("roi_height", left_height)) or left_height)
         right_offset_x = int(config_snapshot.get("right_roi_offset_x", config_snapshot.get("roi_offset_x", 0)) or 0)
         right_offset_y = int(config_snapshot.get("right_roi_offset_y", config_snapshot.get("roi_offset_y", 0)) or 0)
         return {
             "left": (left_width, left_height, left_offset_x, left_offset_y),
-            "right": (left_width, left_height, right_offset_x, right_offset_y),
+            "right": (right_width, right_height, right_offset_x, right_offset_y),
         }
 
     def reset_roi_settings(self) -> None:
@@ -8341,8 +8421,8 @@ class StereoCaptureOnlyApp:
         self.left_roi_height_var.set(str(snapshot.get("left_roi_height", snapshot.get("roi_height", CAPTURE_HEIGHT))))
         self.left_roi_offset_x_var.set(str(snapshot.get("left_roi_offset_x", snapshot.get("roi_offset_x", 0))))
         self.left_roi_offset_y_var.set(str(snapshot.get("left_roi_offset_y", snapshot.get("roi_offset_y", 0))))
-        self.right_roi_width_var.set(str(snapshot.get("left_roi_width", snapshot.get("roi_width", CAPTURE_WIDTH))))
-        self.right_roi_height_var.set(str(snapshot.get("left_roi_height", snapshot.get("roi_height", CAPTURE_HEIGHT))))
+        self.right_roi_width_var.set(str(snapshot.get("right_roi_width", snapshot.get("roi_width", CAPTURE_WIDTH))))
+        self.right_roi_height_var.set(str(snapshot.get("right_roi_height", snapshot.get("roi_height", CAPTURE_HEIGHT))))
         self.right_roi_offset_x_var.set(str(snapshot.get("right_roi_offset_x", snapshot.get("roi_offset_x", 0))))
         self.right_roi_offset_y_var.set(str(snapshot.get("right_roi_offset_y", snapshot.get("roi_offset_y", 0))))
         self.interval_seconds_var.set(optional_config_text(snapshot, "interval_capture_seconds", ""))
@@ -8512,8 +8592,8 @@ class StereoCaptureOnlyApp:
         self.left_roi_height_var.set(str(self.config.get("left_roi_height", self.config.get("roi_height", CAPTURE_HEIGHT))))
         self.left_roi_offset_x_var.set(str(self.config.get("left_roi_offset_x", self.config.get("roi_offset_x", 0))))
         self.left_roi_offset_y_var.set(str(self.config.get("left_roi_offset_y", self.config.get("roi_offset_y", 0))))
-        self.right_roi_width_var.set(str(self.config.get("left_roi_width", self.config.get("roi_width", CAPTURE_WIDTH))))
-        self.right_roi_height_var.set(str(self.config.get("left_roi_height", self.config.get("roi_height", CAPTURE_HEIGHT))))
+        self.right_roi_width_var.set(str(self.config.get("right_roi_width", self.config.get("roi_width", CAPTURE_WIDTH))))
+        self.right_roi_height_var.set(str(self.config.get("right_roi_height", self.config.get("roi_height", CAPTURE_HEIGHT))))
         self.right_roi_offset_x_var.set(str(self.config.get("right_roi_offset_x", self.config.get("roi_offset_x", 0))))
         self.right_roi_offset_y_var.set(str(self.config.get("right_roi_offset_y", self.config.get("roi_offset_y", 0))))
         self.record_max_seconds_var.set(optional_config_text(self.config, "record_max_seconds", "0"))
@@ -9771,7 +9851,14 @@ Output {esc('MP4 + image sequence' if config_bool(config_snapshot, 'record_save_
         if width > 0 and height > 0 and raw_len >= width * height and ("mono" in pixel_name or "bayer" in pixel_name):
             payload = contiguous_frame_buffer(raw_data, width * height)
             return np.frombuffer(payload, dtype=np.uint8, count=width * height).reshape((height, width)).copy()
-        return np.frombuffer(contiguous_frame_buffer(raw_data), dtype=np.uint8).copy()
+        return np.frombuffer(contiguous_frame_buffer(raw_data, raw_len), dtype=np.uint8).copy()
+
+    def _raw_payload_bytes(self, frame: CameraFrame) -> bytes:
+        raw_data = getattr(frame, "raw_data", None)
+        if raw_data is None:
+            raise MvsError("raw-only frame has no raw payload to save")
+        raw_len = int(getattr(frame, "raw_frame_len", 0) or len(raw_data))
+        return bytes(contiguous_frame_buffer(raw_data, raw_len))
 
     def _frame_to_correction_array(self, frame: CameraFrame | None) -> np.ndarray | None:
         if frame is None:
@@ -9845,13 +9932,55 @@ Output {esc('MP4 + image sequence' if config_bool(config_snapshot, 'record_save_
         width = int(getattr(frame, "width", 0) or 0)
         height = int(getattr(frame, "height", 0) or 0)
         bit_depth = int(getattr(frame, "raw_bit_depth", 8) or 8)
+        pixel_name = str(getattr(frame, "pixel_type_name", "") or "").lower()
+        raw_len = int(getattr(frame, "raw_frame_len", 0) or 0)
         if bit_depth <= 8:
             return
-        if width <= 0 or height <= 0 or array.shape != (height, width) or array.dtype != np.uint16:
+        if (
+            width <= 0
+            or height <= 0
+            or array.shape != (height, width)
+            or array.dtype != np.uint16
+            or raw_len < width * height * 2
+            or "packed" in pixel_name
+            or "bayer" in pixel_name
+        ):
             raise MvsError(
                 f"{fmt} requires unpacked high-bit-depth mono data. "
                 "Choose raw_frame_format='npy' to keep the original bytes, or set the camera PixelFormat to unpacked Mono16."
             )
+
+    def _save_raw_npy_frame(self, frame: CameraFrame, raw_path: Path) -> Path:
+        payload = self._raw_payload_bytes(frame)
+        try:
+            np.save(raw_path, np.frombuffer(payload, dtype=np.uint8).copy())
+            metadata = self._frame_meta(frame)
+            metadata.update(
+                {
+                    "raw_storage": "uint8_payload_bytes",
+                    "raw_payload_file": raw_path.name,
+                    "raw_frame_len": len(payload),
+                }
+            )
+            meta_path = raw_path.with_suffix(f"{raw_path.suffix}.json")
+            tmp_meta_path = meta_path.with_name(f"{meta_path.name}.tmp")
+            with tmp_meta_path.open("w", encoding="utf-8") as fh:
+                json.dump(metadata, fh, ensure_ascii=False, indent=2, default=json_metadata_default)
+                fh.write("\n")
+                fh.flush()
+                os.fsync(fh.fileno())
+            tmp_meta_path.replace(meta_path)
+        except Exception:
+            try:
+                raw_path.unlink(missing_ok=True)
+            except OSError:
+                LOGGER.debug("Could not clean up raw npy payload %s after failure.", raw_path, exc_info=True)
+            try:
+                raw_path.with_suffix(f"{raw_path.suffix}.json").unlink(missing_ok=True)
+            except OSError:
+                LOGGER.debug("Could not clean up raw npy metadata for %s after failure.", raw_path, exc_info=True)
+            raise
+        return raw_path
 
     def _save_raw_frame(self, frame: CameraFrame, path: Path, config_snapshot: dict | None = None) -> Path:
         config_snapshot = config_snapshot or self._config_snapshot()
@@ -9862,10 +9991,16 @@ Output {esc('MP4 + image sequence' if config_bool(config_snapshot, 'record_save_
         fmt = raw_frame_format(config_snapshot)
         raw_path = path.with_suffix(f".{raw_frame_extension(config_snapshot)}")
         try:
-            array = self._raw_frame_array(frame)
             if fmt == "npy":
-                np.save(raw_path, array)
-            elif fmt == "png16":
+                raw_path = self._save_raw_npy_frame(frame, raw_path)
+                try:
+                    array = self._raw_frame_array(frame)
+                    self._save_viewable_sidecar(array, raw_path, config_snapshot)
+                except Exception as exc:
+                    LOGGER.debug("viewable sidecar from raw npy payload failed: %s", exc, exc_info=True)
+                return raw_path
+            array = self._raw_frame_array(frame)
+            if fmt == "png16":
                 self._validate_standard_raw_image_array(frame, array, fmt)
                 if array.dtype != np.uint16:
                     array = array.astype(np.uint16, copy=False)
