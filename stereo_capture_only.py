@@ -782,6 +782,11 @@ def timestamp_ms() -> str:
     return time.strftime("%Y%m%d_%H%M%S_") + f"{int((time.time() % 1) * 1000):03d}"
 
 
+def timestamp_ms_from_epoch(epoch_seconds: float) -> str:
+    whole = float(epoch_seconds)
+    return time.strftime("%Y%m%d_%H%M%S_", time.localtime(whole)) + f"{int((whole % 1) * 1000):03d}"
+
+
 def safe_filename(text: object) -> str:
     value = str(text).strip()
     cleaned = "".join(ch if ch.isalnum() or ch in "._-" else "_" for ch in value)
@@ -2079,6 +2084,17 @@ class StereoCaptureOnlyApp:
         self.interval_thread: threading.Thread | None = None
         self.interval_stop_event = threading.Event()
         self.interval_count = 0
+        self._interval_writer_queue: Queue[dict | None] | None = None
+        self._interval_writer_thread: threading.Thread | None = None
+        self._interval_writer_errors: list[Exception] = []
+        self._interval_writer_lock = threading.Lock()
+        self._interval_writer_saved_count = 0
+        self._interval_writer_queued_count = 0
+        self._interval_writer_queue_high_water = 0
+        self._interval_writer_batch_id = ""
+        self._interval_trigger_late_count = 0
+        self._interval_max_late_seconds = 0.0
+        self._interval_min_interval_plan: dict[str, object] = {}
         self.photo_count = 0
         self.recording = False
         self.record_thread: threading.Thread | None = None
@@ -4670,13 +4686,313 @@ class StereoCaptureOnlyApp:
         )
         return meta_dir
 
+    def _interval_pair_bytes_estimate(self, config_snapshot: dict | None = None) -> int:
+        config_snapshot = config_snapshot or self._config_snapshot()
+        left_size, right_size = self._side_roi_dimensions_from_config(config_snapshot)
+        return estimate_frame_bytes(config_snapshot, left_size[0], left_size[1]) + estimate_frame_bytes(
+            config_snapshot,
+            right_size[0],
+            right_size[1],
+        )
+
+    def _build_interval_preflight_plan(self, interval_s: float) -> dict[str, object]:
+        config_snapshot = self._config_snapshot()
+        pair_bytes = self._interval_pair_bytes_estimate(config_snapshot)
+        queue_size = max(config_int(config_snapshot, "interval_writer_queue_max_items", 24), 1)
+        benchmark: dict[str, object] | None = None
+        write_seconds = 0.0
+        if config_bool(config_snapshot, "interval_disk_benchmark_enabled", True, True):
+            try:
+                benchmark = benchmark_write_speed(
+                    self.project_manager.active_project_dir,
+                    size_mb=config_float(config_snapshot, "interval_disk_benchmark_size_mb", 128.0),
+                    sample_seconds=config_float(config_snapshot, "interval_disk_benchmark_seconds", 1.5),
+                )
+                mbps = float(benchmark.get("write_mbps", 0.0) or 0.0)
+                if mbps > 0:
+                    margin = max(config_float(config_snapshot, "interval_disk_benchmark_margin", 1.5), 1.0)
+                    write_seconds = pair_bytes / 1024 / 1024 / mbps * margin
+            except Exception as exc:
+                LOGGER.warning("interval disk benchmark failed: %s", exc, exc_info=True)
+        capture_floor = max(config_float(config_snapshot, "exposure_time_us", 0.0), 0.0) / 1_000_000.0 + 0.25
+        minimum_interval = max(capture_floor, write_seconds)
+        return {
+            "requested_interval_s": float(interval_s),
+            "estimated_min_interval_s": minimum_interval,
+            "estimated_pair_mb": pair_bytes / 1024 / 1024,
+            "queue_size": queue_size,
+            "benchmark": benchmark,
+        }
+
+    def _confirm_interval_preflight(self, interval_s: float) -> bool:
+        if not config_bool(self.config, "interval_preflight_enabled", True, True):
+            self._interval_min_interval_plan = {}
+            return True
+        plan = self._build_interval_preflight_plan(interval_s)
+        self._interval_min_interval_plan = plan
+        estimated = float(plan.get("estimated_min_interval_s", 0.0) or 0.0)
+        if estimated <= 0 or interval_s >= estimated:
+            return True
+        message = (
+            f"当前参数估算的最小安全间隔约 {estimated:.2f} s，"
+            f"你设置的是 {interval_s:.2f} s。\n\n"
+            "程序会按严格节拍触发；如果采集或写入跟不上，将停止并报警，"
+            "不会悄悄拉长间隔。是否仍然启动？"
+        )
+        if config_bool(self.config, "interval_preflight_prompt_enabled", True, True):
+            return bool(messagebox.askyesno("定时拍照间隔预检", message))
+        self.status_var.set(message.replace("\n\n", " "))
+        return True
+
+    def _start_interval_writer(self, interval_s: float, limit: int | None) -> Queue[dict | None]:
+        queue_size = max(config_int(self.config, "interval_writer_queue_max_items", 24), 1)
+        queue: Queue[dict | None] = Queue(maxsize=queue_size)
+        with self._interval_writer_lock:
+            self._interval_writer_queue = queue
+            self._interval_writer_errors = []
+            self._interval_writer_saved_count = 0
+            self._interval_writer_queued_count = 0
+            self._interval_writer_queue_high_water = 0
+            self._interval_writer_batch_id = f"{timestamp_ms()}_interval_batch"
+        thread = threading.Thread(
+            target=self._interval_photo_writer_loop,
+            args=(queue, self._interval_writer_batch_id, interval_s, limit),
+            daemon=True,
+            name="interval-photo-writer",
+        )
+        self._interval_writer_thread = thread
+        thread.start()
+        return queue
+
+    def _interval_writer_counts(self) -> tuple[int, int, int]:
+        queue = self._interval_writer_queue
+        queued_depth = queue.qsize() if queue is not None else 0
+        with self._interval_writer_lock:
+            return self._interval_writer_saved_count, queued_depth, self._interval_writer_queue_high_water
+
+    def _queue_interval_photo(self, item: dict) -> bool:
+        queue = self._interval_writer_queue
+        if queue is None:
+            return False
+        if queue.full():
+            return False
+        try:
+            queue.put_nowait(item)
+        except Full:
+            return False
+        with self._interval_writer_lock:
+            self._interval_writer_queued_count += 1
+            self._interval_writer_queue_high_water = max(self._interval_writer_queue_high_water, queue.qsize())
+        return True
+
+    def _append_interval_writer_error(self, exc: Exception) -> None:
+        with self._interval_writer_lock:
+            self._interval_writer_errors.append(exc)
+
+    def _release_frame_raw_data(self, frame: CameraFrame | None) -> None:
+        if frame is not None and hasattr(frame, "release_raw_data"):
+            try:
+                frame.release_raw_data()
+            except Exception:
+                LOGGER.debug("failed to release interval frame raw data", exc_info=True)
+
+    def _interval_photo_writer_loop(
+        self,
+        queue: Queue[dict | None],
+        batch_id: str,
+        interval_s: float,
+        limit: int | None,
+    ) -> None:
+        records: list[dict[str, object]] = []
+        while True:
+            item = queue.get()
+            try:
+                if item is None:
+                    break
+                left = item.get("left")
+                right = item.get("right")
+                try:
+                    corrected_left, corrected_right = self._correct_frame_pair(left, right)
+                    meta_dir, record = self._save_interval_photo_pair(
+                        corrected_left,
+                        corrected_right,
+                        float(item["trigger_time"]),
+                        int(item["index"]),
+                        float(item.get("scheduled_wall_time", item["trigger_time"])),
+                        float(item.get("capture_late_seconds", 0.0) or 0.0),
+                    )
+                    records.append(record)
+                    with self._interval_writer_lock:
+                        self._interval_writer_saved_count += 1
+                    self.ui_queue.put(("interval_lamp_green", None))
+                    saved, queued_depth, high_water = self._interval_writer_counts()
+                    self.ui_queue.put(
+                        (
+                            "status",
+                            self._interval_status_text(
+                                interval_s,
+                                limit,
+                                meta_dir.name,
+                                max(time.perf_counter() - float(item.get("started_at", time.perf_counter())), 0.0),
+                            )
+                            + f"；已写盘 {saved} 组；待写入 {queued_depth} 组；队列峰值 {high_water}",
+                        )
+                    )
+                except Exception as exc:
+                    self._append_interval_writer_error(exc if isinstance(exc, Exception) else Exception(str(exc)))
+                    self.ui_queue.put(("error", exc))
+                finally:
+                    self._release_frame_raw_data(left if isinstance(left, CameraFrame) else None)
+                    self._release_frame_raw_data(right if isinstance(right, CameraFrame) else None)
+            finally:
+                queue.task_done()
+        try:
+            if records:
+                self._finalize_interval_batch(batch_id, records, interval_s, limit)
+        except Exception as exc:
+            self._append_interval_writer_error(exc if isinstance(exc, Exception) else Exception(str(exc)))
+            self.ui_queue.put(("error", exc))
+
+    def _save_interval_photo_pair(
+        self,
+        left: CameraFrame | None,
+        right: CameraFrame | None,
+        trigger_time: float,
+        index: int,
+        scheduled_wall_time: float,
+        capture_late_seconds: float,
+    ) -> tuple[Path, dict[str, object]]:
+        capture_id = timestamp_ms_from_epoch(trigger_time)
+        left_dir, right_dir, meta_dir = self._project_capture_paths(capture_id)
+        ext = image_extension(self.config)
+        group_left = left_dir / f"{capture_id}_left.{ext}"
+        group_right = right_dir / f"{capture_id}_right.{ext}"
+        if left is not None:
+            group_left = self._save_frame(left, group_left)
+        if right is not None:
+            group_right = self._save_frame(right, group_right)
+        quality_metrics = self._quality_metrics_for_pair(left, right)
+        focus = quality_metrics.get("focus") if isinstance(quality_metrics.get("focus"), dict) else {}
+        left_exposure = quality_metrics.get("left_exposure") if isinstance(quality_metrics.get("left_exposure"), dict) else None
+        right_exposure = quality_metrics.get("right_exposure") if isinstance(quality_metrics.get("right_exposure"), dict) else None
+        calibration_board = quality_metrics.get("calibration_board")
+        dic_speckle = quality_metrics.get("dic_speckle")
+        report = self._quality_report_from_metrics(quality_metrics)
+        self._write_meta(
+            meta_dir / "meta.json",
+            mode="interval_photo",
+            capture_id=capture_id,
+            interval_index=index,
+            trigger_time=trigger_time,
+            scheduled_wall_time=scheduled_wall_time,
+            capture_late_seconds=capture_late_seconds,
+            left=left,
+            right=right,
+            left_path=str(group_left) if left is not None else None,
+            right_path=str(group_right) if right is not None else None,
+            group_left_path=str(group_left) if left is not None else None,
+            group_right_path=str(group_right) if right is not None else None,
+            focus_left=focus.get("left"),
+            focus_right=focus.get("right"),
+            focus_score=focus.get("score"),
+            focus_consistency_warning=bool(focus.get("consistency_warning")),
+            exposure_left=self._meta_exposure(left_exposure),
+            exposure_right=self._meta_exposure(right_exposure),
+            dic_speckle=dic_speckle,
+            calibration_board=calibration_board,
+            capture_quality_report=report,
+            data_manifest={
+                "batch_manifest": str(self.project_manager.active_project_dir / "exports" / "captures" / self._interval_writer_batch_id / "exports" / "file_manifest.csv"),
+            },
+        )
+        return meta_dir, {
+            "index": index,
+            "capture_id": capture_id,
+            "trigger_time": trigger_time,
+            "scheduled_wall_time": scheduled_wall_time,
+            "capture_late_seconds": capture_late_seconds,
+            "left_path": str(group_left) if left is not None else None,
+            "right_path": str(group_right) if right is not None else None,
+            "metadata_path": str(meta_dir / "meta.json"),
+            "meta_dir": str(meta_dir),
+        }
+
+    def _finalize_interval_batch(
+        self,
+        batch_id: str,
+        records: list[dict[str, object]],
+        interval_s: float,
+        limit: int | None,
+    ) -> None:
+        project_dir = self.project_manager.active_project_dir
+        batch_dir = project_dir / "exports" / "captures" / batch_id
+        batch_dir.mkdir(parents=True, exist_ok=True)
+        trigger_times = [float(item["trigger_time"]) for item in records if item.get("trigger_time") is not None]
+        late_values = [float(item.get("capture_late_seconds", 0.0) or 0.0) for item in records]
+        summary = {
+            "mode": "interval_photo_batch",
+            "capture_id": batch_id,
+            "requested_interval_seconds": interval_s,
+            "requested_count": limit,
+            "saved_count": len(records),
+            "first_trigger_time": min(trigger_times) if trigger_times else None,
+            "last_trigger_time": max(trigger_times) if trigger_times else None,
+            "max_capture_late_seconds": max(late_values) if late_values else 0.0,
+            "late_count": self._interval_trigger_late_count,
+            "queue_high_water": self._interval_writer_queue_high_water,
+            "preflight": self._interval_min_interval_plan,
+            "records": records,
+        }
+        atomic_write_json(batch_dir / "interval_summary.json", summary)
+        manifest = self._write_manifest_for_session(
+            batch_dir,
+            summary,
+            scan_roots=[batch_dir, project_dir / "exports" / "captures", project_dir / "left", project_dir / "right"],
+        )
+        self.project_manager.register_session(
+            "interval_photo_batch",
+            batch_dir,
+            batch_dir / "interval_summary.json",
+            {"capture_id": batch_id, "image_root": str(project_dir), "manifest": manifest},
+        )
+
+    def _stop_interval_writer(self) -> dict[str, object]:
+        queue = self._interval_writer_queue
+        thread = self._interval_writer_thread
+        if queue is not None:
+            while True:
+                try:
+                    queue.put(None, timeout=1.0)
+                    break
+                except Full:
+                    if thread is None or not thread.is_alive():
+                        break
+                    continue
+            queue.join()
+        if thread is not None and thread.is_alive():
+            thread.join(timeout=max(config_float(self.config, "record_writer_stop_timeout_seconds", 10.0), 0.1))
+        with self._interval_writer_lock:
+            errors = list(self._interval_writer_errors)
+            summary = {
+                "saved_count": self._interval_writer_saved_count,
+                "queued_count": self._interval_writer_queued_count,
+                "queue_high_water": self._interval_writer_queue_high_water,
+                "batch_id": self._interval_writer_batch_id,
+                "errors": errors,
+                "late_count": self._interval_trigger_late_count,
+                "max_late_seconds": self._interval_max_late_seconds,
+            }
+            self._interval_writer_queue = None
+            self._interval_writer_thread = None
+        return summary
+
     def toggle_interval_capture(self) -> None:
         if self.interval_capturing:
             self.stop_interval_capture()
         else:
             self.start_interval_capture()
 
-    def start_interval_capture(self) -> None:
+    def _legacy_start_interval_capture(self) -> None:
         if self.camera_system is None:
             return
         if self.recording:
@@ -4782,6 +5098,165 @@ class StereoCaptureOnlyApp:
         finally:
             self.interval_capturing = False
             self.ui_queue.put(("interval_done", had_error))
+
+    def start_interval_capture(self) -> None:
+        if self.camera_system is None:
+            return
+        if self.recording:
+            self.status_var.set("录像中不能启动定时拍照。")
+            return
+        try:
+            interval_s = float(self.interval_seconds_var.get())
+            limit = optional_interval_limit_text(self.interval_limit_var.get())
+        except ValueError:
+            self.status_var.set("定时拍照参数必须是数字。")
+            return
+        if interval_s <= 0:
+            self.status_var.set("定时拍照间隔必须大于 0 秒。")
+            return
+        if limit is not None and limit <= 0:
+            self.status_var.set("定时拍照张数必须为空或大于 0。")
+            return
+        if not self._confirm_interval_preflight(interval_s):
+            self.status_var.set("定时拍照已取消：间隔预检未通过。")
+            return
+
+        self._update_config({"interval_capture_seconds": interval_s, "interval_capture_count": limit})
+        self._reset_stats()
+        display_enabled = self.previewing
+        if display_enabled:
+            self.previewing = False
+            if self.preview_thread and self.preview_thread.is_alive():
+                self.preview_thread.join(timeout=3)
+        self.interval_capturing = True
+        self.previewing = display_enabled
+        self.interval_stop_event.clear()
+        self.interval_count = 0
+        self._interval_trigger_late_count = 0
+        self._interval_max_late_seconds = 0.0
+        self._start_interval_writer(interval_s, limit)
+        self._set_interval_lamp(DANGER_COLOR)
+        self.interval_button.configure(text="停止定时")
+        self._set_capture_buttons(NORMAL)
+        count_text = "持续拍照" if limit is None else f"拍 {limit} 组"
+        self.status_var.set(f"定时拍照已启动：严格每 {interval_s:g} 秒触发一组图像，后台写盘，{count_text}。")
+        self.interval_thread = threading.Thread(target=self._strict_interval_capture_loop, args=(interval_s, limit), daemon=True)
+        self.interval_thread.start()
+
+    def _strict_interval_capture_loop(self, interval_s: float, limit: int | None) -> None:
+        had_error = False
+        stop_reason = ""
+        started_at = time.perf_counter()
+        started_wall = time.time()
+        attempt_index = 0
+        late_tolerance = max(config_float(self.config, "interval_strict_late_tolerance_seconds", 0.25), 0.0)
+        try:
+            while self.interval_capturing:
+                target_time = started_at + attempt_index * interval_s
+                sleep_s = target_time - time.perf_counter()
+                if sleep_s > 0 and self.interval_stop_event.wait(sleep_s):
+                    break
+                capture_start = time.perf_counter()
+                capture_late = max(capture_start - target_time, 0.0)
+                self._interval_max_late_seconds = max(self._interval_max_late_seconds, capture_late)
+                if capture_late > late_tolerance:
+                    self._interval_trigger_late_count += 1
+                    had_error = True
+                    stop_reason = (
+                        f"定时拍照已停止：触发迟到 {capture_late:.3f} s，超过容差 {late_tolerance:.3f} s；"
+                        "当前间隔无法严格保证，请增大间隔。"
+                    )
+                    self.ui_queue.put(("error", MvsError(stop_reason)))
+                    break
+                try:
+                    left, right, trigger_time = self._require_camera_system().capture_pair()
+                except FrameTimeoutError as exc:
+                    self._handle_capture_exception(exc, "interval", 1)
+                    attempt_index += 1
+                    continue
+                except Exception as exc:
+                    if self._handle_capture_exception(exc, "interval", 0):
+                        attempt_index += 1
+                        continue
+                    raise
+                scheduled_wall_time = started_wall + attempt_index * interval_s
+                attempt_index += 1
+                next_index = self.interval_count + 1
+                if not self._queue_interval_photo(
+                    {
+                        "index": next_index,
+                        "left": left,
+                        "right": right,
+                        "trigger_time": trigger_time,
+                        "scheduled_wall_time": scheduled_wall_time,
+                        "capture_late_seconds": capture_late,
+                        "started_at": started_at,
+                    }
+                ):
+                    self._release_frame_raw_data(left)
+                    self._release_frame_raw_data(right)
+                    had_error = True
+                    stop_reason = (
+                        "定时拍照已停止：后台写入队列已满，当前间隔下写盘跟不上；"
+                        "请增大间隔或降低图像格式/分辨率。"
+                    )
+                    self.ui_queue.put(("error", MvsError(stop_reason)))
+                    break
+                self.interval_count = next_index
+                if self.previewing:
+                    self._preview_frame_counter += 1
+                    if self._should_analyze_preview_frame(self._preview_frame_counter):
+                        analysis = self._analyze_preview_frames(left, right, self._preview_frame_counter)
+                        self.ui_queue.put(("quality_metrics", analysis))
+                    self.ui_queue.put(("frames", (left, right)))
+                saved_count, queued_depth, high_water = self._interval_writer_counts()
+                self.ui_queue.put(
+                    (
+                        "status",
+                        self._interval_status_text(
+                            interval_s,
+                            limit,
+                            timestamp_ms_from_epoch(trigger_time),
+                            time.perf_counter() - started_at,
+                        )
+                        + f"；已写盘 {saved_count} 组；待写入 {queued_depth} 组；队列峰值 {high_water}",
+                    )
+                )
+                if limit is not None and self.interval_count >= limit:
+                    break
+        except Exception as exc:
+            had_error = True
+            self.ui_queue.put(("error", exc))
+        finally:
+            self.interval_capturing = False
+            writer_summary = self._stop_interval_writer()
+            writer_errors = writer_summary.get("errors") or []
+            if writer_errors:
+                had_error = True
+            if stop_reason:
+                writer_summary["stop_reason"] = stop_reason
+            writer_summary["had_error"] = had_error
+            writer_summary["captured_count"] = self.interval_count
+            saved_count = int(writer_summary.get("saved_count", 0) or 0)
+            high_water = int(writer_summary.get("queue_high_water", 0) or 0)
+            late_count = int(writer_summary.get("late_count", 0) or 0)
+            max_late = float(writer_summary.get("max_late_seconds", 0.0) or 0.0)
+            if stop_reason:
+                self.ui_queue.put(
+                    (
+                        "status",
+                        f"{stop_reason} 已触发 {self.interval_count} 组，已写盘 {saved_count} 组，队列峰值 {high_water}。",
+                    )
+                )
+            else:
+                self.ui_queue.put(
+                    (
+                        "status",
+                        f"定时拍照已停止：已触发 {self.interval_count} 组，已写盘 {saved_count} 组，"
+                        f"迟到 {late_count} 次，最大迟到 {max_late:.3f} s，队列峰值 {high_water}。",
+                    )
+                )
+            self.ui_queue.put(("interval_done", writer_summary))
 
     def toggle_recording(self) -> None:
         if self.recording:
@@ -7130,6 +7605,14 @@ class StereoCaptureOnlyApp:
             "record_disk_benchmark_seconds": 3.0,
             "record_disk_benchmark_margin": 1.25,
             "record_preflight_prompt_enabled": True,
+            "interval_writer_queue_max_items": 24,
+            "interval_strict_late_tolerance_seconds": 0.25,
+            "interval_preflight_enabled": True,
+            "interval_preflight_prompt_enabled": True,
+            "interval_disk_benchmark_enabled": True,
+            "interval_disk_benchmark_size_mb": 128.0,
+            "interval_disk_benchmark_seconds": 1.5,
+            "interval_disk_benchmark_margin": 1.5,
             "timestamp_reject_enabled": True,
             "max_camera_timestamp_delta": 0,
             "max_host_timestamp_delta": DEFAULT_HOST_TIMESTAMP_DELTA_NS,
@@ -10358,6 +10841,7 @@ Output {esc('MP4 + image sequence' if config_bool(config_snapshot, 'record_save_
         join_deadline = time.perf_counter() + join_budget
         self._join_thread_on_close(self.preview_thread, join_timeout, join_deadline)
         self._join_thread_on_close(self.interval_thread, join_timeout, join_deadline)
+        self._join_thread_on_close(self._interval_writer_thread, join_timeout, join_deadline)
         self._join_thread_on_close(self.record_thread, join_timeout, join_deadline)
         for thread in self._background_threads_snapshot():
             self._join_thread_on_close(thread, join_timeout, join_deadline)
