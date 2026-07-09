@@ -299,7 +299,7 @@ DIC_CAPTURE_CONFIG = {
     "record_realtime_mp4": True,
     "auto_make_mp4": False,
     "preview_fps": 5.0,
-    "record_queue_max_items": 32,
+    "record_queue_max_items": 100,
     "record_queue_force_configured": True,
     "chunk_data_enabled": True,
     "timestamp_reject_enabled": False,
