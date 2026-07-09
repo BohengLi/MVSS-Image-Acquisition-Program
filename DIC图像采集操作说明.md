@@ -61,8 +61,8 @@ DIC 专用设置位于 `config.json` 的 `dic_capture` 段。当前默认值如�
 | `record_realtime_mp4` | `true` | 同时实时保存 MP4 |
 | `auto_make_mp4` | `false` | 不在采集结束后再由图像序列合成 MP4 |
 | `preview_fps` | `5.0` | DIC 模式预览帧率 |
-| `record_queue_max_items` | `32` | DIC 写入队列容量 |
-| `record_queue_force_configured` | `true` | 队列容量按 32 使用，不自动扩展 |
+| `record_queue_max_items` | `100` | DIC 写入队列容量 |
+| `record_queue_force_configured` | `true` | 队列容量按 100 使用，不自动扩展 |
 | `chunk_data_enabled` | `true` | 启用相机 Chunk 元数据 |
 | `timestamp_reject_enabled` | `false` | DIC 默认不做时间戳拒绝 |
 | `record_preview_during_capture` | `true` | 采集时默认刷新预览画面 |

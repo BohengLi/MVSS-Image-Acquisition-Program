@@ -40,7 +40,7 @@ from image_quality import (
     roi_from_pixels,
     speckle_quality,
 )
-from project_manager import ProjectManager, benchmark_write_speed, write_data_manifest
+from project_manager import ProjectManager, atomic_write_csv, atomic_write_json, atomic_write_text, benchmark_write_speed, write_data_manifest
 
 _MVS_IMPORT_ERROR: BaseException | None = None
 try:
@@ -163,6 +163,7 @@ LOGGER = logging.getLogger("mvss_capture")
 UI_QUEUE_EVENT = "<<MvssUiQueue>>"
 DEFAULT_HOST_TIMESTAMP_DELTA_NS = 10_000_000
 _CONFIG_MISSING = object()
+_CONFIG_WRITE_LOCK = threading.Lock()
 TRIGGER_SOURCE_CN = {
     "Software": "软触发",
     "Continuous": "连续采集",
@@ -231,6 +232,36 @@ DIC_CAMERA_SETTING_KEYS = (
     "right_roi_offset_x",
     "right_roi_offset_y",
 )
+STARTUP_CAMERA_SETTING_DEFAULTS = {
+    "trigger_source": DISABLED_TRIGGER_FALLBACK,
+    "exposure_auto": "Off",
+    "exposure_time_us": 20000.0,
+    "auto_exposure_lower_limit": 1000.0,
+    "auto_exposure_upper_limit": 100000.0,
+    "gain_auto": "Off",
+    "gain": 0.0,
+    "auto_gain_lower_limit": 0.0,
+    "auto_gain_upper_limit": 15.0,
+    "balance_white_auto": "Off",
+    "balance_ratio_red": None,
+    "balance_ratio_green": None,
+    "balance_ratio_blue": None,
+    "black_level": None,
+    "digital_shift": None,
+    "gamma": None,
+    "roi_width": CAPTURE_WIDTH,
+    "roi_height": CAPTURE_HEIGHT,
+    "roi_offset_x": 0,
+    "roi_offset_y": 0,
+    "left_roi_width": CAPTURE_WIDTH,
+    "left_roi_height": CAPTURE_HEIGHT,
+    "left_roi_offset_x": 0,
+    "left_roi_offset_y": 0,
+    "right_roi_width": CAPTURE_WIDTH,
+    "right_roi_height": CAPTURE_HEIGHT,
+    "right_roi_offset_x": 0,
+    "right_roi_offset_y": 0,
+}
 DIC_CAPTURE_CONFIG = {
     "trigger_source": "Continuous",
     "trigger_activation": "RisingEdge",
@@ -268,7 +299,7 @@ DIC_CAPTURE_CONFIG = {
     "record_realtime_mp4": True,
     "auto_make_mp4": False,
     "preview_fps": 5.0,
-    "record_queue_max_items": 32,
+    "record_queue_max_items": 100,
     "record_queue_force_configured": True,
     "chunk_data_enabled": True,
     "timestamp_reject_enabled": False,
@@ -432,6 +463,20 @@ def dic_capture_defaults() -> dict[str, object]:
     return values
 
 
+def reset_startup_camera_settings(config: dict[str, object]) -> dict[str, object]:
+    normalized = dict(config)
+    normalized.update(STARTUP_CAMERA_SETTING_DEFAULTS)
+    dic_capture = normalized.get("dic_capture")
+    if isinstance(dic_capture, dict):
+        dic_capture = dict(dic_capture)
+        for key in DIC_CAMERA_SETTING_KEYS:
+            if key in DIC_CAPTURE_CONFIG:
+                dic_capture[key] = DIC_CAPTURE_CONFIG[key]
+        normalized["dic_capture"] = dic_capture
+    normalized.update(TRIGGER_CONFIG_SAFE_DEFAULTS)
+    return mono8_capture_config(safe_trigger_config(normalized))
+
+
 class UiEventQueue(Queue[tuple[str, object]]):
     def __init__(self, notify_callback):
         super().__init__()
@@ -546,26 +591,41 @@ class RecordMetaWriter:
         self.flush_every = max(flush_every, 1)
         self._lock = threading.Lock()
         self._fh = path.open("w", encoding="utf-8")
-        self._fh.write("[\n")
         self._count = 0
+        self._write_seconds_total = 0.0
+        self._write_seconds_samples = 0
+        self._first_trigger_time: float | None = None
+        self._last_trigger_time: float | None = None
         self._closed = False
-        self._frames: list[dict] = []
+        self._aborted = False
 
     def append(self, frame_meta: dict) -> None:
         try:
             text = json.dumps(frame_meta, ensure_ascii=False, default=json_metadata_default)
-            normalized = json.loads(text)
         except (TypeError, ValueError) as exc:
             LOGGER.exception("record frame metadata is not JSON serializable")
             raise RuntimeError(f"record frame metadata is not JSON serializable: {exc}") from exc
         with self._lock:
             if self._closed:
                 raise RuntimeError("record frame metadata writer is already closed")
-            if self._count:
-                self._fh.write(",\n")
             self._fh.write(text)
-            self._frames.append(normalized)
+            self._fh.write("\n")
             self._count += 1
+            try:
+                write_seconds = float(frame_meta.get("write_seconds") or 0.0)
+            except (TypeError, ValueError):
+                write_seconds = 0.0
+            if write_seconds > 0:
+                self._write_seconds_total += write_seconds
+                self._write_seconds_samples += 1
+            try:
+                trigger_time = float(frame_meta.get("trigger_time"))
+            except (TypeError, ValueError):
+                trigger_time = None
+            if trigger_time is not None:
+                if self._first_trigger_time is None:
+                    self._first_trigger_time = trigger_time
+                self._last_trigger_time = trigger_time
             if self._count % self.flush_every == 0:
                 self._fh.flush()
 
@@ -585,13 +645,54 @@ class RecordMetaWriter:
         with self._lock:
             if self._closed:
                 return
-            self._fh.write("\n]\n")
+            if not self._aborted:
+                self._fh.flush()
+                os.fsync(self._fh.fileno())
             self._fh.close()
             self._closed = True
 
+    def abort(self) -> None:
+        with self._lock:
+            if self._closed:
+                return
+            self._aborted = True
+            self._fh.close()
+            self._closed = True
+
+    def summary(self) -> dict[str, object]:
+        with self._lock:
+            avg_write = (
+                self._write_seconds_total / self._write_seconds_samples if self._write_seconds_samples > 0 else 0.0
+            )
+            return {
+                "metadata_path": str(self.path),
+                "metadata_format": "ndjson",
+                "count": self._count,
+                "average_write_seconds": avg_write,
+                "write_seconds_samples": self._write_seconds_samples,
+                "first_trigger_time": self._first_trigger_time,
+                "last_trigger_time": self._last_trigger_time,
+                "aborted": self._aborted,
+            }
+
     def load(self) -> list[dict]:
         with self._lock:
-            return [dict(frame) for frame in self._frames]
+            if not self._closed or self._aborted:
+                return []
+        try:
+            with self.path.open("r", encoding="utf-8") as fh:
+                first = fh.read(1)
+                fh.seek(0)
+                if first == "[":
+                    payload = json.load(fh)
+                else:
+                    payload = [json.loads(line) for line in fh if line.strip()]
+        except (OSError, json.JSONDecodeError) as exc:
+            LOGGER.warning("Could not load record frame metadata from %s: %s", self.path, exc, exc_info=True)
+            return []
+        if not isinstance(payload, list):
+            return []
+        return [dict(frame) for frame in payload if isinstance(frame, dict)]
 
 
 def json_metadata_default(value: object) -> object:
@@ -641,7 +742,8 @@ def load_config() -> dict:
     if not isinstance(payload, dict):
         LOGGER.warning("config.json root is %s; starting with defaults.", type(payload).__name__)
         payload = {}
-    payload = mono8_capture_config(safe_trigger_config(payload))
+    original_payload = dict(payload)
+    payload = reset_startup_camera_settings(payload)
     if isinstance(payload.get("presets"), dict):
         payload["presets"] = {
             name: mono8_capture_config(safe_trigger_config(preset)) if isinstance(preset, dict) else preset
@@ -649,24 +751,62 @@ def load_config() -> dict:
         }
     if isinstance(payload.get("dic_capture"), dict):
         payload["dic_capture"] = mono8_capture_config(safe_trigger_config(payload["dic_capture"]))
+    if payload != original_payload:
+        try:
+            save_config(payload)
+        except OSError:
+            LOGGER.warning("Could not persist startup camera defaults to %s.", CONFIG_PATH, exc_info=True)
     return ThreadSafeConfig(payload)
 
 
 def save_config(config: dict) -> None:
     payload = config.snapshot() if isinstance(config, ThreadSafeConfig) else dict(config)
-    with CONFIG_PATH.open("w", encoding="utf-8") as fh:
-        json.dump(payload, fh, ensure_ascii=False, indent=2)
-        fh.write("\n")
+    CONFIG_PATH.parent.mkdir(parents=True, exist_ok=True)
+    tmp_path = CONFIG_PATH.with_name(f"{CONFIG_PATH.name}.{os.getpid()}.{threading.get_ident()}.tmp")
+    with _CONFIG_WRITE_LOCK:
+        try:
+            with tmp_path.open("w", encoding="utf-8") as fh:
+                json.dump(payload, fh, ensure_ascii=False, indent=2)
+                fh.write("\n")
+                fh.flush()
+                os.fsync(fh.fileno())
+            tmp_path.replace(CONFIG_PATH)
+        finally:
+            try:
+                tmp_path.unlink(missing_ok=True)
+            except OSError:
+                LOGGER.debug("Could not remove temporary config file %s.", tmp_path, exc_info=True)
 
 
 def timestamp_ms() -> str:
     return time.strftime("%Y%m%d_%H%M%S_") + f"{int((time.time() % 1) * 1000):03d}"
 
 
+def timestamp_ms_from_epoch(epoch_seconds: float) -> str:
+    whole = float(epoch_seconds)
+    return time.strftime("%Y%m%d_%H%M%S_", time.localtime(whole)) + f"{int((whole % 1) * 1000):03d}"
+
+
 def safe_filename(text: object) -> str:
     value = str(text).strip()
     cleaned = "".join(ch if ch.isalnum() or ch in "._-" else "_" for ch in value)
     return cleaned.strip("._") or "item"
+
+
+def mirrored_right_roi_from_left(
+    width: int,
+    height: int,
+    offset_x: int,
+    offset_y: int,
+    sensor_width: int = CAPTURE_WIDTH,
+) -> tuple[int, int, int, int]:
+    width = max(int(width), 1)
+    height = max(int(height), 1)
+    sensor_width = max(int(sensor_width), width)
+    offset_x = max(int(offset_x), 0)
+    offset_y = max(int(offset_y), 0)
+    mirrored_x = max(sensor_width - offset_x - width, 0)
+    return width, height, mirrored_x, offset_y
 
 
 def optional_float_text(text: str) -> float | None:
@@ -691,6 +831,13 @@ def optional_interval_limit_text(text: str) -> int | None:
     if lowered in {"none", "null", "unlimited", "不限", "无限", "持续"}:
         return None
     return int(value)
+
+
+def optional_record_max_seconds_text(text: object) -> float:
+    value = str(text).strip()
+    if not value:
+        return 0.0
+    return max(float(value), 0.0)
 
 
 def optional_positive_fps(text: object) -> float | None:
@@ -1375,6 +1522,24 @@ class ZoomImagePane(Frame):
                     tags=("guide",),
                     stipple="gray50",
                 )
+        if self._guide_mode.startswith("safe"):
+            try:
+                safe_ratio = float(self._guide_mode.removeprefix("safe")) / 100.0
+            except ValueError:
+                safe_ratio = 0.0
+            if 0.0 < safe_ratio < 1.0:
+                inset_x = width * (1.0 - safe_ratio) / 2.0
+                inset_y = height * (1.0 - safe_ratio) / 2.0
+                self.canvas.create_rectangle(
+                    left + inset_x,
+                    top + inset_y,
+                    left + width - inset_x,
+                    top + height - inset_y,
+                    outline=color,
+                    width=2,
+                    dash=(8, 5),
+                    tags=("guide",),
+                )
         self._raise_overlays()
 
     def _draw_fraction_rects(self) -> None:
@@ -1919,6 +2084,17 @@ class StereoCaptureOnlyApp:
         self.interval_thread: threading.Thread | None = None
         self.interval_stop_event = threading.Event()
         self.interval_count = 0
+        self._interval_writer_queue: Queue[dict | None] | None = None
+        self._interval_writer_thread: threading.Thread | None = None
+        self._interval_writer_errors: list[Exception] = []
+        self._interval_writer_lock = threading.Lock()
+        self._interval_writer_saved_count = 0
+        self._interval_writer_queued_count = 0
+        self._interval_writer_queue_high_water = 0
+        self._interval_writer_batch_id = ""
+        self._interval_trigger_late_count = 0
+        self._interval_max_late_seconds = 0.0
+        self._interval_min_interval_plan: dict[str, object] = {}
         self.photo_count = 0
         self.recording = False
         self.record_thread: threading.Thread | None = None
@@ -2046,8 +2222,6 @@ class StereoCaptureOnlyApp:
                 key = f"{side}_roi_{field}"
                 if self.config.get(key) in (None, ""):
                     self.config[key] = fallback
-        self.config["right_roi_width"] = self.config.get("left_roi_width", self.config["roi_width"])
-        self.config["right_roi_height"] = self.config.get("left_roi_height", self.config["roi_height"])
 
     def _ensure_config_section(self, key: str) -> dict[str, object]:
         section = self.config.get(key)
@@ -2084,8 +2258,8 @@ class StereoCaptureOnlyApp:
         self.left_roi_height_var = StringVar(value=str(self.config.get("left_roi_height", self.config.get("roi_height", CAPTURE_HEIGHT))))
         self.left_roi_offset_x_var = StringVar(value=str(self.config.get("left_roi_offset_x", self.config.get("roi_offset_x", 0))))
         self.left_roi_offset_y_var = StringVar(value=str(self.config.get("left_roi_offset_y", self.config.get("roi_offset_y", 0))))
-        self.right_roi_width_var = StringVar(value=str(self.config.get("left_roi_width", self.config.get("roi_width", CAPTURE_WIDTH))))
-        self.right_roi_height_var = StringVar(value=str(self.config.get("left_roi_height", self.config.get("roi_height", CAPTURE_HEIGHT))))
+        self.right_roi_width_var = StringVar(value=str(self.config.get("right_roi_width", self.config.get("roi_width", CAPTURE_WIDTH))))
+        self.right_roi_height_var = StringVar(value=str(self.config.get("right_roi_height", self.config.get("roi_height", CAPTURE_HEIGHT))))
         self.right_roi_offset_x_var = StringVar(value=str(self.config.get("right_roi_offset_x", self.config.get("roi_offset_x", 0))))
         self.right_roi_offset_y_var = StringVar(value=str(self.config.get("right_roi_offset_y", self.config.get("roi_offset_y", 0))))
         self.interval_seconds_var = StringVar(value=optional_config_text(self.config, "interval_capture_seconds", "5.0"))
@@ -2275,33 +2449,6 @@ class StereoCaptureOnlyApp:
         self.dic_capture_button.grid(row=0, column=12, padx=(0, 4), pady=2)
         self.dic_record_fps_entry = self._labeled_entry(interval_panel, "DIC fps", self.dic_record_fps_var, 6, 0, 13)
 
-        assignment_panel = ttk.Frame(settings, style="Panel.TFrame", padding=(6, 4))
-        assignment_panel.pack(side=LEFT, fill="y", padx=(8, 0))
-        ttk.Label(assignment_panel, text="画面分配", style="Panel.TLabel").grid(
-            row=0, column=0, columnspan=4, padx=(0, 4), pady=2, sticky="w"
-        )
-        ttk.Label(assignment_panel, text="左", style="Panel.TLabel").grid(row=1, column=0, padx=(0, 2), pady=1)
-        self.left_camera_menu = ttk.OptionMenu(
-            assignment_panel,
-            self.left_camera_var,
-            self.left_camera_var.get(),
-            CAMERA_ASSIGNMENT_AUTO,
-            command=lambda _value: self._on_camera_assignment_changed(),
-        )
-        self.left_camera_menu.grid(row=1, column=1, padx=(0, 6), pady=1, sticky="ew")
-        ttk.Label(assignment_panel, text="右", style="Panel.TLabel").grid(row=1, column=2, padx=(0, 2), pady=1)
-        self.right_camera_menu = ttk.OptionMenu(
-            assignment_panel,
-            self.right_camera_var,
-            self.right_camera_var.get(),
-            CAMERA_ASSIGNMENT_AUTO,
-            command=lambda _value: self._on_camera_assignment_changed(),
-        )
-        self.right_camera_menu.grid(row=1, column=3, pady=1, sticky="ew")
-        assignment_panel.grid_columnconfigure(1, minsize=126, weight=1)
-        assignment_panel.grid_columnconfigure(3, minsize=126, weight=1)
-        self._sync_camera_assignment_controls()
-
         self._build_status_bar()
 
         content = DualCameraStrip(
@@ -2332,8 +2479,36 @@ class StereoCaptureOnlyApp:
         param_panel = self.param_panel_body
         param_panel.grid_columnconfigure(0, weight=1)
 
+        assignment_panel = ttk.Frame(param_panel, style="Panel.TFrame", padding=(4, 2))
+        assignment_panel.grid(row=0, column=0, sticky="ew", padx=0, pady=(0, 4))
+        assignment_panel.grid_columnconfigure(1, minsize=96, weight=1)
+        assignment_panel.grid_columnconfigure(3, minsize=96, weight=1)
+        ttk.Label(assignment_panel, text="左", style="Panel.TLabel", anchor="e").grid(
+            row=0, column=0, padx=(0, 2), pady=1, sticky="e"
+        )
+        self.left_camera_menu = ttk.OptionMenu(
+            assignment_panel,
+            self.left_camera_var,
+            self.left_camera_var.get(),
+            CAMERA_ASSIGNMENT_AUTO,
+            command=lambda _value: self._on_camera_assignment_changed(),
+        )
+        self.left_camera_menu.grid(row=0, column=1, padx=(0, 6), pady=1, sticky="ew")
+        ttk.Label(assignment_panel, text="右", style="Panel.TLabel", anchor="e").grid(
+            row=0, column=2, padx=(0, 2), pady=1, sticky="e"
+        )
+        self.right_camera_menu = ttk.OptionMenu(
+            assignment_panel,
+            self.right_camera_var,
+            self.right_camera_var.get(),
+            CAMERA_ASSIGNMENT_AUTO,
+            command=lambda _value: self._on_camera_assignment_changed(),
+        )
+        self.right_camera_menu.grid(row=0, column=3, pady=1, sticky="ew")
+        self._sync_camera_assignment_controls()
+
         gain_panel = ttk.Frame(param_panel, style="Panel.TFrame", padding=(4, 2))
-        gain_panel.grid(row=0, column=0, sticky="ew", padx=0, pady=(0, 4))
+        gain_panel.grid(row=1, column=0, sticky="ew", padx=0, pady=(0, 4))
         self._configure_parameter_grid(gain_panel)
         ttk.Label(gain_panel, text="增益", style="PanelSection.TLabel").grid(
             row=0, column=0, columnspan=2, padx=(0, 5), pady=1, sticky="w"
@@ -2353,7 +2528,7 @@ class StereoCaptureOnlyApp:
         self._labeled_entry(gain_panel, "上限", self.auto_gain_upper_var, 5, 1, 4, stretch=False, label_width=4)
 
         exposure_panel = ttk.Frame(param_panel, style="Panel.TFrame", padding=(4, 2))
-        exposure_panel.grid(row=1, column=0, sticky="ew", padx=0, pady=(0, 4))
+        exposure_panel.grid(row=2, column=0, sticky="ew", padx=0, pady=(0, 4))
         self._configure_parameter_grid(exposure_panel)
         ttk.Label(exposure_panel, text="曝光", style="PanelSection.TLabel").grid(
             row=0, column=0, columnspan=2, padx=(0, 5), pady=1, sticky="w"
@@ -2384,7 +2559,7 @@ class StereoCaptureOnlyApp:
         )
 
         wb_panel = ttk.Frame(param_panel, style="Panel.TFrame", padding=(4, 2))
-        wb_panel.grid(row=2, column=0, sticky="ew", padx=0, pady=(0, 4))
+        wb_panel.grid(row=3, column=0, sticky="ew", padx=0, pady=(0, 4))
         self._configure_parameter_grid(wb_panel)
         ttk.Label(wb_panel, text="白平衡", style="PanelSection.TLabel").grid(
             row=0, column=0, columnspan=2, padx=(0, 5), pady=1, sticky="w"
@@ -2425,7 +2600,7 @@ class StereoCaptureOnlyApp:
             )
 
         correction_panel = ttk.Frame(param_panel, style="Panel.TFrame", padding=(4, 2))
-        correction_panel.grid(row=3, column=0, sticky="ew", padx=0, pady=(0, 4))
+        correction_panel.grid(row=4, column=0, sticky="ew", padx=0, pady=(0, 4))
         for column, width in {0: 74, 1: 44, 2: 40, 3: 44, 4: 52, 5: 44}.items():
             correction_panel.grid_columnconfigure(column, minsize=width, weight=0)
         correction_panel.grid_columnconfigure(6, weight=1)
@@ -2448,7 +2623,7 @@ class StereoCaptureOnlyApp:
             )
 
         roi_panel = ttk.Frame(param_panel, style="Panel.TFrame", padding=(4, 2))
-        roi_panel.grid(row=4, column=0, sticky="ew", padx=0)
+        roi_panel.grid(row=5, column=0, sticky="ew", padx=0)
         for column, width in {0: 20, 1: 18, 2: 40, 3: 18, 4: 40, 5: 18, 6: 40, 7: 18, 8: 40}.items():
             roi_panel.grid_columnconfigure(column, minsize=width, weight=0)
         roi_panel.grid_columnconfigure(9, weight=1)
@@ -3169,6 +3344,10 @@ class StereoCaptureOnlyApp:
             "仅十字线",
             "仅网格线",
             "十字+网格",
+            "95%安全线",
+            "90%安全线",
+            "85%安全线",
+            "80%安全线",
             command=self._on_quality_menu_changed,
         )
         guide_menu.configure(style="Compact.TMenubutton")
@@ -4249,11 +4428,10 @@ class StereoCaptureOnlyApp:
     def _should_analyze_preview_frame(self, frame_index: int, config_snapshot: dict | None = None) -> bool:
         config_snapshot = config_snapshot or self._config_snapshot()
         zebra_enabled = bool(self.zebra_var.get()) if hasattr(self, "zebra_var") else False
-        focus_analysis_enabled = bool(getattr(self, "_focus_realtime_analysis_enabled_setting", True))
         analysis_required = (
             config_bool(config_snapshot, "preview_quality_analysis_enabled", True, True)
             or bool(getattr(self, "_histogram_enabled_setting", False))
-            or (focus_analysis_enabled and bool(getattr(self, "_focus_peaking_enabled_setting", False)))
+            or bool(getattr(self, "_focus_peaking_enabled_setting", False))
             or zebra_enabled
         )
         if not analysis_required:
@@ -4508,13 +4686,313 @@ class StereoCaptureOnlyApp:
         )
         return meta_dir
 
+    def _interval_pair_bytes_estimate(self, config_snapshot: dict | None = None) -> int:
+        config_snapshot = config_snapshot or self._config_snapshot()
+        left_size, right_size = self._side_roi_dimensions_from_config(config_snapshot)
+        return estimate_frame_bytes(config_snapshot, left_size[0], left_size[1]) + estimate_frame_bytes(
+            config_snapshot,
+            right_size[0],
+            right_size[1],
+        )
+
+    def _build_interval_preflight_plan(self, interval_s: float) -> dict[str, object]:
+        config_snapshot = self._config_snapshot()
+        pair_bytes = self._interval_pair_bytes_estimate(config_snapshot)
+        queue_size = max(config_int(config_snapshot, "interval_writer_queue_max_items", 24), 1)
+        benchmark: dict[str, object] | None = None
+        write_seconds = 0.0
+        if config_bool(config_snapshot, "interval_disk_benchmark_enabled", True, True):
+            try:
+                benchmark = benchmark_write_speed(
+                    self.project_manager.active_project_dir,
+                    size_mb=config_float(config_snapshot, "interval_disk_benchmark_size_mb", 128.0),
+                    sample_seconds=config_float(config_snapshot, "interval_disk_benchmark_seconds", 1.5),
+                )
+                mbps = float(benchmark.get("write_mbps", 0.0) or 0.0)
+                if mbps > 0:
+                    margin = max(config_float(config_snapshot, "interval_disk_benchmark_margin", 1.5), 1.0)
+                    write_seconds = pair_bytes / 1024 / 1024 / mbps * margin
+            except Exception as exc:
+                LOGGER.warning("interval disk benchmark failed: %s", exc, exc_info=True)
+        capture_floor = max(config_float(config_snapshot, "exposure_time_us", 0.0), 0.0) / 1_000_000.0 + 0.25
+        minimum_interval = max(capture_floor, write_seconds)
+        return {
+            "requested_interval_s": float(interval_s),
+            "estimated_min_interval_s": minimum_interval,
+            "estimated_pair_mb": pair_bytes / 1024 / 1024,
+            "queue_size": queue_size,
+            "benchmark": benchmark,
+        }
+
+    def _confirm_interval_preflight(self, interval_s: float) -> bool:
+        if not config_bool(self.config, "interval_preflight_enabled", True, True):
+            self._interval_min_interval_plan = {}
+            return True
+        plan = self._build_interval_preflight_plan(interval_s)
+        self._interval_min_interval_plan = plan
+        estimated = float(plan.get("estimated_min_interval_s", 0.0) or 0.0)
+        if estimated <= 0 or interval_s >= estimated:
+            return True
+        message = (
+            f"当前参数估算的最小安全间隔约 {estimated:.2f} s，"
+            f"你设置的是 {interval_s:.2f} s。\n\n"
+            "程序会按严格节拍触发；如果采集或写入跟不上，将停止并报警，"
+            "不会悄悄拉长间隔。是否仍然启动？"
+        )
+        if config_bool(self.config, "interval_preflight_prompt_enabled", True, True):
+            return bool(messagebox.askyesno("定时拍照间隔预检", message))
+        self.status_var.set(message.replace("\n\n", " "))
+        return True
+
+    def _start_interval_writer(self, interval_s: float, limit: int | None) -> Queue[dict | None]:
+        queue_size = max(config_int(self.config, "interval_writer_queue_max_items", 24), 1)
+        queue: Queue[dict | None] = Queue(maxsize=queue_size)
+        with self._interval_writer_lock:
+            self._interval_writer_queue = queue
+            self._interval_writer_errors = []
+            self._interval_writer_saved_count = 0
+            self._interval_writer_queued_count = 0
+            self._interval_writer_queue_high_water = 0
+            self._interval_writer_batch_id = f"{timestamp_ms()}_interval_batch"
+        thread = threading.Thread(
+            target=self._interval_photo_writer_loop,
+            args=(queue, self._interval_writer_batch_id, interval_s, limit),
+            daemon=True,
+            name="interval-photo-writer",
+        )
+        self._interval_writer_thread = thread
+        thread.start()
+        return queue
+
+    def _interval_writer_counts(self) -> tuple[int, int, int]:
+        queue = self._interval_writer_queue
+        queued_depth = queue.qsize() if queue is not None else 0
+        with self._interval_writer_lock:
+            return self._interval_writer_saved_count, queued_depth, self._interval_writer_queue_high_water
+
+    def _queue_interval_photo(self, item: dict) -> bool:
+        queue = self._interval_writer_queue
+        if queue is None:
+            return False
+        if queue.full():
+            return False
+        try:
+            queue.put_nowait(item)
+        except Full:
+            return False
+        with self._interval_writer_lock:
+            self._interval_writer_queued_count += 1
+            self._interval_writer_queue_high_water = max(self._interval_writer_queue_high_water, queue.qsize())
+        return True
+
+    def _append_interval_writer_error(self, exc: Exception) -> None:
+        with self._interval_writer_lock:
+            self._interval_writer_errors.append(exc)
+
+    def _release_frame_raw_data(self, frame: CameraFrame | None) -> None:
+        if frame is not None and hasattr(frame, "release_raw_data"):
+            try:
+                frame.release_raw_data()
+            except Exception:
+                LOGGER.debug("failed to release interval frame raw data", exc_info=True)
+
+    def _interval_photo_writer_loop(
+        self,
+        queue: Queue[dict | None],
+        batch_id: str,
+        interval_s: float,
+        limit: int | None,
+    ) -> None:
+        records: list[dict[str, object]] = []
+        while True:
+            item = queue.get()
+            try:
+                if item is None:
+                    break
+                left = item.get("left")
+                right = item.get("right")
+                try:
+                    corrected_left, corrected_right = self._correct_frame_pair(left, right)
+                    meta_dir, record = self._save_interval_photo_pair(
+                        corrected_left,
+                        corrected_right,
+                        float(item["trigger_time"]),
+                        int(item["index"]),
+                        float(item.get("scheduled_wall_time", item["trigger_time"])),
+                        float(item.get("capture_late_seconds", 0.0) or 0.0),
+                    )
+                    records.append(record)
+                    with self._interval_writer_lock:
+                        self._interval_writer_saved_count += 1
+                    self.ui_queue.put(("interval_lamp_green", None))
+                    saved, queued_depth, high_water = self._interval_writer_counts()
+                    self.ui_queue.put(
+                        (
+                            "status",
+                            self._interval_status_text(
+                                interval_s,
+                                limit,
+                                meta_dir.name,
+                                max(time.perf_counter() - float(item.get("started_at", time.perf_counter())), 0.0),
+                            )
+                            + f"；已写盘 {saved} 组；待写入 {queued_depth} 组；队列峰值 {high_water}",
+                        )
+                    )
+                except Exception as exc:
+                    self._append_interval_writer_error(exc if isinstance(exc, Exception) else Exception(str(exc)))
+                    self.ui_queue.put(("error", exc))
+                finally:
+                    self._release_frame_raw_data(left if isinstance(left, CameraFrame) else None)
+                    self._release_frame_raw_data(right if isinstance(right, CameraFrame) else None)
+            finally:
+                queue.task_done()
+        try:
+            if records:
+                self._finalize_interval_batch(batch_id, records, interval_s, limit)
+        except Exception as exc:
+            self._append_interval_writer_error(exc if isinstance(exc, Exception) else Exception(str(exc)))
+            self.ui_queue.put(("error", exc))
+
+    def _save_interval_photo_pair(
+        self,
+        left: CameraFrame | None,
+        right: CameraFrame | None,
+        trigger_time: float,
+        index: int,
+        scheduled_wall_time: float,
+        capture_late_seconds: float,
+    ) -> tuple[Path, dict[str, object]]:
+        capture_id = timestamp_ms_from_epoch(trigger_time)
+        left_dir, right_dir, meta_dir = self._project_capture_paths(capture_id)
+        ext = image_extension(self.config)
+        group_left = left_dir / f"{capture_id}_left.{ext}"
+        group_right = right_dir / f"{capture_id}_right.{ext}"
+        if left is not None:
+            group_left = self._save_frame(left, group_left)
+        if right is not None:
+            group_right = self._save_frame(right, group_right)
+        quality_metrics = self._quality_metrics_for_pair(left, right)
+        focus = quality_metrics.get("focus") if isinstance(quality_metrics.get("focus"), dict) else {}
+        left_exposure = quality_metrics.get("left_exposure") if isinstance(quality_metrics.get("left_exposure"), dict) else None
+        right_exposure = quality_metrics.get("right_exposure") if isinstance(quality_metrics.get("right_exposure"), dict) else None
+        calibration_board = quality_metrics.get("calibration_board")
+        dic_speckle = quality_metrics.get("dic_speckle")
+        report = self._quality_report_from_metrics(quality_metrics)
+        self._write_meta(
+            meta_dir / "meta.json",
+            mode="interval_photo",
+            capture_id=capture_id,
+            interval_index=index,
+            trigger_time=trigger_time,
+            scheduled_wall_time=scheduled_wall_time,
+            capture_late_seconds=capture_late_seconds,
+            left=left,
+            right=right,
+            left_path=str(group_left) if left is not None else None,
+            right_path=str(group_right) if right is not None else None,
+            group_left_path=str(group_left) if left is not None else None,
+            group_right_path=str(group_right) if right is not None else None,
+            focus_left=focus.get("left"),
+            focus_right=focus.get("right"),
+            focus_score=focus.get("score"),
+            focus_consistency_warning=bool(focus.get("consistency_warning")),
+            exposure_left=self._meta_exposure(left_exposure),
+            exposure_right=self._meta_exposure(right_exposure),
+            dic_speckle=dic_speckle,
+            calibration_board=calibration_board,
+            capture_quality_report=report,
+            data_manifest={
+                "batch_manifest": str(self.project_manager.active_project_dir / "exports" / "captures" / self._interval_writer_batch_id / "exports" / "file_manifest.csv"),
+            },
+        )
+        return meta_dir, {
+            "index": index,
+            "capture_id": capture_id,
+            "trigger_time": trigger_time,
+            "scheduled_wall_time": scheduled_wall_time,
+            "capture_late_seconds": capture_late_seconds,
+            "left_path": str(group_left) if left is not None else None,
+            "right_path": str(group_right) if right is not None else None,
+            "metadata_path": str(meta_dir / "meta.json"),
+            "meta_dir": str(meta_dir),
+        }
+
+    def _finalize_interval_batch(
+        self,
+        batch_id: str,
+        records: list[dict[str, object]],
+        interval_s: float,
+        limit: int | None,
+    ) -> None:
+        project_dir = self.project_manager.active_project_dir
+        batch_dir = project_dir / "exports" / "captures" / batch_id
+        batch_dir.mkdir(parents=True, exist_ok=True)
+        trigger_times = [float(item["trigger_time"]) for item in records if item.get("trigger_time") is not None]
+        late_values = [float(item.get("capture_late_seconds", 0.0) or 0.0) for item in records]
+        summary = {
+            "mode": "interval_photo_batch",
+            "capture_id": batch_id,
+            "requested_interval_seconds": interval_s,
+            "requested_count": limit,
+            "saved_count": len(records),
+            "first_trigger_time": min(trigger_times) if trigger_times else None,
+            "last_trigger_time": max(trigger_times) if trigger_times else None,
+            "max_capture_late_seconds": max(late_values) if late_values else 0.0,
+            "late_count": self._interval_trigger_late_count,
+            "queue_high_water": self._interval_writer_queue_high_water,
+            "preflight": self._interval_min_interval_plan,
+            "records": records,
+        }
+        atomic_write_json(batch_dir / "interval_summary.json", summary)
+        manifest = self._write_manifest_for_session(
+            batch_dir,
+            summary,
+            scan_roots=[batch_dir, project_dir / "exports" / "captures", project_dir / "left", project_dir / "right"],
+        )
+        self.project_manager.register_session(
+            "interval_photo_batch",
+            batch_dir,
+            batch_dir / "interval_summary.json",
+            {"capture_id": batch_id, "image_root": str(project_dir), "manifest": manifest},
+        )
+
+    def _stop_interval_writer(self) -> dict[str, object]:
+        queue = self._interval_writer_queue
+        thread = self._interval_writer_thread
+        if queue is not None:
+            while True:
+                try:
+                    queue.put(None, timeout=1.0)
+                    break
+                except Full:
+                    if thread is None or not thread.is_alive():
+                        break
+                    continue
+            queue.join()
+        if thread is not None and thread.is_alive():
+            thread.join(timeout=max(config_float(self.config, "record_writer_stop_timeout_seconds", 10.0), 0.1))
+        with self._interval_writer_lock:
+            errors = list(self._interval_writer_errors)
+            summary = {
+                "saved_count": self._interval_writer_saved_count,
+                "queued_count": self._interval_writer_queued_count,
+                "queue_high_water": self._interval_writer_queue_high_water,
+                "batch_id": self._interval_writer_batch_id,
+                "errors": errors,
+                "late_count": self._interval_trigger_late_count,
+                "max_late_seconds": self._interval_max_late_seconds,
+            }
+            self._interval_writer_queue = None
+            self._interval_writer_thread = None
+        return summary
+
     def toggle_interval_capture(self) -> None:
         if self.interval_capturing:
             self.stop_interval_capture()
         else:
             self.start_interval_capture()
 
-    def start_interval_capture(self) -> None:
+    def _legacy_start_interval_capture(self) -> None:
         if self.camera_system is None:
             return
         if self.recording:
@@ -4621,6 +5099,165 @@ class StereoCaptureOnlyApp:
             self.interval_capturing = False
             self.ui_queue.put(("interval_done", had_error))
 
+    def start_interval_capture(self) -> None:
+        if self.camera_system is None:
+            return
+        if self.recording:
+            self.status_var.set("录像中不能启动定时拍照。")
+            return
+        try:
+            interval_s = float(self.interval_seconds_var.get())
+            limit = optional_interval_limit_text(self.interval_limit_var.get())
+        except ValueError:
+            self.status_var.set("定时拍照参数必须是数字。")
+            return
+        if interval_s <= 0:
+            self.status_var.set("定时拍照间隔必须大于 0 秒。")
+            return
+        if limit is not None and limit <= 0:
+            self.status_var.set("定时拍照张数必须为空或大于 0。")
+            return
+        if not self._confirm_interval_preflight(interval_s):
+            self.status_var.set("定时拍照已取消：间隔预检未通过。")
+            return
+
+        self._update_config({"interval_capture_seconds": interval_s, "interval_capture_count": limit})
+        self._reset_stats()
+        display_enabled = self.previewing
+        if display_enabled:
+            self.previewing = False
+            if self.preview_thread and self.preview_thread.is_alive():
+                self.preview_thread.join(timeout=3)
+        self.interval_capturing = True
+        self.previewing = display_enabled
+        self.interval_stop_event.clear()
+        self.interval_count = 0
+        self._interval_trigger_late_count = 0
+        self._interval_max_late_seconds = 0.0
+        self._start_interval_writer(interval_s, limit)
+        self._set_interval_lamp(DANGER_COLOR)
+        self.interval_button.configure(text="停止定时")
+        self._set_capture_buttons(NORMAL)
+        count_text = "持续拍照" if limit is None else f"拍 {limit} 组"
+        self.status_var.set(f"定时拍照已启动：严格每 {interval_s:g} 秒触发一组图像，后台写盘，{count_text}。")
+        self.interval_thread = threading.Thread(target=self._strict_interval_capture_loop, args=(interval_s, limit), daemon=True)
+        self.interval_thread.start()
+
+    def _strict_interval_capture_loop(self, interval_s: float, limit: int | None) -> None:
+        had_error = False
+        stop_reason = ""
+        started_at = time.perf_counter()
+        started_wall = time.time()
+        attempt_index = 0
+        late_tolerance = max(config_float(self.config, "interval_strict_late_tolerance_seconds", 0.25), 0.0)
+        try:
+            while self.interval_capturing:
+                target_time = started_at + attempt_index * interval_s
+                sleep_s = target_time - time.perf_counter()
+                if sleep_s > 0 and self.interval_stop_event.wait(sleep_s):
+                    break
+                capture_start = time.perf_counter()
+                capture_late = max(capture_start - target_time, 0.0)
+                self._interval_max_late_seconds = max(self._interval_max_late_seconds, capture_late)
+                if capture_late > late_tolerance:
+                    self._interval_trigger_late_count += 1
+                    had_error = True
+                    stop_reason = (
+                        f"定时拍照已停止：触发迟到 {capture_late:.3f} s，超过容差 {late_tolerance:.3f} s；"
+                        "当前间隔无法严格保证，请增大间隔。"
+                    )
+                    self.ui_queue.put(("error", MvsError(stop_reason)))
+                    break
+                try:
+                    left, right, trigger_time = self._require_camera_system().capture_pair()
+                except FrameTimeoutError as exc:
+                    self._handle_capture_exception(exc, "interval", 1)
+                    attempt_index += 1
+                    continue
+                except Exception as exc:
+                    if self._handle_capture_exception(exc, "interval", 0):
+                        attempt_index += 1
+                        continue
+                    raise
+                scheduled_wall_time = started_wall + attempt_index * interval_s
+                attempt_index += 1
+                next_index = self.interval_count + 1
+                if not self._queue_interval_photo(
+                    {
+                        "index": next_index,
+                        "left": left,
+                        "right": right,
+                        "trigger_time": trigger_time,
+                        "scheduled_wall_time": scheduled_wall_time,
+                        "capture_late_seconds": capture_late,
+                        "started_at": started_at,
+                    }
+                ):
+                    self._release_frame_raw_data(left)
+                    self._release_frame_raw_data(right)
+                    had_error = True
+                    stop_reason = (
+                        "定时拍照已停止：后台写入队列已满，当前间隔下写盘跟不上；"
+                        "请增大间隔或降低图像格式/分辨率。"
+                    )
+                    self.ui_queue.put(("error", MvsError(stop_reason)))
+                    break
+                self.interval_count = next_index
+                if self.previewing:
+                    self._preview_frame_counter += 1
+                    if self._should_analyze_preview_frame(self._preview_frame_counter):
+                        analysis = self._analyze_preview_frames(left, right, self._preview_frame_counter)
+                        self.ui_queue.put(("quality_metrics", analysis))
+                    self.ui_queue.put(("frames", (left, right)))
+                saved_count, queued_depth, high_water = self._interval_writer_counts()
+                self.ui_queue.put(
+                    (
+                        "status",
+                        self._interval_status_text(
+                            interval_s,
+                            limit,
+                            timestamp_ms_from_epoch(trigger_time),
+                            time.perf_counter() - started_at,
+                        )
+                        + f"；已写盘 {saved_count} 组；待写入 {queued_depth} 组；队列峰值 {high_water}",
+                    )
+                )
+                if limit is not None and self.interval_count >= limit:
+                    break
+        except Exception as exc:
+            had_error = True
+            self.ui_queue.put(("error", exc))
+        finally:
+            self.interval_capturing = False
+            writer_summary = self._stop_interval_writer()
+            writer_errors = writer_summary.get("errors") or []
+            if writer_errors:
+                had_error = True
+            if stop_reason:
+                writer_summary["stop_reason"] = stop_reason
+            writer_summary["had_error"] = had_error
+            writer_summary["captured_count"] = self.interval_count
+            saved_count = int(writer_summary.get("saved_count", 0) or 0)
+            high_water = int(writer_summary.get("queue_high_water", 0) or 0)
+            late_count = int(writer_summary.get("late_count", 0) or 0)
+            max_late = float(writer_summary.get("max_late_seconds", 0.0) or 0.0)
+            if stop_reason:
+                self.ui_queue.put(
+                    (
+                        "status",
+                        f"{stop_reason} 已触发 {self.interval_count} 组，已写盘 {saved_count} 组，队列峰值 {high_water}。",
+                    )
+                )
+            else:
+                self.ui_queue.put(
+                    (
+                        "status",
+                        f"定时拍照已停止：已触发 {self.interval_count} 组，已写盘 {saved_count} 组，"
+                        f"迟到 {late_count} 次，最大迟到 {max_late:.3f} s，队列峰值 {high_water}。",
+                    )
+                )
+            self.ui_queue.put(("interval_done", writer_summary))
+
     def toggle_recording(self) -> None:
         if self.recording:
             self.stop_recording()
@@ -4644,9 +5281,9 @@ class StereoCaptureOnlyApp:
             return
         record_updates: dict[str, object] = {"record_fps": fps or 0.0}
         try:
-            record_updates["record_max_seconds"] = max(float(self.record_max_seconds_var.get() or 0), 0.0)
+            record_updates["record_max_seconds"] = optional_record_max_seconds_text(self.record_max_seconds_var.get())
         except ValueError:
-            self.status_var.set("录像时长必须是数字；0 表示不限时。")
+            self.status_var.set("录像时长必须是数字；留空或 0 表示不限时。")
             return
         try:
             record_updates.update(self._current_parameter_config())
@@ -4754,7 +5391,7 @@ class StereoCaptureOnlyApp:
 
         def worker() -> None:
             try:
-                warnings = self._apply_capture_config_to_camera(config_snapshot)
+                warnings = self._apply_dic_capture_config_to_camera(config_snapshot)
                 persisted = self._update_config(config_snapshot)
                 self._set_cached_trigger_source(str(persisted.get("trigger_source", "Software")))
                 self.ui_queue.put(("dic_start", (persisted, warnings)))
@@ -4949,7 +5586,7 @@ class StereoCaptureOnlyApp:
         queue_size = configured_record_queue_size(config_snapshot, fps)
         image_queue: Queue[dict | None] | None = Queue(maxsize=queue_size) if save_image_sequence else None
         video_queue: Queue[dict | None] | None = Queue(maxsize=queue_size) if realtime_mp4_enabled else None
-        meta_writer = RecordMetaWriter(record_dir / "frames.meta.json", config_int(config_snapshot, "record_meta_flush_every", 32))
+        meta_writer = RecordMetaWriter(record_dir / "frames.meta.ndjson", config_int(config_snapshot, "record_meta_flush_every", 32))
         writer_errors: list[Exception] = []
         writer_errors_lock = threading.Lock()
         video_outputs: dict[str, list[str]] = {"left": [], "right": []}
@@ -5106,92 +5743,112 @@ class StereoCaptureOnlyApp:
                 queues.append(image_queue)
             if video_queue is not None:
                 queues.append(video_queue)
-            self._stop_record_workers(tuple(queues), workers, config_snapshot)
-            meta_writer.close()
-            frames_snapshot = meta_writer.load()
-            writer_errors_snapshot = self._writer_errors_snapshot(writer_errors, writer_errors_lock)
-            if writer_errors_snapshot:
-                self.ui_queue.put(("error", writer_errors_snapshot[0]))
-                self._add_record_errors(len(writer_errors_snapshot))
-            output_fps = self._record_output_fps(capture_fps or fps)
-            generated_video_names = self._finalize_recording_videos(
-                record_dir,
-                output_fps,
-                frames_snapshot,
-                video_outputs,
-                config_snapshot,
-            )
-            summary = self._build_record_summary(record_dir, capture_fps or 0.0, output_fps, frames_snapshot)
-            reports = self._write_record_reports(record_dir, summary, frames_snapshot, config_snapshot)
-            summary["record_reports"] = reports
-            write_lag, _write_warning, skip_every_n, skip_keep_frames = self._record_write_state_snapshot()
-            stats = self._record_stats_snapshot()
-            camera_system = self.camera_system
-            record_mode = str(config_snapshot.get("record_mode", "video"))
-            meta = {
-                "mode": record_mode,
-                "fps": fps,
-                "effective_video_fps": output_fps,
-                "frame_count": stats["record_count"],
-                "saved_frame_count": stats["saved_frame_count"],
-                "skipped_frame_count": stats["skipped_frame_count"],
-                "skipped_frames": stats["skipped_frames"],
-                "skip_reasons": stats["skip_reasons"],
-                "timeout_count": stats["timeout_count"],
-                "error_count": stats["error_count"],
-                "reconnect_count": stats["reconnect_count"],
-                "disk_warning_count": stats["disk_warning_count"],
-                "image_format": ext,
-                "record_save_image_sequence": save_image_sequence,
-                "video_format": "mp4" if (post_make_mp4 or realtime_mp4_enabled) else None,
-                "video_codec": config_snapshot.get("video_codec", "mp4v"),
-                "video_bitrate_kbps": config_int(config_snapshot, "video_bitrate_kbps", 8000),
-                "video_quality_crf": config_int(config_snapshot, "video_quality_crf", 23),
-                "video_preset": config_snapshot.get("video_preset", "medium"),
-                "use_nvenc": config_bool(config_snapshot, "use_nvenc", False, False),
-                "auto_make_mp4": post_make_mp4,
-                "record_realtime_mp4": realtime_mp4_enabled,
-                "mp4_generation": mp4_generation,
-                "record_mode": record_mode,
-                "record_split_interval_seconds": config_float(config_snapshot, "record_split_interval_seconds", 600.0),
-                "record_split_size_gb": config_float(config_snapshot, "record_split_size_gb", 4.0),
-                "record_max_seconds": max_seconds,
-                "stop_reason": stats["stop_reason"],
-                "write_lag": write_lag,
-                "disk_write_benchmark": self._record_disk_benchmark,
-                "skip_every_n": skip_every_n,
-                "skip_keep_frames": skip_keep_frames,
-                "left_videos": [str(path) for path in video_outputs["left"]],
-                "right_videos": [str(path) for path in video_outputs["right"]],
-                "pixel_format": CAPTURE_PIXEL_FORMAT,
-                "left_camera": asdict(camera_system.left_info) if camera_system and camera_system.left_info else None,
-                "right_camera": asdict(camera_system.right_info) if camera_system and camera_system.right_info else None,
-                "device_versions": dict(self._device_versions),
-                "temperatures_c": dict(self._latest_temperatures),
-                "stream_stats": dict(getattr(self, "_latest_stream_stats", {})),
-                "temperature_samples": list(self._temperature_samples),
-                "calibration": self.calibration.meta(),
-                "camera_timestamp_offset_fixed": config_snapshot.get("camera_timestamp_offset_fixed"),
-                "field_correction": dict(config_snapshot.get("field_correction", {}))
-                if isinstance(config_snapshot.get("field_correction"), dict)
-                else {},
-                "dic_analysis": dict(config_snapshot.get("dic_analysis", {}))
-                if isinstance(config_snapshot.get("dic_analysis"), dict)
-                else {},
-                "project": self.project_manager.project_meta(),
-                "data_manifest": {
-                    "manifest_csv": str(record_dir / "exports" / "file_manifest.csv"),
-                    "summary_json": str(record_dir / "exports" / "capture_summary.json"),
-                },
-                "record_reports": reports,
-                "frames": frames_snapshot,
-                "summary": summary,
-            }
-            with (record_dir / "meta.json").open("w", encoding="utf-8") as fh:
-                json.dump(meta, fh, ensure_ascii=False, indent=2)
-            manifest = self._write_manifest_for_session(record_dir, summary, config_snapshot)
-            self.project_manager.register_session(record_mode, record_dir, record_dir / "meta.json", {"manifest": manifest})
-            self.ui_queue.put(("record_done", (record_dir, generated_video_names, summary)))
+            workers_stopped = self._stop_record_workers(tuple(queues), workers, config_snapshot)
+            if not workers_stopped:
+                self._set_record_stop_reason("writer_timeout")
+                self._add_record_errors()
+                meta_writer.abort()
+                stats = self._record_stats_snapshot()
+                summary = {
+                    "record_dir": str(record_dir),
+                    "incomplete": True,
+                    "stop_reason": "writer_timeout",
+                    "record_count": stats["record_count"],
+                    "saved_frame_count": stats["saved_frame_count"],
+                    "frame_metadata_path": str(meta_writer.path),
+                    "warning": "record writer thread did not stop before finalization; final meta/report/manifest were skipped",
+                }
+                self.ui_queue.put(("error", MvsError(str(summary["warning"]))))
+                self.ui_queue.put(("record_done", (record_dir, [], summary)))
+            else:
+                meta_writer.close()
+                frame_metadata = meta_writer.summary()
+                writer_errors_snapshot = self._writer_errors_snapshot(writer_errors, writer_errors_lock)
+                if writer_errors_snapshot:
+                    self.ui_queue.put(("error", writer_errors_snapshot[0]))
+                    self._add_record_errors(len(writer_errors_snapshot))
+                output_fps = self._record_output_fps(capture_fps or fps)
+                generated_video_names = self._finalize_recording_videos(
+                    record_dir,
+                    output_fps,
+                    video_outputs,
+                    config_snapshot,
+                )
+                summary = self._build_record_summary(record_dir, capture_fps or 0.0, output_fps, frame_metadata)
+                reports = self._write_record_reports(record_dir, summary, config_snapshot)
+                summary["record_reports"] = reports
+                write_lag, _write_warning, skip_every_n, skip_keep_frames = self._record_write_state_snapshot()
+                stats = self._record_stats_snapshot()
+                camera_system = self.camera_system
+                record_mode = str(config_snapshot.get("record_mode", "video"))
+                meta = {
+                    "mode": record_mode,
+                    "fps": fps,
+                    "effective_video_fps": output_fps,
+                    "frame_count": stats["record_count"],
+                    "saved_frame_count": stats["saved_frame_count"],
+                    "skipped_frame_count": stats["skipped_frame_count"],
+                    "skipped_frames": stats["skipped_frames"],
+                    "skip_reasons": stats["skip_reasons"],
+                    "timeout_count": stats["timeout_count"],
+                    "error_count": stats["error_count"],
+                    "reconnect_count": stats["reconnect_count"],
+                    "disk_warning_count": stats["disk_warning_count"],
+                    "image_format": ext,
+                    "record_save_image_sequence": save_image_sequence,
+                    "video_format": "mp4" if (post_make_mp4 or realtime_mp4_enabled) else None,
+                    "video_codec": config_snapshot.get("video_codec", "mp4v"),
+                    "video_bitrate_kbps": config_int(config_snapshot, "video_bitrate_kbps", 8000),
+                    "video_quality_crf": config_int(config_snapshot, "video_quality_crf", 23),
+                    "video_preset": config_snapshot.get("video_preset", "medium"),
+                    "use_nvenc": config_bool(config_snapshot, "use_nvenc", False, False),
+                    "auto_make_mp4": post_make_mp4,
+                    "record_realtime_mp4": realtime_mp4_enabled,
+                    "mp4_generation": mp4_generation,
+                    "record_mode": record_mode,
+                    "record_split_interval_seconds": config_float(config_snapshot, "record_split_interval_seconds", 600.0),
+                    "record_split_size_gb": config_float(config_snapshot, "record_split_size_gb", 4.0),
+                    "record_max_seconds": max_seconds,
+                    "stop_reason": stats["stop_reason"],
+                    "write_lag": write_lag,
+                    "disk_write_benchmark": self._record_disk_benchmark,
+                    "skip_every_n": skip_every_n,
+                    "skip_keep_frames": skip_keep_frames,
+                    "left_videos": [str(path) for path in video_outputs["left"]],
+                    "right_videos": [str(path) for path in video_outputs["right"]],
+                    "pixel_format": CAPTURE_PIXEL_FORMAT,
+                    "left_camera": asdict(camera_system.left_info) if camera_system and camera_system.left_info else None,
+                    "right_camera": asdict(camera_system.right_info) if camera_system and camera_system.right_info else None,
+                    "device_versions": dict(self._device_versions),
+                    "temperatures_c": dict(self._latest_temperatures),
+                    "stream_stats": dict(getattr(self, "_latest_stream_stats", {})),
+                    "temperature_samples": list(self._temperature_samples),
+                    "calibration": self.calibration.meta(),
+                    "camera_timestamp_offset_fixed": config_snapshot.get("camera_timestamp_offset_fixed"),
+                    "field_correction": dict(config_snapshot.get("field_correction", {}))
+                    if isinstance(config_snapshot.get("field_correction"), dict)
+                    else {},
+                    "dic_analysis": dict(config_snapshot.get("dic_analysis", {}))
+                    if isinstance(config_snapshot.get("dic_analysis"), dict)
+                    else {},
+                    "project": self.project_manager.project_meta(),
+                    "data_manifest": {
+                        "manifest_csv": str(record_dir / "exports" / "file_manifest.csv"),
+                        "summary_json": str(record_dir / "exports" / "capture_summary.json"),
+                    },
+                    "record_reports": reports,
+                    "frames": {
+                        "metadata_path": str(meta_writer.path),
+                        "metadata_format": "ndjson",
+                        "count": int(frame_metadata.get("count", 0) or 0),
+                        "embedded": False,
+                    },
+                    "summary": summary,
+                }
+                atomic_write_json(record_dir / "meta.json", meta, default=json_metadata_default)
+                manifest = self._write_manifest_for_session(record_dir, summary, config_snapshot)
+                self.project_manager.register_session(record_mode, record_dir, record_dir / "meta.json", {"manifest": manifest})
+                self.ui_queue.put(("record_done", (record_dir, generated_video_names, summary)))
 
     def _reset_record_write_state(self) -> None:
         with self._state_lock:
@@ -5544,8 +6201,8 @@ class StereoCaptureOnlyApp:
         queues: tuple[Queue, ...],
         workers: list[threading.Thread],
         config_snapshot: dict,
-    ) -> None:
-        timeout_s = max(config_float(config_snapshot, "record_writer_stop_timeout_seconds", 10.0), 1.0)
+    ) -> bool:
+        timeout_s = max(config_float(config_snapshot, "record_writer_stop_timeout_seconds", 10.0), 0.1)
         for queue in queues:
             try:
                 queue.put(None, timeout=1.0)
@@ -5562,11 +6219,12 @@ class StereoCaptureOnlyApp:
             if worker.is_alive():
                 self._notify_warning(
                     "record_worker_stop_timeout",
-                    f"录像写入线程 {worker.name or worker.ident} 停止超时，已继续收尾。",
+                    f"Record writer thread {worker.name or worker.ident} did not stop in time; final reports will be skipped.",
                 )
         for queue in queues:
             if getattr(queue, "unfinished_tasks", 0) > 0:
                 self._drain_queue(queue, "queue_drain_after_stop_timeout")
+        return not any(worker.is_alive() for worker in workers)
 
     def _drain_queue(self, queue: Queue, reason: str) -> None:
         while True:
@@ -5621,6 +6279,9 @@ class StereoCaptureOnlyApp:
     def _clone_frame(self, frame: CameraFrame | None) -> CameraFrame | None:
         if frame is None:
             return None
+        raw_data = getattr(frame, "raw_data", None)
+        raw_len = int(getattr(frame, "raw_frame_len", 0) or (len(raw_data) if raw_data is not None else 0))
+        raw_copy = bytes(contiguous_frame_buffer(raw_data, raw_len)) if raw_data is not None and raw_len > 0 else None
         return CameraFrame(
             image=frame.image.copy() if getattr(frame, "image", None) is not None else None,
             frame_number=frame.frame_number,
@@ -5628,8 +6289,8 @@ class StereoCaptureOnlyApp:
             height=frame.height,
             host_timestamp=frame.host_timestamp,
             camera_timestamp=frame.camera_timestamp,
-            raw_data=getattr(frame, "raw_data", None),
-            raw_frame_len=int(getattr(frame, "raw_frame_len", 0) or 0),
+            raw_data=raw_copy,
+            raw_frame_len=raw_len if raw_copy is not None else 0,
             pixel_type=int(getattr(frame, "pixel_type", 0) or 0),
             pixel_type_name=str(getattr(frame, "pixel_type_name", "") or ""),
             raw_bit_depth=int(getattr(frame, "raw_bit_depth", 8) or 8),
@@ -6015,8 +6676,17 @@ class StereoCaptureOnlyApp:
             self.left_roi_height_var.set(str(height))
             self.left_roi_offset_x_var.set(str(offset_x))
             self.left_roi_offset_y_var.set(str(offset_y))
-            self.right_roi_width_var.set(str(width))
-            self.right_roi_height_var.set(str(height))
+            right_width, right_height, right_offset_x, right_offset_y = mirrored_right_roi_from_left(
+                width,
+                height,
+                offset_x,
+                offset_y,
+                CAPTURE_WIDTH,
+            )
+            self.right_roi_width_var.set(str(right_width))
+            self.right_roi_height_var.set(str(right_height))
+            self.right_roi_offset_x_var.set(str(right_offset_x))
+            self.right_roi_offset_y_var.set(str(right_offset_y))
         else:
             try:
                 width = optional_int_text(self.left_roi_width_var.get()) or width
@@ -6039,13 +6709,13 @@ class StereoCaptureOnlyApp:
         left_height = optional_int_text(self.left_roi_height_var.get()) or CAPTURE_HEIGHT
         left_offset_x = int(self.left_roi_offset_x_var.get() or 0)
         left_offset_y = int(self.left_roi_offset_y_var.get() or 0)
+        right_width = optional_int_text(self.right_roi_width_var.get()) or left_width
+        right_height = optional_int_text(self.right_roi_height_var.get()) or left_height
         right_offset_x = int(self.right_roi_offset_x_var.get() or 0)
         right_offset_y = int(self.right_roi_offset_y_var.get() or 0)
-        self.right_roi_width_var.set(str(left_width))
-        self.right_roi_height_var.set(str(left_height))
         return {
             "left": (left_width, left_height, left_offset_x, left_offset_y),
-            "right": (left_width, left_height, right_offset_x, right_offset_y),
+            "right": (right_width, right_height, right_offset_x, right_offset_y),
         }
 
     def _side_roi_requests_from_config(self, config_snapshot: dict) -> dict[str, tuple[int, int, int, int]]:
@@ -6053,11 +6723,13 @@ class StereoCaptureOnlyApp:
         left_height = int(config_snapshot.get("left_roi_height", config_snapshot.get("roi_height", CAPTURE_HEIGHT)) or CAPTURE_HEIGHT)
         left_offset_x = int(config_snapshot.get("left_roi_offset_x", config_snapshot.get("roi_offset_x", 0)) or 0)
         left_offset_y = int(config_snapshot.get("left_roi_offset_y", config_snapshot.get("roi_offset_y", 0)) or 0)
+        right_width = int(config_snapshot.get("right_roi_width", config_snapshot.get("roi_width", left_width)) or left_width)
+        right_height = int(config_snapshot.get("right_roi_height", config_snapshot.get("roi_height", left_height)) or left_height)
         right_offset_x = int(config_snapshot.get("right_roi_offset_x", config_snapshot.get("roi_offset_x", 0)) or 0)
         right_offset_y = int(config_snapshot.get("right_roi_offset_y", config_snapshot.get("roi_offset_y", 0)) or 0)
         return {
             "left": (left_width, left_height, left_offset_x, left_offset_y),
-            "right": (left_width, left_height, right_offset_x, right_offset_y),
+            "right": (right_width, right_height, right_offset_x, right_offset_y),
         }
 
     def reset_roi_settings(self) -> None:
@@ -6933,6 +7605,14 @@ class StereoCaptureOnlyApp:
             "record_disk_benchmark_seconds": 3.0,
             "record_disk_benchmark_margin": 1.25,
             "record_preflight_prompt_enabled": True,
+            "interval_writer_queue_max_items": 24,
+            "interval_strict_late_tolerance_seconds": 0.25,
+            "interval_preflight_enabled": True,
+            "interval_preflight_prompt_enabled": True,
+            "interval_disk_benchmark_enabled": True,
+            "interval_disk_benchmark_size_mb": 128.0,
+            "interval_disk_benchmark_seconds": 1.5,
+            "interval_disk_benchmark_margin": 1.5,
             "timestamp_reject_enabled": True,
             "max_camera_timestamp_delta": 0,
             "max_host_timestamp_delta": DEFAULT_HOST_TIMESTAMP_DELTA_NS,
@@ -7078,6 +7758,14 @@ class StereoCaptureOnlyApp:
             return "grid"
         if value in {"全部网格线", "十字+网格"}:
             return "full"
+        if value in {"95%安全线", "95%安全框"}:
+            return "safe95"
+        if value in {"90%安全线", "90%安全框"}:
+            return "safe90"
+        if value in {"85%安全线", "85%安全框"}:
+            return "safe85"
+        if value in {"80%安全线", "80%安全框"}:
+            return "safe80"
         return "off"
 
     def _record_roi_sizes_from_config(self, config_snapshot: dict) -> tuple[tuple[int, int], tuple[int, int]]:
@@ -7123,7 +7811,7 @@ class StereoCaptureOnlyApp:
         self._ensure_recording_config_defaults()
         try:
             fps = optional_positive_fps(self.record_fps_var.get())
-            max_seconds = max(float(self.record_max_seconds_var.get() or 0), 0.0)
+            max_seconds = optional_record_max_seconds_text(self.record_max_seconds_var.get())
             updates: dict[str, object] = {"record_fps": fps or 0.0, "record_max_seconds": max_seconds}
             updates.update(self._current_parameter_config())
         except ValueError as exc:
@@ -7151,7 +7839,7 @@ class StereoCaptureOnlyApp:
         measured_mbps = float((benchmark or {}).get("write_mbps") or 0.0)
         usable_mbps = measured_mbps / margin if measured_mbps > 0 else 0.0
         suggested_fps = usable_mbps * 1024 * 1024 / pair_bytes if pair_bytes > 0 and usable_mbps > 0 else 0.0
-        max_seconds = max(float(config_snapshot.get("record_max_seconds", 0.0) or 0.0), 0.0)
+        max_seconds = optional_record_max_seconds_text(config_snapshot.get("record_max_seconds", 0.0))
         one_minute_bytes = pair_bytes * fps * 60
         planned_seconds = max_seconds if max_seconds > 0 else 60.0
         planned_bytes = pair_bytes * fps * planned_seconds
@@ -7284,8 +7972,9 @@ class StereoCaptureOnlyApp:
         self._focus_realtime_analysis_enabled_setting = bool(self.focus_realtime_analysis_var.get())
         self._focus_peaking_enabled_setting = bool(self.focus_peaking_var.get())
         self._histogram_enabled_setting = bool(self.histogram_enabled_var.get())
-        if not self.preview_quality_analysis_var.get() or not self.focus_realtime_analysis_var.get():
+        if not self.preview_quality_analysis_var.get():
             self._set_last_quality_metrics(None)
+        if not self.focus_peaking_var.get():
             self._last_focus_overlay_left = None
             self._last_focus_overlay_right = None
             self._last_focus_overlay_key = None
@@ -7293,8 +7982,10 @@ class StereoCaptureOnlyApp:
         self._update_quality_optional_sections()
         save_config(self.config)
         if hasattr(self, "left_pane"):
-            needs_analysis = self._histogram_enabled_setting or (
-                self._focus_realtime_analysis_enabled_setting and self.preview_quality_analysis_var.get()
+            needs_analysis = (
+                bool(self.preview_quality_analysis_var.get())
+                or self._histogram_enabled_setting
+                or self._focus_peaking_enabled_setting
             )
             if needs_analysis and (
                 self._last_left_frame_obj is not None or self._last_right_frame_obj is not None
@@ -7348,8 +8039,11 @@ class StereoCaptureOnlyApp:
             "temperatures_c": dict(self._latest_temperatures),
             "timestamp": time.time(),
         }
-        focus_analysis_enabled = force_focus_analysis or bool(
-            getattr(self, "_focus_realtime_analysis_enabled_setting", True)
+        focus_analysis_enabled = (
+            force_focus_analysis
+            or bool(getattr(self, "_focus_realtime_analysis_enabled_setting", True))
+            or bool(getattr(self, "_focus_peaking_enabled_setting", False))
+            or config_bool(self.config, "preview_quality_analysis_enabled", True, True)
         )
         if focus_analysis_enabled:
             metrics["focus"] = focus_pair_metrics(left_image, right_image, roi, method)
@@ -7393,7 +8087,7 @@ class StereoCaptureOnlyApp:
         if not isinstance(metrics, dict):
             return
         now = time.perf_counter()
-        if isinstance(metrics.get("focus"), dict):
+        if self._should_cache_quality_metrics(metrics):
             self._set_last_quality_metrics(metrics)
         if now - self._last_analysis_time < 0.20:
             return
@@ -7406,6 +8100,21 @@ class StereoCaptureOnlyApp:
         self._update_exposure_display(left_exposure, right_exposure)
         self._update_dic_quality_display(metrics.get("dic_speckle"))
         self._update_capture_gate_preview()
+
+    def _should_cache_quality_metrics(self, metrics: dict[str, object]) -> bool:
+        if isinstance(metrics.get("focus"), dict):
+            return True
+        preview_quality_var = getattr(self, "preview_quality_analysis_var", None)
+        if preview_quality_var is not None:
+            try:
+                preview_quality_enabled = bool(preview_quality_var.get())
+            except Exception:
+                preview_quality_enabled = False
+        else:
+            preview_quality_enabled = config_bool(getattr(self, "config", {}), "preview_quality_analysis_enabled", False, False)
+        if not preview_quality_enabled:
+            return False
+        return any(isinstance(metrics.get(key), dict) for key in ("left_exposure", "right_exposure", "dic_speckle"))
 
     def _update_dic_quality_display(self, payload: object) -> None:
         if not hasattr(self, "dic_quality_var"):
@@ -8233,8 +8942,8 @@ class StereoCaptureOnlyApp:
         self.left_roi_height_var.set(str(snapshot.get("left_roi_height", snapshot.get("roi_height", CAPTURE_HEIGHT))))
         self.left_roi_offset_x_var.set(str(snapshot.get("left_roi_offset_x", snapshot.get("roi_offset_x", 0))))
         self.left_roi_offset_y_var.set(str(snapshot.get("left_roi_offset_y", snapshot.get("roi_offset_y", 0))))
-        self.right_roi_width_var.set(str(snapshot.get("left_roi_width", snapshot.get("roi_width", CAPTURE_WIDTH))))
-        self.right_roi_height_var.set(str(snapshot.get("left_roi_height", snapshot.get("roi_height", CAPTURE_HEIGHT))))
+        self.right_roi_width_var.set(str(snapshot.get("right_roi_width", snapshot.get("roi_width", CAPTURE_WIDTH))))
+        self.right_roi_height_var.set(str(snapshot.get("right_roi_height", snapshot.get("roi_height", CAPTURE_HEIGHT))))
         self.right_roi_offset_x_var.set(str(snapshot.get("right_roi_offset_x", snapshot.get("roi_offset_x", 0))))
         self.right_roi_offset_y_var.set(str(snapshot.get("right_roi_offset_y", snapshot.get("roi_offset_y", 0))))
         self.interval_seconds_var.set(optional_config_text(snapshot, "interval_capture_seconds", ""))
@@ -8307,12 +9016,44 @@ class StereoCaptureOnlyApp:
             camera_system.timestamp_reject_enabled = False
         return warnings
 
+    def _apply_dic_capture_config_to_camera(self, config_snapshot: dict[str, object]) -> list[str]:
+        config_snapshot = mono8_capture_config(safe_trigger_config(config_snapshot))
+        camera_system = self._require_camera_system()
+        warnings: list[str] = []
+
+        pixel_format = CAPTURE_PIXEL_FORMAT
+        apply_pixel_format = getattr(camera_system, "apply_pixel_format_settings", None)
+        if callable(apply_pixel_format):
+            warnings.extend(apply_pixel_format(pixel_format))
+        warnings.extend(camera_system.apply_trigger_settings(str(config_snapshot.get("trigger_source", "Continuous"))))
+        apply_chunk = getattr(camera_system, "apply_chunk_settings", None)
+        if callable(apply_chunk):
+            warnings.extend(
+                apply_chunk(
+                    config_bool(config_snapshot, "chunk_data_enabled", False, False),
+                    config_snapshot.get("chunk_selectors"),
+                )
+            )
+        if hasattr(camera_system, "config"):
+            camera_system.config.update(config_snapshot)
+        camera_system.trigger_source = str(config_snapshot.get("trigger_source", camera_system.trigger_source))
+        camera_system.require_hardware_trigger = False
+        camera_system.hardware_sync_enabled = False
+        camera_system.timestamp_reject_enabled = config_bool(config_snapshot, "timestamp_reject_enabled", True, False)
+        camera_system.max_camera_timestamp_delta = int(config_snapshot.get("max_camera_timestamp_delta", 0) or 0)
+        camera_system.max_host_timestamp_delta = int(
+            config_snapshot.get("max_host_timestamp_delta", DEFAULT_HOST_TIMESTAMP_DELTA_NS) or 0
+        )
+        if camera_system.max_camera_timestamp_delta <= 0 and camera_system.max_host_timestamp_delta <= 0:
+            camera_system.timestamp_reject_enabled = False
+        return warnings
+
     def _save_current_capture_settings(self) -> None:
         values = self._current_parameter_config()
         values["interval_capture_seconds"] = float(self.interval_seconds_var.get() or 0)
         values["interval_capture_count"] = optional_interval_limit_text(self.interval_limit_var.get())
         values["record_fps"] = optional_positive_fps(self.record_fps_var.get()) or 0.0
-        values["record_max_seconds"] = max(float(self.record_max_seconds_var.get() or 0), 0.0)
+        values["record_max_seconds"] = optional_record_max_seconds_text(self.record_max_seconds_var.get())
         try:
             dic_record_fps = self._dic_record_fps_from_entry()
         except ValueError:
@@ -8372,8 +9113,8 @@ class StereoCaptureOnlyApp:
         self.left_roi_height_var.set(str(self.config.get("left_roi_height", self.config.get("roi_height", CAPTURE_HEIGHT))))
         self.left_roi_offset_x_var.set(str(self.config.get("left_roi_offset_x", self.config.get("roi_offset_x", 0))))
         self.left_roi_offset_y_var.set(str(self.config.get("left_roi_offset_y", self.config.get("roi_offset_y", 0))))
-        self.right_roi_width_var.set(str(self.config.get("left_roi_width", self.config.get("roi_width", CAPTURE_WIDTH))))
-        self.right_roi_height_var.set(str(self.config.get("left_roi_height", self.config.get("roi_height", CAPTURE_HEIGHT))))
+        self.right_roi_width_var.set(str(self.config.get("right_roi_width", self.config.get("roi_width", CAPTURE_WIDTH))))
+        self.right_roi_height_var.set(str(self.config.get("right_roi_height", self.config.get("roi_height", CAPTURE_HEIGHT))))
         self.right_roi_offset_x_var.set(str(self.config.get("right_roi_offset_x", self.config.get("roi_offset_x", 0))))
         self.right_roi_offset_y_var.set(str(self.config.get("right_roi_offset_y", self.config.get("roi_offset_y", 0))))
         self.record_max_seconds_var.set(optional_config_text(self.config, "record_max_seconds", "0"))
@@ -8582,11 +9323,16 @@ class StereoCaptureOnlyApp:
                 if self._wait_reconnect_delay(delay):
                     return False
                 try:
+                    close_failure: list[Exception] = []
                     if self.camera_system is not None:
                         try:
                             self.camera_system.close()
-                        except Exception:
+                        except Exception as close_exc:
                             LOGGER.exception("重连前关闭旧相机失败")
+                            close_failure.append(close_exc)
+                    if close_failure:
+                        self._handle_reconnect_close_failure(mode, close_failure[0])
+                        return False
                     system_config = self._config_snapshot()
                     system_config["allow_single_camera"] = True
                     system = StereoCameraSystem(system_config)
@@ -8614,6 +9360,22 @@ class StereoCaptureOnlyApp:
             return False
         finally:
             self._reconnecting = False
+
+    def _handle_reconnect_close_failure(self, mode: str, exc: Exception) -> None:
+        message = (
+            "camera reconnect aborted because the previous camera system could not be closed; "
+            "wait for the timed-out SDK call to return or restart the process"
+        )
+        LOGGER.error("%s: %s", message, exc, exc_info=(type(exc), exc, exc.__traceback__))
+        self.ui_queue.put(("error", MvsError(f"{message}: {exc}")))
+        self.ui_queue.put(("status", message))
+        if mode == "record":
+            self._set_record_stop_reason("reconnect_close_failed")
+            self.recording = False
+        elif mode == "preview":
+            self.previewing = False
+        elif mode == "interval":
+            self.interval_capturing = False
 
     def _wait_reconnect_delay(self, delay: float) -> bool:
         deadline = time.perf_counter() + max(delay, 0.0)
@@ -8777,13 +9539,13 @@ class StereoCaptureOnlyApp:
         self,
         record_dir: Path,
         fps: float,
-        frames: list[dict],
         video_outputs: dict[str, list[str]],
         config_snapshot: dict,
     ) -> list[str]:
         if config_bool(config_snapshot, "auto_make_mp4", True, True) and config_bool(
             config_snapshot, "record_save_image_sequence", False, False
         ):
+            frames = self._record_sequence_frames_from_disk(record_dir, config_snapshot)
             total_units = self._mp4_progress_total_units(frames)
             progress_done = 0
 
@@ -8838,6 +9600,47 @@ class StereoCaptureOnlyApp:
             for path in video_outputs[side]:
                 names.append(Path(path).name)
         return names
+
+    def _record_sequence_frames_from_disk(self, record_dir: Path, config_snapshot: dict) -> list[dict]:
+        ext = image_extension(config_snapshot)
+        frames_by_key: dict[tuple[int, int], dict[str, object]] = {}
+        for side in ("left", "right"):
+            for segment_index, frame_dir in self._record_image_segment_dirs(record_dir, side):
+                prefix = f"{side}_"
+                for path in sorted(frame_dir.glob(f"{prefix}*.{ext}")):
+                    stem = path.stem
+                    if not stem.startswith(prefix):
+                        continue
+                    try:
+                        saved_index = int(stem[len(prefix) :])
+                    except ValueError:
+                        continue
+                    key = (segment_index, saved_index)
+                    frame = frames_by_key.setdefault(
+                        key,
+                        {
+                            "saved_index": saved_index,
+                            "segment_index": segment_index,
+                        },
+                    )
+                    frame[f"{side}_path"] = str(path)
+        return [frames_by_key[key] for key in sorted(frames_by_key)]
+
+    def _record_image_segment_dirs(self, record_dir: Path, side: str) -> list[tuple[int, Path]]:
+        dirs: list[tuple[int, Path]] = []
+        first_dir = record_dir / self._record_segment_dir(side, 1)
+        if first_dir.is_dir():
+            dirs.append((1, first_dir))
+        prefix = f"{side}_part"
+        if record_dir.exists():
+            for child in record_dir.iterdir():
+                if not child.is_dir() or not child.name.startswith(prefix):
+                    continue
+                suffix = child.name[len(prefix) :]
+                if not suffix.isdigit():
+                    continue
+                dirs.append((int(suffix), child))
+        return sorted({index: path for index, path in dirs}.items())
 
     def _mp4_progress_total_units(self, frames: list[dict]) -> int:
         total = 0
@@ -9217,17 +10020,18 @@ class StereoCaptureOnlyApp:
         record_dir: Path,
         target_fps: float,
         output_fps: float,
-        frames: list[dict],
+        frame_metadata: dict[str, object],
     ) -> dict[str, object]:
         elapsed = self._record_elapsed_seconds()
         dir_bytes = self._directory_size_bytes(record_dir)
         disk_used_delta = max(self._disk_used_bytes(record_dir) - self._record_disk_usage_start, 0)
         stats = self._record_stats_snapshot()
         record_count = int(stats["record_count"])
+        frame_count = int(frame_metadata.get("count", 0) or 0)
         summary = {
             "total_frame_count": record_count,
             "saved_frame_count": stats["saved_frame_count"],
-            "valid_frame_count": len(frames),
+            "valid_frame_count": frame_count,
             "skipped_frame_count": stats["skipped_frame_count"],
             "skipped_frames": stats["skipped_frames"],
             "timeout_count": stats["timeout_count"],
@@ -9244,7 +10048,8 @@ class StereoCaptureOnlyApp:
             "stop_reason": stats["stop_reason"],
             "skip_reasons": stats["skip_reasons"],
             "per_second": stats.get("per_second", []),
-            "average_write_seconds": self._average_record_write_seconds(frames),
+            "average_write_seconds": float(frame_metadata.get("average_write_seconds", 0.0) or 0.0),
+            "frame_metadata": dict(frame_metadata),
             "disk_write_benchmark": self._record_disk_benchmark,
             "preflight": dict(self._record_preflight_plan),
         }
@@ -9252,18 +10057,7 @@ class StereoCaptureOnlyApp:
             self._record_summary = summary
         return summary
 
-    def _average_record_write_seconds(self, frames: list[dict]) -> float:
-        values = []
-        for frame in frames:
-            try:
-                value = float(frame.get("write_seconds") or 0.0)
-            except (TypeError, ValueError):
-                continue
-            if value > 0:
-                values.append(value)
-        return float(np.mean(values)) if values else 0.0
-
-    def _record_report_second_rows(self, summary: dict[str, object], frames: list[dict]) -> list[dict[str, object]]:
+    def _record_report_second_rows(self, summary: dict[str, object]) -> list[dict[str, object]]:
         rows_by_second: dict[int, dict[str, object]] = {}
         for raw in summary.get("per_second", []) if isinstance(summary.get("per_second"), list) else []:
             if not isinstance(raw, dict):
@@ -9288,41 +10082,15 @@ class StereoCaptureOnlyApp:
                 "avg_write_ms": (write_total / write_samples * 1000.0) if write_samples > 0 else 0.0,
                 "drop_reasons": "; ".join(f"{key}: {value}" for key, value in sorted(drop_reasons.items())),
             }
-        for frame in frames:
-            try:
-                trigger = float(frame.get("trigger_time") or 0.0)
-            except (TypeError, ValueError):
-                trigger = 0.0
-            second = int(max(trigger - float(frames[0].get("trigger_time") or trigger), 0.0)) if frames else 0
-            rows_by_second.setdefault(
-                second,
-                {
-                    "second": second,
-                    "captured_frames": 0,
-                    "saved_frames": 0,
-                    "skipped_frames": 0,
-                    "timeout_count": 0,
-                    "error_count": 0,
-                    "frame_number_gaps": 0,
-                    "first_frame_index": None,
-                    "last_frame_index": None,
-                    "first_saved_index": None,
-                    "last_saved_index": None,
-                    "saved_mb": 0.0,
-                    "avg_write_ms": 0.0,
-                    "drop_reasons": "",
-                },
-            )
         return [rows_by_second[key] for key in sorted(rows_by_second)]
 
     def _write_record_reports(
         self,
         record_dir: Path,
         summary: dict[str, object],
-        frames: list[dict],
         config_snapshot: dict,
     ) -> dict[str, str]:
-        second_rows = self._record_report_second_rows(summary, frames)
+        second_rows = self._record_report_second_rows(summary)
         skipped_frames = summary.get("skipped_frames")
         if not isinstance(skipped_frames, list):
             skipped_frames = self._record_stats_snapshot().get("skipped_frames", [])
@@ -9350,38 +10118,38 @@ class StereoCaptureOnlyApp:
             "metric",
             "value",
         ]
-        with csv_path.open("w", newline="", encoding="utf-8-sig") as fh:
-            writer = csv.DictWriter(fh, fieldnames=csv_fields)
-            writer.writeheader()
-            summary_rows = {
-                "total_frame_count": summary.get("total_frame_count", 0),
-                "saved_frame_count": summary.get("saved_frame_count", 0),
-                "skipped_frame_count": summary.get("skipped_frame_count", 0),
-                "timeout_count": summary.get("timeout_count", 0),
-                "frame_number_gap_count": summary.get("frame_number_gap_count", 0),
-                "average_capture_fps": f"{float(summary.get('average_capture_fps') or 0.0):.4f}",
-                "effective_video_fps": f"{float(summary.get('effective_video_fps') or 0.0):.4f}",
-                "average_write_ms": f"{float(summary.get('average_write_seconds') or 0.0) * 1000.0:.4f}",
-                "directory_size_bytes": summary.get("directory_size_bytes", 0),
-                "stop_reason": summary.get("stop_reason", ""),
-            }
-            for metric_name, value in summary_rows.items():
-                writer.writerow({"section": "summary", "metric": metric_name, "value": value})
-            for row in second_rows:
-                writer.writerow({"section": "per_second", **row})
-            for skipped in skipped_frames if isinstance(skipped_frames, list) else []:
-                if not isinstance(skipped, dict):
-                    continue
-                writer.writerow(
-                    {
-                        "section": "skipped_frame",
-                        "frame_index": skipped.get("index"),
-                        "reason": skipped.get("reason"),
-                        "time": self._format_wall_time(skipped.get("time")),
-                    }
-                )
+        rows: list[dict[str, object]] = []
+        summary_rows = {
+            "total_frame_count": summary.get("total_frame_count", 0),
+            "saved_frame_count": summary.get("saved_frame_count", 0),
+            "skipped_frame_count": summary.get("skipped_frame_count", 0),
+            "timeout_count": summary.get("timeout_count", 0),
+            "frame_number_gap_count": summary.get("frame_number_gap_count", 0),
+            "average_capture_fps": f"{float(summary.get('average_capture_fps') or 0.0):.4f}",
+            "effective_video_fps": f"{float(summary.get('effective_video_fps') or 0.0):.4f}",
+            "average_write_ms": f"{float(summary.get('average_write_seconds') or 0.0) * 1000.0:.4f}",
+            "directory_size_bytes": summary.get("directory_size_bytes", 0),
+            "stop_reason": summary.get("stop_reason", ""),
+        }
+        for metric_name, value in summary_rows.items():
+            rows.append({"section": "summary", "metric": metric_name, "value": value})
+        for row in second_rows:
+            rows.append({"section": "per_second", **row})
+        for skipped in skipped_frames if isinstance(skipped_frames, list) else []:
+            if not isinstance(skipped, dict):
+                continue
+            rows.append(
+                {
+                    "section": "skipped_frame",
+                    "frame_index": skipped.get("index"),
+                    "reason": skipped.get("reason"),
+                    "time": self._format_wall_time(skipped.get("time")),
+                }
+            )
+        atomic_write_csv(csv_path, csv_fields, rows)
 
-        html_path.write_text(
+        atomic_write_text(
+            html_path,
             self._record_report_html(record_dir, summary, second_rows, skipped_frames, config_snapshot),
             encoding="utf-8",
         )
@@ -9631,7 +10399,26 @@ Output {esc('MP4 + image sequence' if config_bool(config_snapshot, 'record_save_
         if width > 0 and height > 0 and raw_len >= width * height and ("mono" in pixel_name or "bayer" in pixel_name):
             payload = contiguous_frame_buffer(raw_data, width * height)
             return np.frombuffer(payload, dtype=np.uint8, count=width * height).reshape((height, width)).copy()
-        return np.frombuffer(contiguous_frame_buffer(raw_data), dtype=np.uint8).copy()
+        return np.frombuffer(contiguous_frame_buffer(raw_data, raw_len), dtype=np.uint8).copy()
+
+    def _raw_payload_bytes(self, frame: CameraFrame) -> bytes:
+        raw_data = getattr(frame, "raw_data", None)
+        if raw_data is None:
+            raise MvsError("raw-only frame has no raw payload to save")
+        raw_len = int(getattr(frame, "raw_frame_len", 0) or len(raw_data))
+        return bytes(contiguous_frame_buffer(raw_data, raw_len))
+
+    def _raw_viewable_sidecar_allowed(self, frame: CameraFrame) -> bool:
+        width = int(getattr(frame, "width", 0) or 0)
+        height = int(getattr(frame, "height", 0) or 0)
+        bit_depth = int(getattr(frame, "raw_bit_depth", 8) or 8)
+        pixel_name = str(getattr(frame, "pixel_type_name", "") or "").lower()
+        raw_len = int(getattr(frame, "raw_frame_len", 0) or 0)
+        if bit_depth > 8 and ("packed" in pixel_name or "bayer" in pixel_name):
+            return False
+        if bit_depth > 8 and width > 0 and height > 0 and raw_len < width * height * 2:
+            return False
+        return True
 
     def _frame_to_correction_array(self, frame: CameraFrame | None) -> np.ndarray | None:
         if frame is None:
@@ -9705,13 +10492,55 @@ Output {esc('MP4 + image sequence' if config_bool(config_snapshot, 'record_save_
         width = int(getattr(frame, "width", 0) or 0)
         height = int(getattr(frame, "height", 0) or 0)
         bit_depth = int(getattr(frame, "raw_bit_depth", 8) or 8)
+        pixel_name = str(getattr(frame, "pixel_type_name", "") or "").lower()
+        raw_len = int(getattr(frame, "raw_frame_len", 0) or 0)
         if bit_depth <= 8:
             return
-        if width <= 0 or height <= 0 or array.shape != (height, width) or array.dtype != np.uint16:
+        if (
+            width <= 0
+            or height <= 0
+            or array.shape != (height, width)
+            or array.dtype != np.uint16
+            or raw_len < width * height * 2
+            or "packed" in pixel_name
+            or "bayer" in pixel_name
+        ):
             raise MvsError(
                 f"{fmt} requires unpacked high-bit-depth mono data. "
                 "Choose raw_frame_format='npy' to keep the original bytes, or set the camera PixelFormat to unpacked Mono16."
             )
+
+    def _save_raw_npy_frame(self, frame: CameraFrame, raw_path: Path) -> Path:
+        payload = self._raw_payload_bytes(frame)
+        try:
+            np.save(raw_path, np.frombuffer(payload, dtype=np.uint8).copy())
+            metadata = self._frame_meta(frame)
+            metadata.update(
+                {
+                    "raw_storage": "uint8_payload_bytes",
+                    "raw_payload_file": raw_path.name,
+                    "raw_frame_len": len(payload),
+                }
+            )
+            meta_path = raw_path.with_suffix(f"{raw_path.suffix}.json")
+            tmp_meta_path = meta_path.with_name(f"{meta_path.name}.tmp")
+            with tmp_meta_path.open("w", encoding="utf-8") as fh:
+                json.dump(metadata, fh, ensure_ascii=False, indent=2, default=json_metadata_default)
+                fh.write("\n")
+                fh.flush()
+                os.fsync(fh.fileno())
+            tmp_meta_path.replace(meta_path)
+        except Exception:
+            try:
+                raw_path.unlink(missing_ok=True)
+            except OSError:
+                LOGGER.debug("Could not clean up raw npy payload %s after failure.", raw_path, exc_info=True)
+            try:
+                raw_path.with_suffix(f"{raw_path.suffix}.json").unlink(missing_ok=True)
+            except OSError:
+                LOGGER.debug("Could not clean up raw npy metadata for %s after failure.", raw_path, exc_info=True)
+            raise
+        return raw_path
 
     def _save_raw_frame(self, frame: CameraFrame, path: Path, config_snapshot: dict | None = None) -> Path:
         config_snapshot = config_snapshot or self._config_snapshot()
@@ -9722,10 +10551,19 @@ Output {esc('MP4 + image sequence' if config_bool(config_snapshot, 'record_save_
         fmt = raw_frame_format(config_snapshot)
         raw_path = path.with_suffix(f".{raw_frame_extension(config_snapshot)}")
         try:
-            array = self._raw_frame_array(frame)
             if fmt == "npy":
-                np.save(raw_path, array)
-            elif fmt == "png16":
+                raw_path = self._save_raw_npy_frame(frame, raw_path)
+                if self._raw_viewable_sidecar_allowed(frame):
+                    try:
+                        array = self._raw_frame_array(frame)
+                        self._save_viewable_sidecar(array, raw_path, config_snapshot)
+                    except Exception as exc:
+                        LOGGER.debug("viewable sidecar from raw npy payload failed: %s", exc, exc_info=True)
+                else:
+                    LOGGER.debug("viewable sidecar skipped for packed or Bayer high-bit-depth raw frame: %s", raw_path)
+                return raw_path
+            array = self._raw_frame_array(frame)
+            if fmt == "png16":
                 self._validate_standard_raw_image_array(frame, array, fmt)
                 if array.dtype != np.uint16:
                     array = array.astype(np.uint16, copy=False)
@@ -9850,6 +10688,7 @@ Output {esc('MP4 + image sequence' if config_bool(config_snapshot, 'record_save_
             environment=environment,
             algorithm=self._checksum_algorithm(config_snapshot),
             scan_roots=scan_roots,
+            checksum_files=config_bool(config_snapshot, "record_manifest_checksum_enabled", False, False),
         )
 
     def _capture_settings_snapshot(self, config_snapshot: dict | None = None) -> dict[str, object]:
@@ -10002,6 +10841,7 @@ Output {esc('MP4 + image sequence' if config_bool(config_snapshot, 'record_save_
         join_deadline = time.perf_counter() + join_budget
         self._join_thread_on_close(self.preview_thread, join_timeout, join_deadline)
         self._join_thread_on_close(self.interval_thread, join_timeout, join_deadline)
+        self._join_thread_on_close(self._interval_writer_thread, join_timeout, join_deadline)
         self._join_thread_on_close(self.record_thread, join_timeout, join_deadline)
         for thread in self._background_threads_snapshot():
             self._join_thread_on_close(thread, join_timeout, join_deadline)
