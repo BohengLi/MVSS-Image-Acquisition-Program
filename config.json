@@ -50,8 +50,8 @@
   ],
   "preview_fps": 5.0,
   "record_fps": 1.0,
-  "interval_capture_seconds": 0.5,
-  "interval_capture_count": null,
+  "interval_capture_seconds": 3.0,
+  "interval_capture_count": 20,
   "record_jpeg_quality": 100,
   "auto_make_mp4": false,
   "video_codec": "mp4v",
@@ -318,8 +318,8 @@
     }
   },
   "focus_roi": {
-    "x_frac": 0.32748538011695905,
-    "y_frac": 0.13815789473684212,
+    "x_frac": 0.7911184210526315,
+    "y_frac": 0.0,
     "w_frac": 0.03654970760233918,
     "h_frac": 0.05482456140350877
   },
@@ -377,8 +377,8 @@
   "project": {
     "enabled": true,
     "projects_subdir": "projects",
-    "current_project_id": "20260706_095554_317",
-    "current_project_name": "Project 20260706_095554_317"
+    "current_project_id": "20260707_155204_260",
+    "current_project_name": "Project 20260707_155204_260"
   },
   "hdr_bracketing": {
     "enabled": true,
@@ -531,5 +531,13 @@
   "gamma": null,
   "viewable_sidecar_enabled": true,
   "viewable_sidecar_format": "png",
-  "focus_realtime_analysis_enabled": true
+  "focus_realtime_analysis_enabled": true,
+  "interval_writer_queue_max_items": 24,
+  "interval_strict_late_tolerance_seconds": 0.25,
+  "interval_preflight_enabled": true,
+  "interval_preflight_prompt_enabled": true,
+  "interval_disk_benchmark_enabled": true,
+  "interval_disk_benchmark_size_mb": 128.0,
+  "interval_disk_benchmark_seconds": 1.5,
+  "interval_disk_benchmark_margin": 1.5
 }
