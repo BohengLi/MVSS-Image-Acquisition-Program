@@ -193,6 +193,30 @@ class _FakeCalibration:
 
 
 class ReliabilityFixTests(unittest.TestCase):
+    def test_previous_capture_overlap_uses_previous_right_thirty_percent(self) -> None:
+        current = Image.new("RGB", (10, 2), (0, 0, 200))
+        previous = Image.new("RGB", (10, 2), (200, 0, 0))
+
+        result = stereo_capture_only.make_previous_capture_overlap(current, previous, fraction=0.30, alpha=0.50)
+
+        self.assertEqual(result.getpixel((0, 0)), (100, 0, 100))
+        self.assertEqual(result.getpixel((2, 0)), (100, 0, 100))
+        self.assertEqual(result.getpixel((3, 0)), (255, 209, 102))
+        self.assertEqual(result.getpixel((6, 0)), (0, 0, 200))
+
+    def test_overlap_reference_is_queued_as_an_image_copy(self) -> None:
+        app = StereoCaptureOnlyApp.__new__(StereoCaptureOnlyApp)
+        app.ui_queue = Queue()
+        source = Image.new("L", (3, 2), 17)
+        frame = Frame(source, 1, 3, 2, 0, 0)
+
+        app._queue_overlap_reference(frame)
+        kind, queued = app.ui_queue.get_nowait()
+        source.putpixel((0, 0), 99)
+
+        self.assertEqual(kind, "overlap_reference")
+        self.assertEqual(queued.getpixel((0, 0)), 17)
+
     def test_pyinstaller_spec_skips_hikrobot_hidden_import_when_package_missing(self) -> None:
         spec_path = Path(__file__).resolve().parents[1] / "MVSS_Capture.spec"
         calls: dict[str, object] = {}

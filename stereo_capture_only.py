@@ -138,6 +138,9 @@ APP_TITLE_FONT_SIZE = 15
 INFO_FONT_SIZE = 9
 OVERLAY_FONT_SIZE = 10
 COMPACT_UI_FONT_SIZE = max(BASE_FONT_SIZE - 1, 8)
+OVERLAP_PREVIEW_MODE = "30%重叠"
+OVERLAP_GUIDE_FRACTION = 0.30
+OVERLAP_GUIDE_ALPHA = 0.55
 STATUS_BAR_HEIGHT = 34
 STATUS_VERSION_WIDTH = max(len(APP_VERSION) + 2, 16)
 WINDOW_ASPECT_RATIO = 16 / 10
@@ -998,6 +1001,30 @@ def format_duration(seconds: float) -> str:
 def image_estimated_bytes(image: Image.Image) -> int:
     channels = 1 if image.mode in {"1", "L", "P"} else len(image.getbands())
     return image.width * image.height * max(channels, 1)
+
+
+def make_previous_capture_overlap(
+    current: Image.Image,
+    previous: Image.Image,
+    fraction: float = OVERLAP_GUIDE_FRACTION,
+    alpha: float = OVERLAP_GUIDE_ALPHA,
+) -> Image.Image:
+    """Overlay the previous image's right edge on the current image's left edge."""
+    base = current.convert("RGB")
+    if base.width <= 0 or base.height <= 0:
+        return base
+    reference = previous.convert("RGB")
+    if reference.size != base.size:
+        reference = reference.resize(base.size, Image.Resampling.BILINEAR)
+    overlap_width = max(1, min(base.width, int(round(base.width * min(max(float(fraction), 0.0), 1.0)))))
+    blend_alpha = min(max(float(alpha), 0.0), 1.0)
+    current_strip = base.crop((0, 0, overlap_width, base.height))
+    previous_strip = reference.crop((reference.width - overlap_width, 0, reference.width, reference.height))
+    base.paste(Image.blend(current_strip, previous_strip, blend_alpha), (0, 0))
+    marker_width = min(3, base.width)
+    marker_x = min(overlap_width, base.width - marker_width)
+    base.paste(Image.new("RGB", (marker_width, base.height), WARNING_COLOR), (marker_x, 0))
+    return base
 
 
 def frame_raw_estimated_bytes(frame: CameraFrame | None) -> int:
@@ -2180,6 +2207,7 @@ class StereoCaptureOnlyApp:
         self._stereo_blink_phase = 0
         self._last_rectified_overlay_key: tuple[int | None, int | None] | None = None
         self._last_rectified_overlay_image: Image.Image | None = None
+        self._previous_capture_left_image: Image.Image | None = None
         self._field_correction_lock = threading.Lock()
         self._dark_frame_refs: dict[str, np.ndarray] = {}
         self._flat_field_refs: dict[str, np.ndarray] = {}
@@ -3330,6 +3358,7 @@ class StereoCaptureOnlyApp:
             "交替闪烁",
             "校正叠加",
             "位移叠加",
+            OVERLAP_PREVIEW_MODE,
             command=self._on_quality_menu_changed,
         )
         preview_menu.configure(style="Compact.TMenubutton")
@@ -3591,6 +3620,8 @@ class StereoCaptureOnlyApp:
 
     def _on_quality_menu_changed(self, _value=None) -> None:
         self._sync_quality_toggles()
+        if self.stereo_preview_mode_var.get() == OVERLAP_PREVIEW_MODE and self._previous_capture_left_image is None:
+            self.status_var.set("30%重叠模式已开启：完成首张拍照后，将显示上一张左图的右侧30%。")
         if self._last_left_frame_obj is not None or self._last_right_frame_obj is not None:
             self._display_frames(self._last_left_frame_obj, self._last_right_frame_obj)
 
@@ -4188,6 +4219,16 @@ class StereoCaptureOnlyApp:
                     self.right_pane.set_frame(right)
                 else:
                     self.right_pane.set_no_signal()
+        elif mode == OVERLAP_PREVIEW_MODE and left is not None:
+            if self._previous_capture_left_image is not None:
+                image = make_previous_capture_overlap(left.image, self._previous_capture_left_image)
+                self.left_pane.set_display_image(image, f"30% overlap guide {image.width}x{image.height}")
+            else:
+                self.left_pane.set_frame(left)
+            if right is not None:
+                self.right_pane.set_frame(right)
+            else:
+                self.right_pane.set_no_signal()
         else:
             if left is not None:
                 self.left_pane.set_frame(left)
@@ -4490,6 +4531,7 @@ class StereoCaptureOnlyApp:
                         mode="recording_photo",
                         quality_report=quality_report,
                     )
+                    self._queue_overlap_reference(left_copy)
                     self.ui_queue.put(("shutter_flash", None))
                     self.ui_queue.put(("photo_done", ("photo", photo_dir)))
                 except Exception as exc:
@@ -4537,6 +4579,7 @@ class StereoCaptureOnlyApp:
                 fresh_report = self._quality_report_from_metrics(fresh_metrics)
                 self.ui_queue.put(("quality_report", fresh_report))
                 photo_dir = self._save_photo_pair(left, right, trigger_time, mode="photo", quality_report=fresh_report)
+                self._queue_overlap_reference(left)
                 if self.previewing:
                     self.ui_queue.put(("frames", (left, right)))
                 self.ui_queue.put(("shutter_flash", None))
@@ -4822,6 +4865,7 @@ class StereoCaptureOnlyApp:
                         float(item.get("capture_late_seconds", 0.0) or 0.0),
                     )
                     records.append(record)
+                    self._queue_overlap_reference(corrected_left)
                     with self._interval_writer_lock:
                         self._interval_writer_saved_count += 1
                     self.ui_queue.put(("interval_lamp_green", None))
@@ -5063,6 +5107,7 @@ class StereoCaptureOnlyApp:
                 metrics = self._quality_metrics_for_pair(left, right)
                 report = self._quality_report_from_metrics(metrics)
                 photo_dir = self._save_photo_pair(left, right, trigger_time, mode="interval_photo", quality_report=report)
+                self._queue_overlap_reference(left)
                 self.ui_queue.put(("interval_lamp_green", None))
                 if self.previewing:
                     self._preview_frame_counter += 1
@@ -7204,6 +7249,8 @@ class StereoCaptureOnlyApp:
                     self.status_var.set(str(payload))
                 elif kind == "quality_report":
                     self._apply_quality_report(payload)
+                elif kind == "overlap_reference":
+                    self._previous_capture_left_image = payload if isinstance(payload, Image.Image) else None
                 elif kind == "calibration_board":
                     self._apply_calibration_board(payload)
                 elif kind == "photo_quality_prefetched":
@@ -8549,6 +8596,7 @@ class StereoCaptureOnlyApp:
         def worker() -> None:
             try:
                 photo_dir = self._save_photo_pair(left, right, trigger_time, mode="photo", quality_report=quality_report)
+                self._queue_overlap_reference(left)
                 if self.previewing:
                     self.ui_queue.put(("frames", (left, right)))
                 self.ui_queue.put(("shutter_flash", None))
@@ -8559,6 +8607,11 @@ class StereoCaptureOnlyApp:
                 self.ui_queue.put(("capture_idle", None))
 
         self._start_background_thread(worker, "save-photo-prefetched")
+
+    def _queue_overlap_reference(self, left: CameraFrame | None) -> None:
+        image = getattr(left, "image", None) if left is not None else None
+        if isinstance(image, Image.Image):
+            self.ui_queue.put(("overlap_reference", image.copy()))
 
     def set_focus_reference(self) -> None:
         metrics = self._get_last_quality_metrics()
