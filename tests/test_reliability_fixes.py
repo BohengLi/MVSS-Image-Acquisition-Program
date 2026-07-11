@@ -193,6 +193,46 @@ class _FakeCalibration:
 
 
 class ReliabilityFixTests(unittest.TestCase):
+    def test_background_palette_switches_between_white_and_black(self) -> None:
+        try:
+            stereo_capture_only.apply_background_palette(True)
+            self.assertEqual(stereo_capture_only.BG_COLOR, "#ffffff")
+            self.assertEqual(stereo_capture_only.CANVAS_COLOR, "#ffffff")
+            self.assertEqual(stereo_capture_only.TEXT_COLOR, "#18212b")
+
+            stereo_capture_only.apply_background_palette(False)
+            self.assertEqual(stereo_capture_only.BG_COLOR, "#0e1116")
+            self.assertEqual(stereo_capture_only.CANVAS_COLOR, "#05070a")
+            self.assertEqual(stereo_capture_only.TEXT_COLOR, "#f2f6f9")
+        finally:
+            stereo_capture_only.apply_background_palette(False)
+
+    def test_background_button_toggles_and_persists_theme(self) -> None:
+        self.addCleanup(stereo_capture_only.apply_background_palette, False)
+        app = StereoCaptureOnlyApp.__new__(StereoCaptureOnlyApp)
+        app._light_background = False
+        app.config = {}
+        app.background_button_text_var = _Var()
+        app.status_var = _Var()
+        root_updates = []
+        app.root = type(
+            "Root",
+            (),
+            {"configure": lambda _self, **kwargs: root_updates.append(kwargs)},
+        )()
+        app._configure_style = lambda: None
+        app._refresh_direct_theme_widgets = lambda: None
+
+        with patch.object(stereo_capture_only, "save_config") as save:
+            app.toggle_background_theme()
+
+        self.assertTrue(app._light_background)
+        self.assertEqual(app.config["ui_background"], "white")
+        self.assertEqual(app.background_button_text_var.get(), "黑色背景")
+        self.assertIn("白色背景", app.status_var.get())
+        self.assertEqual(root_updates[-1]["bg"], "#ffffff")
+        save.assert_called_once_with(app.config)
+
     def test_previous_capture_overlap_uses_previous_right_thirty_percent(self) -> None:
         current = Image.new("RGB", (10, 2), (0, 0, 200))
         previous = Image.new("RGB", (10, 2), (200, 0, 0))

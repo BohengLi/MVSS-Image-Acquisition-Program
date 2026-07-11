@@ -130,6 +130,42 @@ DANGER_COLOR = "#ff6b6b"
 TEXT_COLOR = "#f2f6f9"
 MUTED_TEXT_COLOR = "#aab6c0"
 SUBTLE_TEXT_COLOR = "#71808d"
+DARK_BACKGROUND_PALETTE = {
+    "bg": "#0e1116",
+    "surface": "#141a21",
+    "panel": "#1b232c",
+    "panel_elevated": "#222c35",
+    "canvas": "#05070a",
+    "chart": "#0c1117",
+    "border": "#34414c",
+    "border_strong": "#4d5e6b",
+    "accent": "#12a8e8",
+    "accent_active": "#35c0ff",
+    "success": "#31c784",
+    "warning": "#ffd166",
+    "danger": "#ff6b6b",
+    "text": "#f2f6f9",
+    "muted_text": "#aab6c0",
+    "subtle_text": "#71808d",
+}
+LIGHT_BACKGROUND_PALETTE = {
+    "bg": "#ffffff",
+    "surface": "#f3f6f8",
+    "panel": "#ffffff",
+    "panel_elevated": "#e8eef2",
+    "canvas": "#ffffff",
+    "chart": "#f7f9fb",
+    "border": "#b8c4cc",
+    "border_strong": "#7d8d98",
+    "accent": "#0077b6",
+    "accent_active": "#005f8f",
+    "success": "#16865b",
+    "warning": "#9a6500",
+    "danger": "#bd3030",
+    "text": "#18212b",
+    "muted_text": "#4b5b68",
+    "subtle_text": "#6d7b87",
+}
 FONT_FAMILY = "Microsoft YaHei UI"
 MONO_FONT_FAMILY = "Cascadia Mono"
 BASE_FONT_SIZE = 10
@@ -157,6 +193,29 @@ PARAM_SIDEBAR_WIDTH = 400
 MAGNIFIER_CANVAS_WIDTH = 320
 MAGNIFIER_CANVAS_HEIGHT = 72
 TASKBAR_RESERVED_HEIGHT = 96
+
+
+def apply_background_palette(light: bool) -> None:
+    palette = LIGHT_BACKGROUND_PALETTE if light else DARK_BACKGROUND_PALETTE
+    global BG_COLOR, SURFACE_COLOR, PANEL_COLOR, PANEL_ELEVATED_COLOR, CANVAS_COLOR, CHART_COLOR
+    global BORDER_COLOR, BORDER_STRONG_COLOR, ACCENT_COLOR, ACCENT_ACTIVE_COLOR
+    global SUCCESS_COLOR, WARNING_COLOR, DANGER_COLOR, TEXT_COLOR, MUTED_TEXT_COLOR, SUBTLE_TEXT_COLOR
+    BG_COLOR = palette["bg"]
+    SURFACE_COLOR = palette["surface"]
+    PANEL_COLOR = palette["panel"]
+    PANEL_ELEVATED_COLOR = palette["panel_elevated"]
+    CANVAS_COLOR = palette["canvas"]
+    CHART_COLOR = palette["chart"]
+    BORDER_COLOR = palette["border"]
+    BORDER_STRONG_COLOR = palette["border_strong"]
+    ACCENT_COLOR = palette["accent"]
+    ACCENT_ACTIVE_COLOR = palette["accent_active"]
+    SUCCESS_COLOR = palette["success"]
+    WARNING_COLOR = palette["warning"]
+    DANGER_COLOR = palette["danger"]
+    TEXT_COLOR = palette["text"]
+    MUTED_TEXT_COLOR = palette["muted_text"]
+    SUBTLE_TEXT_COLOR = palette["subtle_text"]
 QUALITY_MONITOR_COMPACT_HEIGHT = 192
 QUALITY_MONITOR_HIGH_RES_COMPACT_HEIGHT = 232
 HISTOGRAM_CANVAS_HEIGHT = 92
@@ -1299,10 +1358,10 @@ class ZoomImagePane(Frame):
         self._pan_start: tuple[int, int] | None = None
         self._pan_origin: tuple[float, float] = (0.0, 0.0)
 
-        container = Frame(self, bg=CANVAS_COLOR, bd=0)
-        container.pack(fill=BOTH, expand=True, padx=1, pady=1)
+        self._container = Frame(self, bg=CANVAS_COLOR, bd=0)
+        self._container.pack(fill=BOTH, expand=True, padx=1, pady=1)
 
-        header = ttk.Frame(container, style="PaneHeader.TFrame")
+        header = ttk.Frame(self._container, style="PaneHeader.TFrame")
         header.pack(side=TOP, fill=X)
         ttk.Label(header, textvariable=self.title_var, style="PaneTitle.TLabel", padding=(12, 5), anchor="w").pack(
             side=LEFT, fill=X, expand=True
@@ -1314,7 +1373,7 @@ class ZoomImagePane(Frame):
             side=RIGHT
         )
 
-        footer = ttk.Frame(container, style="PaneHeader.TFrame")
+        footer = ttk.Frame(self._container, style="PaneHeader.TFrame")
         footer.pack(side=BOTTOM, fill=X)
         ttk.Label(footer, textvariable=self.info_var, style="PaneInfo.TLabel", padding=(10, 4), anchor="w").pack(
             side=LEFT, fill=X, expand=True
@@ -1327,7 +1386,7 @@ class ZoomImagePane(Frame):
             anchor="e",
         ).pack(side=RIGHT)
 
-        self.canvas = Canvas(container, bg=CANVAS_COLOR, highlightthickness=0, bd=0)
+        self.canvas = Canvas(self._container, bg=CANVAS_COLOR, highlightthickness=0, bd=0)
         self.canvas.pack(side=TOP, fill=BOTH, expand=True)
         self._canvas_image_id: int | None = None
         self._canvas_text_id = self.canvas.create_text(
@@ -1348,6 +1407,12 @@ class ZoomImagePane(Frame):
         self.canvas.bind("<ButtonRelease-1>", self._on_mouse_release)
         self.canvas.bind("<Double-Button-1>", self._on_double_click)
         self._update_cursor()
+
+    def apply_theme(self) -> None:
+        self.configure(bg=BORDER_COLOR)
+        self._container.configure(bg=CANVAS_COLOR)
+        self.canvas.configure(bg=CANVAS_COLOR)
+        self.canvas.itemconfigure(self._canvas_text_id, fill=SUBTLE_TEXT_COLOR)
 
     def _on_configure(self, _event=None) -> None:
         self._render()
@@ -1905,6 +1970,10 @@ class HistogramCanvas(ttk.Frame):
         self.canvas.pack(side=TOP, fill=BOTH, expand=True)
         self.canvas.bind("<Configure>", self._on_configure)
 
+    def apply_theme(self) -> None:
+        self.canvas.configure(bg=CHART_COLOR, highlightbackground=BORDER_COLOR)
+        self.draw()
+
     def _on_configure(self, _event=None) -> None:
         self.draw()
 
@@ -2076,6 +2145,9 @@ class StereoCaptureOnlyApp:
         self.root.bind("<Escape>", self._on_escape_key)
 
         self.config = load_config()
+        self._light_background = str(self.config.get("ui_background", "black")).strip().lower() == "white"
+        apply_background_palette(self._light_background)
+        self.root.configure(bg=BG_COLOR)
         self.config.update(
             mono8_capture_config(
                 safe_trigger_config(self.config.snapshot() if isinstance(self.config, ThreadSafeConfig) else dict(self.config))
@@ -2355,6 +2427,7 @@ class StereoCaptureOnlyApp:
         self.stereo_preview_mode_var = StringVar(value="正常预览")
         self.guide_mode_var = StringVar(value="关闭")
         self.mp4_progress_var = StringVar(value="MP4 --")
+        self.background_button_text_var = StringVar(value="黑色背景" if self._light_background else "白色背景")
         self._focus_peaking_enabled_setting = bool(self.focus_peaking_var.get())
         self._focus_realtime_analysis_enabled_setting = bool(self.focus_realtime_analysis_var.get())
         self._histogram_enabled_setting = bool(self.histogram_enabled_var.get())
@@ -2403,6 +2476,12 @@ class StereoCaptureOnlyApp:
         self.calibration_wizard_button = ttk.Button(
             actions, text="标定向导", command=self.show_calibration_wizard, style="Utility.TButton"
         )
+        self.background_button = ttk.Button(
+            actions,
+            textvariable=self.background_button_text_var,
+            command=self.toggle_background_theme,
+            style="Utility.TButton",
+        )
         self.exit_button = ttk.Button(actions, text="退出", command=self.close, style="Danger.TButton")
 
         for button in (
@@ -2420,6 +2499,7 @@ class StereoCaptureOnlyApp:
         ):
             button.pack(side=LEFT, padx=(0, 5), pady=0)
         self.exit_button.pack(side=RIGHT, pady=0)
+        self.background_button.pack(side=RIGHT, padx=(0, 5), pady=0)
         self.refresh_tooltip = ToolTip(self.refresh_button, self._device_tooltip_text)
 
         settings = ttk.Frame(toolbar, style="Toolbar.TFrame")
@@ -2746,12 +2826,51 @@ class StereoCaptureOnlyApp:
         )
         self.status_version_label.grid(row=0, column=3, sticky="e")
 
+    def toggle_background_theme(self) -> None:
+        self._light_background = not self._light_background
+        apply_background_palette(self._light_background)
+        self.root.configure(bg=BG_COLOR)
+        self._configure_style()
+        self._refresh_direct_theme_widgets()
+        self.background_button_text_var.set("黑色背景" if self._light_background else "白色背景")
+        self.config["ui_background"] = "white" if self._light_background else "black"
+        save_config(self.config)
+        label = "白色" if self._light_background else "黑色"
+        self.status_var.set(f"界面已切换为{label}背景。")
+
+    def _refresh_direct_theme_widgets(self) -> None:
+        if hasattr(self, "camera_strip"):
+            self.camera_strip.configure(bg=BG_COLOR)
+        for pane_name in ("left_pane", "right_pane"):
+            pane = getattr(self, pane_name, None)
+            if pane is not None:
+                pane.apply_theme()
+        if hasattr(self, "interval_lamp"):
+            self.interval_lamp.configure(bg=PANEL_COLOR)
+            self.interval_lamp.itemconfigure(self.interval_lamp_id, outline=CANVAS_COLOR)
+        for canvas_name in ("focus_chart_canvas", "magnifier_canvas", "health_chart_canvas"):
+            canvas = getattr(self, canvas_name, None)
+            if canvas is not None:
+                canvas.configure(bg=CHART_COLOR, highlightbackground=BORDER_COLOR)
+        for histogram_name in ("left_hist_canvas", "right_hist_canvas"):
+            histogram = getattr(self, histogram_name, None)
+            if histogram is not None:
+                histogram.apply_theme()
+        if hasattr(self, "health_chart_canvas"):
+            self._update_temperature_trend_chart(self._latest_temperatures)
+        for child in self.root.winfo_children():
+            if isinstance(child, Toplevel):
+                child.configure(bg=BG_COLOR)
+
     def _configure_style(self) -> None:
         self.style = ttk.Style()
         try:
             self.style.theme_use("clam")
         except Exception:
             pass
+        button_active = "#e1e7eb" if self._light_background else "#2a3641"
+        disabled_background = "#edf1f4" if self._light_background else "#151b22"
+        disabled_border = "#d0d8de" if self._light_background else "#232c35"
         self.style.configure(".", background=BG_COLOR, foreground=TEXT_COLOR, font=(FONT_FAMILY, BASE_FONT_SIZE))
         self.style.configure("TFrame", background=BG_COLOR)
         self.style.configure("Toolbar.TFrame", background=SURFACE_COLOR)
@@ -2890,8 +3009,8 @@ class StereoCaptureOnlyApp:
         )
         self.style.map(
             "TButton",
-            background=[("pressed", SURFACE_COLOR), ("active", "#2a3641"), ("disabled", "#151b22")],
-            bordercolor=[("active", BORDER_STRONG_COLOR), ("disabled", "#232c35")],
+            background=[("pressed", SURFACE_COLOR), ("active", button_active), ("disabled", disabled_background)],
+            bordercolor=[("active", BORDER_STRONG_COLOR), ("disabled", disabled_border)],
             foreground=[("disabled", SUBTLE_TEXT_COLOR)],
         )
         self.style.configure(
@@ -2977,7 +3096,7 @@ class StereoCaptureOnlyApp:
         )
         self.style.map(
             "TMenubutton",
-            background=[("pressed", SURFACE_COLOR), ("active", "#2a3641"), ("disabled", "#151b22")],
+            background=[("pressed", SURFACE_COLOR), ("active", button_active), ("disabled", disabled_background)],
             foreground=[("disabled", SUBTLE_TEXT_COLOR)],
         )
         self.style.configure(

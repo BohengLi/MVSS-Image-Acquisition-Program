@@ -25,6 +25,7 @@ python stereo_capture_only.py
 
 - 连接和刷新左右相机，记录相机型号、序列号和固件版本 `DeviceVersion`。
 - 实时预览左右画面，支持缩放、平移、ROI 框选、峰值对焦、放大镜、斑马线和直方图。
+- 工具栏支持一键切换黑色/白色界面背景，选择会保存到 `config.json`，下次启动自动恢复。
 - 加载已有双目标定文件，支持 K1/K2、D1/D2、R/T，并生成/缓存 stereo rectification maps。
 - 预览模式支持 `校正叠加`，将校正后的左右图半透明叠加，并绘制水平参考线。
 - 预览模式支持 `30%重叠`：照片成功保存后，左窗把上一张左图的右侧 30% 叠加到实时画面的左侧 30%，辅助相邻采集保持覆盖率；右窗继续正常预览。
@@ -47,6 +48,7 @@ gain_auto / gain                        自动增益和手动增益
 roi_width / roi_height                  ROI 宽高
 pixel_format / image_format             相机像素格式和保存格式
 preview_fps / record_fps                预览和录像目标帧率
+ui_background                          black 或 white，界面背景主题
 record_disk_benchmark_*                 录像前写入测速设置
 temperature_monitor                     温度轮询间隔和告警阈值
 hdr_bracketing.ev_offsets               HDR 包围 EV 序列
