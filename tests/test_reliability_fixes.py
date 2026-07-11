@@ -1571,6 +1571,20 @@ class ReliabilityFixTests(unittest.TestCase):
 
         self.assertEqual(app._get_last_quality_metrics(), metrics)
 
+    def test_focus_reference_startup_check_uses_status_instead_of_popup(self) -> None:
+        app = StereoCaptureOnlyApp.__new__(StereoCaptureOnlyApp)
+        app.config = {"focus_reference_score": 100.0}
+        app._last_reference_warning_score = None
+        app._focus_drift_warning_text = ""
+        app.status_var = _Var()
+
+        with patch.object(stereo_capture_only.messagebox, "showwarning") as showwarning:
+            app._handle_focus_reference_check({"score": 60.0})
+
+        showwarning.assert_not_called()
+        self.assertIn("对焦启动检查偏移", app.status_var.get())
+        self.assertEqual(app._last_reference_warning_score, 60.0)
+
     def test_preview_capture_timeout_uses_shorter_preview_value(self) -> None:
         app = StereoCaptureOnlyApp.__new__(StereoCaptureOnlyApp)
 

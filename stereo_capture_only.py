@@ -8633,7 +8633,10 @@ class StereoCaptureOnlyApp:
         deviation = abs(score - float(reference)) / max(float(reference), 1e-9)
         if deviation > 0.20 and score != self._last_reference_warning_score:
             self._last_reference_warning_score = score
-            messagebox.showwarning("对焦偏移提醒", "检测到对焦可能偏移，建议重新对焦并更新基准")
+            self._focus_drift_warning_text = f"对焦启动检查偏移 {deviation * 100:.0f}%：建议重新对焦并更新基准"
+            if hasattr(self, "status_var"):
+                self.status_var.set(self._focus_drift_warning_text)
+            LOGGER.warning(self._focus_drift_warning_text)
 
     def _schedule_focus_drift_check(self) -> None:
         if self._closing:
